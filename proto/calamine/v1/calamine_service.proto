@@ -1,0 +1,323 @@
+// SPDX-License-Identifier: MIT
+//
+// gRPC service contract for the calamine spreadsheet server.
+//
+// The server parses Excel and OpenDocument workbooks with the Rust
+// `calamine` crate and streams results back to the caller as they are read,
+// instead of buffering whole worksheets in a single response. The protocol
+// is handle-based: a client uploads a workbook once (`OpenWorkbook`,
+// client-streaming), receives a `workbook_id`, and then issues any number of
+// read RPCs against that handle. Handles are independent, so many clients
+// (or one client with many workbooks) can stream concurrently.
+
+syntax = "proto3";
+
+package calamine.v1;
+
+import "calamine/v1/types.proto";
+
+// CalamineService exposes the calamine spreadsheet reader over gRPC with
+// server-streaming reads.
+service CalamineService {
+  // Uploads a workbook and opens it for reading.
+  //
+  // Client-streaming: the first request message must carry `options`;
+  // every subsequent message carries a `chunk` of the file bytes, in order.
+  // The server detects the format (or honors the format hint), parses the
+  // workbook metadata, and responds once with a handle plus the metadata.
+  // Mirrors `calamine::open_workbook_auto_from_rs`.
+  rpc OpenWorkbook(stream OpenWorkbookRequest) returns (OpenWorkbookResponse);
+
+  // Releases a workbook handle and all server-side state attached to it.
+  // Closing an unknown handle is a no-op.
+  rpc CloseWorkbook(CloseWorkbookRequest) returns (CloseWorkbookResponse);
+
+  // Returns the workbook metadata again for an open handle. Equivalent to
+  // the metadata returned by `OpenWorkbook`; useful after a reconnect.
+  // Mirrors `Reader::metadata` / `Reader::sheets_metadata`.
+  rpc GetMetadata(GetMetadataRequest) returns (GetMetadataResponse);
+
+  // Streams one worksheet's cell data row by row, in worksheet order.
+  //
+  // The first event is always a `RangeStarted` header carrying the range
+  // dimensions; each subsequent `WorksheetRow` event carries one absolute
+  // row of dense cell values as soon as it has been parsed. Mirrors
+  // `Reader::worksheet_range` / `Reader::worksheet_range_at`, but rows are
+  // emitted incrementally instead of returning a whole `Range<Data>`.
+  rpc StreamWorksheetRange(StreamWorksheetRangeRequest)
+      returns (stream StreamWorksheetRangeResponse);
+
+  // Streams one worksheet's formulas row by row, in worksheet order.
+  // Mirrors `Reader::worksheet_formula` (a `Range<String>`), streamed the
+  // same way as `StreamWorksheetRange`.
+  rpc StreamWorksheetFormula(StreamWorksheetFormulaRequest)
+      returns (stream StreamWorksheetFormulaResponse);
+
+  // Returns all defined names of the workbook.
+  // Mirrors `Reader::defined_names`.
+  rpc GetDefinedNames(GetDefinedNamesRequest) returns (GetDefinedNamesResponse);
+
+  // Streams the VBA project of a workbook, if any.
+  //
+  // The first event is a `VbaProjectInfo` header with the project
+  // references; each subsequent `VbaModule` event carries one module as soon
+  // as it has been decompressed. Mirrors `Reader::vba_project`,
+  // `VbaProject::get_references`, and `VbaProject::get_module_raw`.
+  rpc StreamVbaProject(StreamVbaProjectRequest)
+      returns (stream StreamVbaProjectResponse);
+
+  // Streams the pictures embedded in a workbook, one `Picture` event per
+  // image, in workbook order. Requires the server to be built with
+  // calamine's `picture` feature; otherwise the RPC fails with
+  // UNIMPLEMENTED. Mirrors `Reader::pictures_with_metadata`.
+  rpc GetPictures(GetPicturesRequest) returns (stream GetPicturesResponse);
+}
+
+// WorkbookOptions carries the open-time settings for `OpenWorkbook`.
+// It must be the payload of the first `OpenWorkbookRequest` message.
+message WorkbookOptions {
+  // Expected file format. `WORKBOOK_FORMAT_UNSPECIFIED` means auto-detect
+  // from the content, exactly like `calamine::open_workbook_auto_from_rs`.
+  WorkbookFormat format_hint = 1;
+
+  // Header row selection applied to subsequent worksheet reads on this
+  // handle, mirroring `Reader::with_header_row`. Absent means calamine's
+  // default, `HeaderRow::FirstNonEmptyRow`.
+  HeaderRow header_row = 2;
+}
+
+// OpenWorkbookRequest is one frame of the client-streaming upload.
+message OpenWorkbookRequest {
+  // The frame payload. The first message of the stream must set `options`;
+  // all following messages must set `chunk`.
+  oneof payload {
+    // Open-time settings. First frame only.
+    WorkbookOptions options = 1;
+
+    // A chunk of the workbook file bytes. Chunks are concatenated in stream
+    // order to form the complete file.
+    bytes chunk = 2;
+  }
+}
+
+// OpenWorkbookResponse is the single response to `OpenWorkbook`, sent once
+// the upload is complete and the workbook has been opened.
+message OpenWorkbookResponse {
+  // Opaque handle identifying the opened workbook. Used by every other RPC.
+  string workbook_id = 1;
+
+  // The format the workbook was actually opened as (after auto-detection).
+  // Never `WORKBOOK_FORMAT_UNSPECIFIED`.
+  WorkbookFormat detected_format = 2;
+
+  // Workbook metadata: sheets (in workbook order) and defined names.
+  Metadata metadata = 3;
+}
+
+// CloseWorkbookRequest selects the handle to release.
+message CloseWorkbookRequest {
+  // Handle returned by `OpenWorkbook`.
+  string workbook_id = 1;
+}
+
+// CloseWorkbookResponse acknowledges the release of the handle.
+message CloseWorkbookResponse {
+  // True if the handle existed and was closed, false if it was unknown.
+  bool closed = 1;
+}
+
+// GetMetadataRequest selects the workbook whose metadata is requested.
+message GetMetadataRequest {
+  // Handle returned by `OpenWorkbook`.
+  string workbook_id = 1;
+}
+
+// GetMetadataResponse returns the metadata snapshot for an open workbook.
+message GetMetadataResponse {
+  // The format the workbook was opened as.
+  WorkbookFormat detected_format = 1;
+
+  // Workbook metadata: sheets (in workbook order) and defined names.
+  Metadata metadata = 2;
+}
+
+// SheetSelector picks a worksheet either by name or by position, mirroring
+// the pair `Reader::worksheet_range(name)` / `Reader::worksheet_range_at(n)`.
+message SheetSelector {
+  // Exactly one selection method is set.
+  oneof selector {
+    // Select by sheet name, e.g. "Sheet1".
+    string sheet_name = 1;
+
+    // Select by zero-based position in workbook order.
+    uint32 sheet_index = 2;
+  }
+}
+
+// StreamWorksheetRangeRequest selects the workbook and worksheet to stream.
+message StreamWorksheetRangeRequest {
+  // Handle returned by `OpenWorkbook`.
+  string workbook_id = 1;
+
+  // Which worksheet to stream.
+  SheetSelector sheet = 2;
+}
+
+// RangeStarted is the header event of a streamed range. It is always the
+// first event of `StreamWorksheetRange` and `StreamWorksheetFormula` and
+// lets the caller allocate/validate before any row arrives.
+message RangeStarted {
+  // Resolved name of the worksheet being streamed.
+  string sheet_name = 1;
+
+  // Absolute dimensions of the range. Absent when the range is empty,
+  // matching `Range::start()`/`Range::end()` returning `None`.
+  Dimensions dimensions = 2;
+
+  // Total number of cells in the dense range
+  // (`Range::get_size().0 * Range::get_size().1`).
+  uint64 total_cells = 3;
+}
+
+// WorksheetRow is one streamed row of cell values.
+message WorksheetRow {
+  // Absolute zero-based row index within the worksheet.
+  uint32 row_index = 1;
+
+  // Dense values for this row, in column order starting at the range's
+  // start column. Cells without content appear as `CellData.empty`.
+  repeated CellData values = 2;
+}
+
+// StreamError is an in-band error event on a streaming RPC.
+//
+// Non-terminal errors (e.g. one sheet of a multi-item read failed) are
+// delivered this way so the stream can continue. Terminal failures still use
+// the gRPC status and end the stream.
+message StreamError {
+  // The structured calamine error.
+  CalamineError error = 1;
+
+  // True when the stream cannot produce further events after this one.
+  bool terminal = 2;
+}
+
+// StreamWorksheetRangeResponse is one event of the worksheet data stream.
+message StreamWorksheetRangeResponse {
+  // Exactly one event kind is set per message.
+  oneof event {
+    // Stream header. Always the first event, sent exactly once.
+    RangeStarted started = 1;
+
+    // One row of cell data.
+    WorksheetRow row = 2;
+
+    // An in-band error.
+    StreamError error = 3;
+  }
+}
+
+// StreamWorksheetFormulaRequest selects the workbook and worksheet whose
+// formulas are streamed.
+message StreamWorksheetFormulaRequest {
+  // Handle returned by `OpenWorkbook`.
+  string workbook_id = 1;
+
+  // Which worksheet to stream formulas from.
+  SheetSelector sheet = 2;
+}
+
+// FormulaRow is one streamed row of formula strings.
+message FormulaRow {
+  // Absolute zero-based row index within the worksheet.
+  uint32 row_index = 1;
+
+  // Dense formulas for this row, in column order starting at the range's
+  // start column. Empty string means the cell has no formula.
+  repeated string formulas = 2;
+}
+
+// StreamWorksheetFormulaResponse is one event of the formula stream.
+message StreamWorksheetFormulaResponse {
+  // Exactly one event kind is set per message.
+  oneof event {
+    // Stream header. Always the first event, sent exactly once.
+    RangeStarted started = 1;
+
+    // One row of formulas.
+    FormulaRow row = 2;
+
+    // An in-band error.
+    StreamError error = 3;
+  }
+}
+
+// GetDefinedNamesRequest selects the workbook whose defined names are
+// requested.
+message GetDefinedNamesRequest {
+  // Handle returned by `OpenWorkbook`.
+  string workbook_id = 1;
+}
+
+// GetDefinedNamesResponse returns all defined names of the workbook.
+message GetDefinedNamesResponse {
+  // All defined names, mirroring `Reader::defined_names`.
+  repeated DefinedName defined_names = 1;
+}
+
+// StreamVbaProjectRequest selects the workbook whose VBA project is
+// streamed.
+message StreamVbaProjectRequest {
+  // Handle returned by `OpenWorkbook`.
+  string workbook_id = 1;
+}
+
+// VbaProjectInfo is the header event of the VBA stream. It is always the
+// first event of `StreamVbaProject`, sent exactly once.
+message VbaProjectInfo {
+  // False when the workbook has no VBA project (`vba_project()` returned
+  // `None`); in that case no module events follow and the stream ends.
+  bool present = 1;
+
+  // All references of the project, mirroring
+  // `VbaProject::get_references`.
+  repeated VbaReference references = 2;
+
+  // Names of all modules in the project, in lexicographic order, mirroring
+  // `VbaProject::get_module_names`. Each name is followed by exactly one
+  // `VbaModule` event.
+  repeated string module_names = 3;
+}
+
+// StreamVbaProjectResponse is one event of the VBA project stream.
+message StreamVbaProjectResponse {
+  // Exactly one event kind is set per message.
+  oneof event {
+    // Stream header. Always the first event, sent exactly once.
+    VbaProjectInfo info = 1;
+
+    // One VBA module.
+    VbaModule module = 2;
+
+    // An in-band error.
+    StreamError error = 3;
+  }
+}
+
+// GetPicturesRequest selects the workbook whose pictures are streamed.
+message GetPicturesRequest {
+  // Handle returned by `OpenWorkbook`.
+  string workbook_id = 1;
+}
+
+// GetPicturesResponse is one event of the pictures stream.
+message GetPicturesResponse {
+  // Exactly one event kind is set per message.
+  oneof event {
+    // One embedded picture with its position metadata.
+    Picture picture = 1;
+
+    // An in-band error.
+    StreamError error = 2;
+  }
+}

@@ -1,0 +1,447 @@
+// SPDX-License-Identifier: MIT
+//
+// Core data model for the calamine gRPC service.
+//
+// Every message and enum in this file is a one-to-one mapping of a public
+// type from the Rust `calamine` crate (https://github.com/tafia/calamine).
+// The mapping is intentionally structural: no flattening, no stringly-typed
+// enums, no lossy shortcuts. Where calamine uses a Rust enum we use a
+// protobuf enum or a `oneof`; where calamine uses `(u32, u32)` position
+// tuples we use the `CellPosition` message.
+
+syntax = "proto3";
+
+package calamine.v1;
+
+import "google/protobuf/empty.proto";
+
+// CellErrorType mirrors `calamine::CellErrorType`.
+//
+// Represents every error value that can appear as the content of a worksheet
+// cell. The display strings below are the exact strings Excel shows and that
+// `CellErrorType::fmt` produces.
+enum CellErrorType {
+  // Zero value. Never set by the server; present only as the protobuf
+  // default when the field was not populated.
+  CELL_ERROR_TYPE_UNSPECIFIED = 0;
+
+  // Division by zero error. Displayed as `#DIV/0!`.
+  CELL_ERROR_TYPE_DIV0 = 1;
+
+  // Unavailable value error. Displayed as `#N/A`.
+  CELL_ERROR_TYPE_NA = 2;
+
+  // Invalid name error. Displayed as `#NAME?`.
+  CELL_ERROR_TYPE_NAME = 3;
+
+  // Null value error. Displayed as `#NULL!`.
+  CELL_ERROR_TYPE_NULL = 4;
+
+  // Number error. Displayed as `#NUM!`.
+  CELL_ERROR_TYPE_NUM = 5;
+
+  // Invalid cell reference error. Displayed as `#REF!`.
+  CELL_ERROR_TYPE_REF = 6;
+
+  // Value error. Displayed as `#VALUE!`.
+  CELL_ERROR_TYPE_VALUE = 7;
+
+  // "Getting data" placeholder error. Displayed as `#DATA!`.
+  CELL_ERROR_TYPE_GETTING_DATA = 8;
+}
+
+// ExcelDateTimeType mirrors `calamine::ExcelDateTimeType`.
+//
+// Calamine can only distinguish between a genuine datetime and a duration
+// (time delta); Excel stores both as the same serial f64 value.
+enum ExcelDateTimeType {
+  // Zero value. Never set by the server; present only as the protobuf
+  // default when the field was not populated.
+  EXCEL_DATE_TIME_TYPE_UNSPECIFIED = 0;
+
+  // A date, a time, or a combined date/time serial value.
+  EXCEL_DATE_TIME_TYPE_DATE_TIME = 1;
+
+  // A duration serial value, e.g. a cell formatted as `[hh]:mm:ss`.
+  EXCEL_DATE_TIME_TYPE_TIME_DELTA = 2;
+}
+
+// ExcelDateTime mirrors `calamine::ExcelDateTime`.
+//
+// Excel stores dates and times as a single f64 "serial" value: the integer
+// part counts days from an epoch and the fractional part is the portion of
+// the day. The epoch is either 1900-01-01 or 1904-01-01 depending on the
+// workbook; note that the 1900 epoch reproduces the famous Excel leap year
+// bug (it treats 1900 as a leap year).
+message ExcelDateTime {
+  // The raw Excel serial value, e.g. 45943.5 for 2025-10-13 12:00:00 in the
+  // 1900 date system.
+  double value = 1;
+
+  // Whether the serial value is a datetime or a duration.
+  ExcelDateTimeType datetime_type = 2;
+
+  // True when the workbook uses the 1904 date system, false for the 1900
+  // date system. Conversion differs by exactly 1462 days between the two.
+  bool is_1904 = 3;
+}
+
+// CellData mirrors `calamine::Data` and `calamine::DataRef`.
+//
+// `Data` and `DataRef` differ only in that `DataRef` can borrow a shared
+// string (`SharedString`) instead of owning a `String`; every other variant
+// is identical. Both enums are therefore represented by this single message:
+// `shared_string_value` is only ever produced from a `DataRef` read, and
+// every other variant is produced identically from either enum.
+//
+// Exactly one variant is always set. An empty cell is represented explicitly
+// by the `empty` variant, never by an unset oneof.
+message CellData {
+  // The cell value. The variants correspond one-to-one to the variants of
+  // `calamine::Data` / `calamine::DataRef`.
+  oneof value {
+    // Signed 64-bit integer. Maps to `Data::Int(i64)`.
+    int64 int_value = 1;
+
+    // IEEE 754 double. Maps to `Data::Float(f64)`.
+    double float_value = 2;
+
+    // Owned UTF-8 string. Maps to `Data::String(String)`.
+    string string_value = 3;
+
+    // Borrowed shared string, resolved to its UTF-8 content before sending.
+    // Maps to `DataRef::SharedString(&str)`; only produced by ref reads.
+    string shared_string_value = 4;
+
+    // Boolean value. Maps to `Data::Bool(bool)`.
+    bool bool_value = 5;
+
+    // Excel serial date/time. Maps to `Data::DateTime(ExcelDateTime)`.
+    ExcelDateTime date_time = 6;
+
+    // Date, time, or date/time already formatted as ISO 8601 text by the
+    // source format (e.g. ODS). Maps to `Data::DateTimeIso(String)`.
+    string date_time_iso = 7;
+
+    // Duration already formatted as ISO 8601 text by the source format.
+    // Maps to `Data::DurationIso(String)`.
+    string duration_iso = 8;
+
+    // Cell error value. Maps to `Data::Error(CellErrorType)`.
+    CellErrorType error = 9;
+
+    // Empty cell. Maps to `Data::Empty`. Carries no data; the variant being
+    // set is the entire signal.
+    google.protobuf.Empty empty = 10;
+  }
+}
+
+// CellPosition is the typed form of calamine's `(row, column)` tuples.
+//
+// Calamine uses bare `(u32, u32)` pairs throughout its API (cell positions,
+// range start/end). This message gives the pair named, type-safe fields.
+// All coordinates are absolute, zero-based worksheet coordinates: (0, 0) is
+// cell A1.
+message CellPosition {
+  // Zero-based absolute row index. Row 0 is spreadsheet row 1.
+  uint32 row = 1;
+
+  // Zero-based absolute column index. Column 0 is spreadsheet column A.
+  uint32 col = 2;
+}
+
+// Dimensions mirrors `calamine::Dimensions`.
+//
+// Inclusive start and end positions of a rectangular worksheet area.
+message Dimensions {
+  // Top-left cell of the area, inclusive, in absolute coordinates.
+  CellPosition start = 1;
+
+  // Bottom-right cell of the area, inclusive, in absolute coordinates.
+  CellPosition end = 2;
+}
+
+// Cell mirrors `calamine::Cell<Data>`.
+//
+// A single cell value together with its absolute position. This is the
+// sparse representation used by `Range::from_sparse` and `Range::cells()`.
+message Cell {
+  // Absolute position of the cell within the worksheet.
+  CellPosition position = 1;
+
+  // Value of the cell.
+  CellData value = 2;
+}
+
+// CellRange mirrors `calamine::Range<Data>`.
+//
+// A rectangular area of cells with absolute start/end positions and the cell
+// values stored densely in row-major order: index `i` of `values` is row
+// `start.row + i / width`, column `start.col + i % width`, where
+// `width = end.col - start.col + 1`. The range is dense: cells with no
+// content appear as `CellData.empty` variants.
+message CellRange {
+  // Absolute position of the top-left cell. Absent when the range is empty
+  // (`Range::empty()`), matching `Range::start() -> Option<(u32, u32)>`.
+  CellPosition start = 1;
+
+  // Absolute position of the bottom-right cell. Absent when the range is
+  // empty, matching `Range::end() -> Option<(u32, u32)>`.
+  CellPosition end = 2;
+
+  // Dense row-major cell values. Length is exactly
+  // `(end.row - start.row + 1) * (end.col - start.col + 1)` when the range
+  // is non-empty, and 0 when it is empty.
+  repeated CellData values = 3;
+}
+
+// FormulaRange mirrors `calamine::Range<String>` as returned by
+// `Reader::worksheet_formula`.
+//
+// Same dense row-major layout as `CellRange`, but each element is the cell's
+// formula string. Cells without a formula produce an empty string, matching
+// calamine's behavior.
+message FormulaRange {
+  // Absolute position of the top-left cell. Absent when the range is empty.
+  CellPosition start = 1;
+
+  // Absolute position of the bottom-right cell. Absent when the range is
+  // empty.
+  CellPosition end = 2;
+
+  // Dense row-major formula strings. Empty string means "no formula".
+  repeated string formulas = 3;
+}
+
+// SheetType mirrors `calamine::SheetType`.
+//
+// The kind of a sheet. Only Excel formats carry this information; ODS sheets
+// always report `SHEET_TYPE_WORKSHEET`.
+enum SheetType {
+  // Zero value. Never set by the server; present only as the protobuf
+  // default when the field was not populated.
+  SHEET_TYPE_UNSPECIFIED = 0;
+
+  // A regular worksheet.
+  SHEET_TYPE_WORKSHEET = 1;
+
+  // A dialog sheet.
+  SHEET_TYPE_DIALOG_SHEET = 2;
+
+  // A macro sheet.
+  SHEET_TYPE_MACRO_SHEET = 3;
+
+  // A chart sheet.
+  SHEET_TYPE_CHART_SHEET = 4;
+
+  // A VBA module sheet.
+  SHEET_TYPE_VBA = 5;
+}
+
+// SheetVisible mirrors `calamine::SheetVisible`.
+//
+// Visibility state of a sheet.
+enum SheetVisible {
+  // Zero value. Never set by the server; present only as the protobuf
+  // default when the field was not populated.
+  SHEET_VISIBLE_UNSPECIFIED = 0;
+
+  // The sheet is visible.
+  SHEET_VISIBLE_VISIBLE = 1;
+
+  // The sheet is hidden but can be unhidden through the UI.
+  SHEET_VISIBLE_HIDDEN = 2;
+
+  // The sheet is hidden and cannot be unhidden through the UI. Only
+  // supported by Excel formats.
+  SHEET_VISIBLE_VERY_HIDDEN = 3;
+}
+
+// Sheet mirrors `calamine::Sheet`.
+//
+// Metadata describing a single sheet of a workbook.
+message Sheet {
+  // Name of the sheet, e.g. "Sheet1".
+  string name = 1;
+
+  // Kind of the sheet. ODS workbooks always report `SHEET_TYPE_WORKSHEET`.
+  SheetType typ = 2;
+
+  // Visibility state of the sheet.
+  SheetVisible visible = 3;
+}
+
+// DefinedName mirrors one entry of the `(String, String)` pairs returned by
+// `Reader::defined_names`.
+//
+// A workbook-level defined name (named range, named formula, etc.).
+message DefinedName {
+  // The defined name, e.g. "MyRange".
+  string name = 1;
+
+  // The string representation of the definition, e.g. "Sheet1!$A$1:$B$10".
+  string definition = 2;
+}
+
+// Metadata mirrors `calamine::Metadata`.
+//
+// Workbook-level metadata available immediately after opening a workbook,
+// before any worksheet is read.
+message Metadata {
+  // Metadata of every sheet, in workbook order. Matches
+  // `Reader::sheets_metadata`; sheet names alone (as returned by
+  // `Reader::sheet_names`) are `sheets[i].name` in order.
+  repeated Sheet sheets = 1;
+
+  // All defined names of the workbook, matching `Reader::defined_names`.
+  repeated DefinedName defined_names = 2;
+}
+
+// HeaderRow mirrors `calamine::HeaderRow`.
+//
+// Selects which row of a worksheet should be treated as the header row.
+// Exactly one variant is set; when the whole message is absent the server
+// applies calamine's default, `HeaderRow::FirstNonEmptyRow`.
+message HeaderRow {
+  // Header row selection, one-to-one with the `HeaderRow` enum variants.
+  oneof selection {
+    // Use the first non-empty row as the header. Maps to
+    // `HeaderRow::FirstNonEmptyRow`, calamine's default.
+    google.protobuf.Empty first_non_empty_row = 1;
+
+    // Use the row at this absolute zero-based index as the header. Maps to
+    // `HeaderRow::Row(u32)`.
+    uint32 row_index = 2;
+  }
+}
+
+// Picture mirrors `calamine::Picture` (calamine's `picture` feature).
+//
+// An image embedded in a workbook, together with the worksheet position of
+// its anchor cell.
+message Picture {
+  // Zero-based row index of the picture's anchor cell.
+  uint32 row = 1;
+
+  // Zero-based column index of the picture's anchor cell.
+  uint32 col = 2;
+
+  // Name of the worksheet containing the picture. An empty string means the
+  // picture could not be matched to a worksheet, in which case `row` and
+  // `col` are both 0.
+  string sheet_name = 3;
+
+  // File extension of the picture, e.g. "png" or "jpg".
+  string extension = 4;
+
+  // Raw image bytes.
+  bytes data = 5;
+
+  // Name of the picture object, e.g. "Picture 1". Only populated for
+  // pictures anchored over cells (DrawingML anchor); Excel does not track
+  // the original file name.
+  string name = 6;
+}
+
+// VbaReference mirrors `calamine::vba::Reference`.
+//
+// A single reference of a VBA project. Note that calamine's
+// `Reference::is_missing` checks whether `path` exists on the local file
+// system; that check is meaningless on the server and is therefore not part
+// of this contract. Clients must treat `path` as opaque metadata.
+message VbaReference {
+  // Name of the reference.
+  string name = 1;
+
+  // Human-readable description of the reference.
+  string description = 2;
+
+  // Location of the reference as recorded in the workbook.
+  string path = 3;
+}
+
+// VbaModule mirrors one entry of the `BTreeMap<String, Vec<u8>>` held by
+// `calamine::vba::VbaProject`.
+//
+// The raw content is MBCS-encoded source exactly as stored in the file
+// (what `VbaProject::get_module_raw` returns). Decoding to UTF-8 (what
+// `VbaProject::get_module` attempts) is deliberately left to the client
+// because it can fail and calamine itself offers no guaranteed decoding.
+message VbaModule {
+  // Name of the module, e.g. "Module1".
+  string name = 1;
+
+  // Raw MBCS-encoded module source bytes.
+  bytes raw_content = 2;
+}
+
+// WorkbookFormat identifies the spreadsheet file format, mirroring the
+// variants of `calamine::Sheets<RS>` produced by `open_workbook_auto`.
+enum WorkbookFormat {
+  // Zero value. In requests this means "auto-detect from content". The
+  // server never reports it in responses.
+  WORKBOOK_FORMAT_UNSPECIFIED = 0;
+
+  // Legacy Excel binary format (.xls, .xla). Maps to `calamine::Xls`.
+  WORKBOOK_FORMAT_XLS = 1;
+
+  // OOXML Excel format (.xlsx, .xlsm, .xlam). Maps to `calamine::Xlsx`.
+  WORKBOOK_FORMAT_XLSX = 2;
+
+  // Excel binary OOXML format (.xlsb). Maps to `calamine::Xlsb`.
+  WORKBOOK_FORMAT_XLSB = 3;
+
+  // OpenDocument spreadsheet (.ods). Maps to `calamine::Ods`.
+  WORKBOOK_FORMAT_ODS = 4;
+}
+
+// CalamineErrorKind mirrors the variants of `calamine::Error`.
+//
+// Classifies a failure the way calamine's top-level error enum does. The
+// detailed, format-specific sub-errors (`XlsxError`, `XlsError`, ...) are
+// rendered into `CalamineError.message`; only the variant is preserved as
+// structured data, matching what calamine exposes programmatically.
+enum CalamineErrorKind {
+  // Zero value. Never set by the server; present only as the protobuf
+  // default when the field was not populated.
+  CALAMINE_ERROR_KIND_UNSPECIFIED = 0;
+
+  // I/O error. Maps to `Error::Io`.
+  CALAMINE_ERROR_KIND_IO = 1;
+
+  // ODS-format error. Maps to `Error::Ods`.
+  CALAMINE_ERROR_KIND_ODS = 2;
+
+  // XLS-format error. Maps to `Error::Xls`.
+  CALAMINE_ERROR_KIND_XLS = 3;
+
+  // XLSB-format error. Maps to `Error::Xlsb`.
+  CALAMINE_ERROR_KIND_XLSB = 4;
+
+  // XLSX-format error. Maps to `Error::Xlsx`.
+  CALAMINE_ERROR_KIND_XLSX = 5;
+
+  // VBA project error. Maps to `Error::Vba`.
+  CALAMINE_ERROR_KIND_VBA = 6;
+
+  // Deserializer error. Maps to `Error::De`.
+  CALAMINE_ERROR_KIND_DE = 7;
+
+  // General error message. Maps to `Error::Msg`.
+  CALAMINE_ERROR_KIND_MSG = 8;
+}
+
+// CalamineError is the structured form of `calamine::Error`.
+//
+// Used for in-band error events on streaming RPCs. Terminal failures of an
+// RPC are still reported through the gRPC status; this message exists so a
+// stream can surface a per-sheet or per-item failure without aborting the
+// remaining items.
+message CalamineError {
+  // Which `calamine::Error` variant occurred.
+  CalamineErrorKind kind = 1;
+
+  // Human-readable detail, i.e. the `Display` rendering of the underlying
+  // calamine error.
+  string message = 2;
+}

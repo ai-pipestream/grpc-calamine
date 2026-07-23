@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! A gRPC server that reads Excel and OpenDocument workbooks with the Rust
+//! A gRPC server that reads Excel and `OpenDocument` workbooks with the Rust
 //! `calamine` crate and streams the results back to callers as they are
 //! parsed.
 //!

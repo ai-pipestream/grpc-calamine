@@ -6,7 +6,11 @@
 
 /// Messages, enums, client, and server for the `calamine.v1` protobuf
 /// package.
-#[allow(clippy::all, clippy::pedantic, clippy::nursery)]
+///
+/// Wire-level documentation lives in the `.proto` files (buf enforces
+/// comments on every item there); the generated Rust carries it over where
+/// prost supports it.
+#[allow(clippy::all, clippy::pedantic, clippy::nursery, missing_docs)]
 pub mod v1 {
     // The prost output already ends with `include!("calamine.v1.tonic.rs")`,
     // pulling in the client and server modules.

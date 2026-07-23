@@ -28,9 +28,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workers = env_usize(
         "GRPC_CALAMINE_WORKERS",
-        std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(4),
+        std::thread::available_parallelism().map_or(4, usize::from),
     );
     let blocking = env_usize("GRPC_CALAMINE_BLOCKING_THREADS", 512);
 
@@ -62,7 +60,20 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
         .max_concurrent_streams(1024)
         .add_service(service)
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown_signal())
         .await?;
+    eprintln!("grpc-calamine shut down");
     Ok(())
+}
+
+/// Resolve when the process receives SIGINT (Ctrl-C) or SIGTERM, so open
+/// streams can drain instead of being cut mid-row.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = sigterm.recv() => {}
+    }
 }

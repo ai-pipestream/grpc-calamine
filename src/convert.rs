@@ -11,6 +11,7 @@ use calamine::{CellErrorType, Data, DataRef, ExcelDateTime, Sheet, SheetVisible}
 use crate::proto::v1 as pb;
 
 /// Map `calamine::CellErrorType` onto `CellErrorType`.
+#[must_use]
 pub fn cell_error_type(e: &CellErrorType) -> pb::CellErrorType {
     match e {
         CellErrorType::Div0 => pb::CellErrorType::Div0,
@@ -25,7 +26,12 @@ pub fn cell_error_type(e: &CellErrorType) -> pb::CellErrorType {
 }
 
 /// Map `calamine::ExcelDateTime` onto `ExcelDateTime`.
-pub fn excel_date_time(dt: &ExcelDateTime) -> pb::ExcelDateTime {
+///
+/// The 1904 flag is a workbook-level property, not a cell-level one, so it
+/// is read once per workbook via the readers' `has_1904_epoch` methods and
+/// passed in here rather than derived from the value.
+#[must_use]
+pub fn excel_date_time(dt: &ExcelDateTime, is_1904: bool) -> pb::ExcelDateTime {
     let datetime_type = if dt.is_duration() {
         pb::ExcelDateTimeType::TimeDelta
     } else {
@@ -34,18 +40,22 @@ pub fn excel_date_time(dt: &ExcelDateTime) -> pb::ExcelDateTime {
     pb::ExcelDateTime {
         value: dt.as_f64(),
         datetime_type: datetime_type as i32,
-        is_1904: dt.is_1904(),
+        is_1904,
     }
 }
 
 /// Map an owned `calamine::Data` onto the `CellData.value` oneof.
-pub fn data_value(d: &Data) -> pb::cell_data::Value {
+///
+/// `is_1904` is the workbook's date-system flag, stamped onto every
+/// datetime cell.
+#[must_use]
+pub fn data_value(d: &Data, is_1904: bool) -> pb::cell_data::Value {
     match d {
         Data::Int(v) => pb::cell_data::Value::IntValue(*v),
         Data::Float(v) => pb::cell_data::Value::FloatValue(*v),
         Data::String(v) => pb::cell_data::Value::StringValue(v.clone()),
         Data::Bool(v) => pb::cell_data::Value::BoolValue(*v),
-        Data::DateTime(v) => pb::cell_data::Value::DateTime(excel_date_time(v)),
+        Data::DateTime(v) => pb::cell_data::Value::DateTime(excel_date_time(v, is_1904)),
         Data::DateTimeIso(v) => pb::cell_data::Value::DateTimeIso(v.clone()),
         Data::DurationIso(v) => pb::cell_data::Value::DurationIso(v.clone()),
         Data::Error(e) => pb::cell_data::Value::Error(cell_error_type(e) as i32),
@@ -57,14 +67,17 @@ pub fn data_value(d: &Data) -> pb::cell_data::Value {
 ///
 /// `DataRef::SharedString` is the only variant that does not exist on
 /// `Data`; it maps to `shared_string_value` as documented in the contract.
-pub fn data_ref_value(d: &DataRef<'_>) -> pb::cell_data::Value {
+/// `is_1904` is the workbook's date-system flag, stamped onto every
+/// datetime cell.
+#[must_use]
+pub fn data_ref_value(d: &DataRef<'_>, is_1904: bool) -> pb::cell_data::Value {
     match d {
         DataRef::Int(v) => pb::cell_data::Value::IntValue(*v),
         DataRef::Float(v) => pb::cell_data::Value::FloatValue(*v),
         DataRef::String(v) => pb::cell_data::Value::StringValue(v.clone()),
         DataRef::SharedString(v) => pb::cell_data::Value::SharedStringValue((*v).to_string()),
         DataRef::Bool(v) => pb::cell_data::Value::BoolValue(*v),
-        DataRef::DateTime(v) => pb::cell_data::Value::DateTime(excel_date_time(v)),
+        DataRef::DateTime(v) => pb::cell_data::Value::DateTime(excel_date_time(v, is_1904)),
         DataRef::DateTimeIso(v) => pb::cell_data::Value::DateTimeIso(v.clone()),
         DataRef::DurationIso(v) => pb::cell_data::Value::DurationIso(v.clone()),
         DataRef::Error(e) => pb::cell_data::Value::Error(cell_error_type(e) as i32),
@@ -72,17 +85,36 @@ pub fn data_ref_value(d: &DataRef<'_>) -> pb::cell_data::Value {
     }
 }
 
+/// Workbook-level 1904 date-system flag.
+///
+/// This is the API shape the calamine maintainer prefers (see calamine
+/// PR #630): the epoch is a property of the workbook, read once via
+/// `has_1904_epoch`, not of individual cells. ODS stores dates as ISO
+/// strings and has no serial epoch, so it reports `false`.
+#[must_use]
+pub fn has_1904_epoch<RS: std::io::Read + std::io::Seek>(workbook: &calamine::Sheets<RS>) -> bool {
+    match workbook {
+        calamine::Sheets::Xls(xls) => xls.has_1904_epoch(),
+        calamine::Sheets::Xlsx(xlsx) => xlsx.has_1904_epoch(),
+        calamine::Sheets::Xlsb(xlsb) => xlsb.has_1904_epoch(),
+        calamine::Sheets::Ods(_) => false,
+    }
+}
+
 /// Wrap a oneof value into a `CellData` message.
+#[must_use]
 pub fn cell_data(value: pb::cell_data::Value) -> pb::CellData {
     pb::CellData { value: Some(value) }
 }
 
 /// Build an empty `CellData` (`Data::Empty`).
+#[must_use]
 pub fn empty_cell_data() -> pb::CellData {
     cell_data(pb::cell_data::Value::Empty(()))
 }
 
 /// Map a `(row, col)` tuple onto `CellPosition`.
+#[must_use]
 pub fn cell_position(pos: (u32, u32)) -> pb::CellPosition {
     pb::CellPosition {
         row: pos.0,
@@ -91,6 +123,7 @@ pub fn cell_position(pos: (u32, u32)) -> pb::CellPosition {
 }
 
 /// Map `calamine::Dimensions` onto `Dimensions`.
+#[must_use]
 pub fn dimensions(d: calamine::Dimensions) -> pb::Dimensions {
     pb::Dimensions {
         start: Some(cell_position(d.start)),
@@ -99,6 +132,7 @@ pub fn dimensions(d: calamine::Dimensions) -> pb::Dimensions {
 }
 
 /// Map `calamine::SheetType` onto `SheetType`.
+#[must_use]
 pub fn sheet_type(t: calamine::SheetType) -> pb::SheetType {
     match t {
         calamine::SheetType::WorkSheet => pb::SheetType::Worksheet,
@@ -110,6 +144,7 @@ pub fn sheet_type(t: calamine::SheetType) -> pb::SheetType {
 }
 
 /// Map `calamine::SheetVisible` onto `SheetVisible`.
+#[must_use]
 pub fn sheet_visible(v: SheetVisible) -> pb::SheetVisible {
     match v {
         SheetVisible::Visible => pb::SheetVisible::Visible,
@@ -119,6 +154,7 @@ pub fn sheet_visible(v: SheetVisible) -> pb::SheetVisible {
 }
 
 /// Map `calamine::Sheet` onto `Sheet`.
+#[must_use]
 pub fn sheet(s: &Sheet) -> pb::Sheet {
     pb::Sheet {
         name: s.name.clone(),
@@ -129,6 +165,7 @@ pub fn sheet(s: &Sheet) -> pb::Sheet {
 
 /// Build the `CalamineErrorKind` matching a top-level `calamine::Error`
 /// variant.
+#[must_use]
 pub fn error_kind(e: &calamine::Error) -> pb::CalamineErrorKind {
     match e {
         calamine::Error::Io(_) => pb::CalamineErrorKind::Io,
@@ -143,7 +180,11 @@ pub fn error_kind(e: &calamine::Error) -> pb::CalamineErrorKind {
 }
 
 /// Build a `CalamineError` from any displayable error plus its kind.
-pub fn calamine_error(kind: pb::CalamineErrorKind, err: impl std::fmt::Display) -> pb::CalamineError {
+#[must_use]
+pub fn calamine_error(
+    kind: pb::CalamineErrorKind,
+    err: impl std::fmt::Display,
+) -> pb::CalamineError {
     pb::CalamineError {
         kind: kind as i32,
         message: err.to_string(),
@@ -152,6 +193,7 @@ pub fn calamine_error(kind: pb::CalamineErrorKind, err: impl std::fmt::Display) 
 
 /// The `CalamineErrorKind` for errors produced by a reader of the given
 /// workbook format.
+#[must_use]
 pub fn error_kind_for_format(format: pb::WorkbookFormat) -> pb::CalamineErrorKind {
     match format {
         pb::WorkbookFormat::Xls => pb::CalamineErrorKind::Xls,

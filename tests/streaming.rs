@@ -7,21 +7,21 @@
 //! output, so the tests assert that the wire stream is a faithful rendering
 //! of what calamine parsed.
 
-
 use std::path::PathBuf;
 
-use calamine::{open_workbook_auto, Data, Reader, Sheets};
+use calamine::{Data, Reader, Sheets, open_workbook_auto};
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::{Endpoint, Server};
 use tonic::Code;
+use tonic::transport::{Endpoint, Server};
 
 use grpc_calamine::proto::v1 as pb;
 use grpc_calamine::proto::v1::calamine_service_client::CalamineServiceClient;
-use grpc_calamine::{convert, CalamineGrpc, WorkbookStore};
+use grpc_calamine::{CalamineGrpc, WorkbookStore, convert};
 
-/// Directory holding the calamine test fixtures.
+/// Directory holding the workbook fixtures (originally from the calamine
+/// test suite, MIT licensed).
 fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../reference-code/calamine/tests")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demos/sample-data")
 }
 
 /// Start the server on an ephemeral localhost port and return a connected
@@ -63,9 +63,13 @@ async fn upload(
             },
         )),
     }];
-    frames.extend(bytes.chunks(64 * 1024).map(|chunk| pb::OpenWorkbookRequest {
-        payload: Some(pb::open_workbook_request::Payload::Chunk(chunk.to_vec())),
-    }));
+    frames.extend(
+        bytes
+            .chunks(64 * 1024)
+            .map(|chunk| pb::OpenWorkbookRequest {
+                payload: Some(pb::open_workbook_request::Payload::Chunk(chunk.to_vec())),
+            }),
+    );
     client
         .open_workbook(tokio_stream::iter(frames))
         .await
@@ -113,6 +117,7 @@ async fn stream_range(
 /// the expected dense rows exactly as the server should stream them.
 fn expected_rows(file: &str, sheet_index: usize) -> (String, Vec<pb::WorksheetRow>) {
     let mut workbook: Sheets<_> = open_workbook_auto(fixtures().join(file)).expect("open fixture");
+    let is_1904 = convert::has_1904_epoch(&workbook);
     let name = workbook.sheet_names()[sheet_index].clone();
     let range = workbook.worksheet_range(&name).expect("worksheet range");
     let start = range.start().expect("non-empty range");
@@ -123,7 +128,7 @@ fn expected_rows(file: &str, sheet_index: usize) -> (String, Vec<pb::WorksheetRo
             row_index: start.0 + offset as u32,
             values: row
                 .iter()
-                .map(|d| convert::cell_data(convert::data_value(d)))
+                .map(|d| convert::cell_data(convert::data_value(d, is_1904)))
                 .collect(),
         })
         .collect();
@@ -323,7 +328,7 @@ async fn formulas_stream_matches_calamine() {
         open_workbook_auto(fixtures().join("formula.issue.xlsx")).expect("open fixture");
     let sheet_name = workbook.sheet_names()[0].clone();
     let range = workbook.worksheet_formula(&sheet_name).expect("formulas");
-    let expected: Vec<Vec<String>> = range.rows().map(|r| r.to_vec()).collect();
+    let expected: Vec<Vec<String>> = range.rows().map(<[String]>::to_vec).collect();
 
     let mut stream = client
         .stream_worksheet_formula(pb::StreamWorksheetFormulaRequest {
@@ -410,14 +415,32 @@ async fn datetime_cells_round_trip_exactly() {
             if let Some(pb::cell_data::Value::DateTime(dt)) = &cell.value {
                 saw_datetime = true;
                 assert!(dt.value > 0.0, "serial value must be preserved");
-                assert_ne!(
-                    dt.datetime_type,
-                    pb::ExcelDateTimeType::Unspecified as i32
-                );
+                assert_ne!(dt.datetime_type, pb::ExcelDateTimeType::Unspecified as i32);
+                assert!(!dt.is_1904, "date.xlsx uses the 1900 date system");
             }
         }
     }
     assert!(saw_datetime, "date.xlsx must contain datetime cells");
+}
+
+#[tokio::test]
+async fn date_1904_workbook_sets_epoch_flag_on_every_datetime() {
+    // The 1904 flag is a workbook-level property, read once per workbook via
+    // calamine's `has_1904_epoch` and stamped onto each streamed datetime.
+    let client = start_server().await;
+    let opened = upload(&client, "date_1904.xlsx").await;
+    let (_, rows) = stream_range(&client, &opened.workbook_id, 0).await;
+
+    let mut saw_datetime = false;
+    for row in &rows {
+        for cell in &row.values {
+            if let Some(pb::cell_data::Value::DateTime(dt)) = &cell.value {
+                saw_datetime = true;
+                assert!(dt.is_1904, "date_1904.xlsx uses the 1904 date system");
+            }
+        }
+    }
+    assert!(saw_datetime, "date_1904.xlsx must contain datetime cells");
 }
 
 #[tokio::test]
@@ -444,7 +467,10 @@ async fn error_cells_map_to_typed_enum() {
 fn empty_cells_are_explicit() {
     let mut workbook: Sheets<_> =
         open_workbook_auto(fixtures().join("date.xlsx")).expect("open fixture");
-    let range = workbook.worksheet_range_at(0).expect("sheet").expect("range");
+    let range = workbook
+        .worksheet_range_at(0)
+        .expect("sheet")
+        .expect("range");
     let has_data = range.cells().any(|(_, _, d)| !matches!(d, Data::Empty));
     assert!(has_data);
 }

@@ -1,10 +1,17 @@
 [package]
 name = "grpc-calamine"
 version = "0.1.0"
+description = "A gRPC server that streams Excel/OpenDocument workbooks parsed with calamine"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["excel", "ods", "grpc", "streaming", "calamine"]
+categories = ["parsing", "network-programming"]
 edition = "2024"
+rust-version = "1.88" # Matches calamine's MSRV.
+publish = false # Depends on a local calamine checkout; not for crates.io.
 
 [dependencies]
-calamine = { version = "0.36.0", path = "../../../reference-code/calamine", features = ["picture"] }
+calamine = { version = "0.36.0", features = ["picture"] }
 prost = "0.14.4"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
@@ -14,3 +21,7 @@ uuid = { version = "1.24.0", features = ["v4"] }
 
 [dev-dependencies]
 tokio-stream = { version = "0.1.19", features = ["net"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"

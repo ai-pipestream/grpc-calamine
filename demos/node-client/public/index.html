@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>calamine live sheet viewer</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1a1d21; --muted: #6b7280;
+    --line: #e5e7eb; --accent: #0f766e; --accent-soft: #ccfbf1;
+    --number: #1d4ed8; --date: #7c3aed; --bool: #b45309; --err: #b91c1c;
+    --err-soft: #fee2e2; --formula: #0e7490; --header-bg: #f3f4f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111418; --panel: #1a1f26; --ink: #e5e7eb; --muted: #9ca3af;
+      --line: #2a313b; --accent: #2dd4bf; --accent-soft: #134e4a;
+      --number: #93c5fd; --date: #c4b5fd; --bool: #fcd34d; --err: #fca5a5;
+      --err-soft: #450a0a; --formula: #67e8f9; --header-bg: #21262e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 12px;
+    padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { font-size: 16px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  main { max-width: 1200px; margin: 0 auto; padding: 20px; }
+
+  #drop {
+    border: 2px dashed var(--line); border-radius: 10px; background: var(--panel);
+    padding: 42px; text-align: center; color: var(--muted); cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  #drop.hover, #drop:hover { border-color: var(--accent); }
+  #drop strong { color: var(--ink); }
+  #drop input { display: none; }
+
+  #meta { display: none; margin-top: 16px; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+  .badge {
+    background: var(--accent-soft); color: var(--accent); border-radius: 99px;
+    font-size: 12px; padding: 2px 10px; font-weight: 600;
+  }
+  .badge.plain { background: var(--header-bg); color: var(--muted); font-weight: 400; }
+
+  .tabs { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid var(--line); }
+  .tab {
+    border: 1px solid var(--line); border-bottom: none; background: var(--panel);
+    border-radius: 8px 8px 0 0; padding: 6px 14px; cursor: pointer; color: var(--muted);
+    font-size: 13px;
+  }
+  .tab.active { color: var(--ink); font-weight: 600; border-color: var(--accent); }
+  .tab .viz { font-size: 11px; opacity: .7; }
+
+  .controls {
+    display: flex; align-items: center; gap: 14px; padding: 10px 0; flex-wrap: wrap;
+  }
+  .controls label { color: var(--muted); font-size: 13px; display: flex; gap: 6px; align-items: center; }
+  #progress-wrap { flex: 1; min-width: 160px; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  #progress { height: 100%; width: 0%; background: var(--accent); transition: width .1s linear; }
+  #stats { color: var(--muted); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+  #grid-wrap {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 0 8px 8px 8px;
+    overflow: auto; max-height: 70vh;
+  }
+  table { border-collapse: collapse; width: max-content; min-width: 100%; }
+  th, td {
+    border: 1px solid var(--line); padding: 3px 10px; font-size: 13px;
+    max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  thead th {
+    position: sticky; top: 0; background: var(--header-bg); color: var(--muted);
+    font-weight: 600; text-align: center; z-index: 2;
+  }
+  td.rowno, thead th.rowno {
+    position: sticky; left: 0; background: var(--header-bg); color: var(--muted);
+    text-align: right; font-variant-numeric: tabular-nums; z-index: 1;
+  }
+  thead th.rowno { z-index: 3; }
+  td.number { text-align: right; color: var(--number); font-variant-numeric: tabular-nums; }
+  td.date { color: var(--date); }
+  td.bool { color: var(--bool); text-align: center; }
+  td.error { color: var(--err); background: var(--err-soft); font-weight: 600; }
+  td.formula { color: var(--formula); font-family: ui-monospace, monospace; font-size: 12px; }
+  td.empty { color: var(--muted); }
+  tbody tr.fresh { animation: fresh .6s ease-out; }
+  @keyframes fresh { from { background: var(--accent-soft); } to { background: transparent; } }
+
+  #error-banner {
+    display: none; margin: 12px 0; padding: 10px 14px; border-radius: 8px;
+    background: var(--err-soft); color: var(--err); font-size: 13px;
+  }
+  #empty-note {
+    display: none; padding: 40px 20px; text-align: center; color: var(--muted);
+    font-size: 14px;
+  }
+  #empty-note strong { color: var(--ink); }
+</style>
+</head>
+<body>
+<header>
+  <h1>calamine live sheet viewer</h1>
+  <span class="sub">rows appear as the Rust server parses them — gRPC &rarr; SSE &rarr; DOM</span>
+</header>
+<main>
+  <div id="drop">
+    <strong>Drop a workbook here</strong> or click to choose a file<br>
+    <span>.xlsx &nbsp; .xlsb &nbsp; .xls &nbsp; .ods &nbsp; .xlsm</span>
+    <input id="file" type="file" accept=".xls,.xlsx,.xlsm,.xlam,.xlsb,.ods,.xla">
+  </div>
+
+  <div id="error-banner"></div>
+
+  <section id="meta">
+    <div class="badges" id="badges"></div>
+    <div class="tabs" id="tabs"></div>
+    <div class="controls">
+      <label><input type="checkbox" id="formulas"> show formulas</label>
+      <div id="progress-wrap"><div id="progress"></div></div>
+      <span id="stats"></span>
+    </div>
+    <div id="grid-wrap">
+      <table>
+        <thead id="grid-head"></thead>
+        <tbody id="grid-body"></tbody>
+      </table>
+      <div id="empty-note"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+const state = { workbookId: null, sheets: [], activeSheet: 0, source: null, startCol: 0 };
+
+function columnLabel(index) {
+  let label = "";
+  for (let i = index; i >= 0; i = Math.floor(i / 26) - 1) {
+    label = String.fromCharCode(65 + (i % 26)) + label;
+  }
+  return label;
+}
+
+function showError(text) {
+  const banner = $("error-banner");
+  banner.textContent = text;
+  banner.style.display = text ? "block" : "none";
+}
+
+// ---- upload ----------------------------------------------------------------
+const drop = $("drop");
+if (location.protocol === "file:") {
+  // Opened straight from disk there is no bridge behind the page; explain
+  // instead of failing every fetch with CORS noise.
+  drop.innerHTML =
+    "<strong>This page must be served by the demo bridge.</strong><br>" +
+    "Run <code>npm start</code> in demos/node-client and open " +
+    "<code>http://127.0.0.1:8080</code> instead of the file itself.";
+} else {
+  drop.addEventListener("click", () => $("file").click());
+  $("file").addEventListener("change", () => upload($("file").files[0]));
+  drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("hover"); });
+  drop.addEventListener("dragleave", () => drop.classList.remove("hover"));
+  drop.addEventListener("drop", (e) => {
+    e.preventDefault();
+    drop.classList.remove("hover");
+    upload(e.dataTransfer.files[0]);
+  });
+}
+
+async function upload(file) {
+  if (!file) return;
+  showError("");
+  if (state.workbookId) {
+    fetch(`/api/workbooks/${state.workbookId}`, { method: "DELETE" });
+    state.workbookId = null;
+  }
+  const response = await fetch("/api/workbooks", { method: "POST", body: file });
+  const opened = await response.json();
+  if (!response.ok) return showError(`open failed: ${opened.error}`);
+
+  state.workbookId = opened.workbookId;
+  state.sheets = opened.metadata.sheets;
+
+  const badges = [`<span class="badge">${opened.detectedFormat.replace("WORKBOOK_FORMAT_", "")}</span>`,
+    `<span class="badge plain">${file.name}</span>`,
+    `<span class="badge plain">${(file.size / 1024).toFixed(1)} KiB</span>`];
+  for (const dn of opened.metadata.definedNames) {
+    badges.push(`<span class="badge plain" title="${dn.definition}">name: ${dn.name}</span>`);
+  }
+  $("badges").innerHTML = badges.join("");
+
+  $("tabs").innerHTML = state.sheets.map((sheet, i) => {
+    const hidden = sheet.visible !== "SHEET_VISIBLE_VISIBLE" ? ` <span class="viz">(${sheet.visible.replace("SHEET_VISIBLE_", "").toLowerCase()})</span>` : "";
+    return `<button class="tab" data-i="${i}">${sheet.name}${hidden}</button>`;
+  }).join("");
+  for (const tab of document.querySelectorAll(".tab")) {
+    tab.addEventListener("click", () => selectSheet(Number(tab.dataset.i)));
+  }
+
+  $("meta").style.display = "block";
+  selectSheet(0);
+}
+
+$("formulas").addEventListener("change", () => selectSheet(state.activeSheet));
+
+// ---- streaming -------------------------------------------------------------
+function selectSheet(index) {
+  state.activeSheet = index;
+  document.querySelectorAll(".tab").forEach((tab, i) => tab.classList.toggle("active", i === index));
+  if (state.source) state.source.close();
+  $("grid-head").innerHTML = "";
+  $("grid-body").innerHTML = "";
+  $("empty-note").style.display = "none";
+  $("progress").style.width = "0%";
+  $("stats").textContent = "";
+  showError("");
+
+  const formulas = $("formulas").checked;
+  const kind = formulas ? "formulas" : "rows";
+  const source = new EventSource(`/api/workbooks/${state.workbookId}/sheets/${index}/${kind}`);
+  state.source = source;
+
+  let totalCells = 0, seenCells = 0, rows = 0, width = 0;
+  const startedAt = performance.now();
+
+  source.addEventListener("started", (e) => {
+    const started = JSON.parse(e.data);
+    totalCells = Number(started.totalCells);
+    if (started.dimensions) {
+      state.startCol = started.dimensions.start.col;
+      width = started.dimensions.end.col - started.dimensions.start.col + 1;
+      $("grid-head").innerHTML = "<tr><th class='rowno'></th>" +
+        Array.from({ length: width }, (_, i) => `<th>${columnLabel(state.startCol + i)}</th>`).join("") +
+        "</tr>";
+      $("stats").textContent = `0 / ${totalCells} cells`;
+    }
+  });
+
+  source.addEventListener("row", (e) => {
+    const row = JSON.parse(e.data);
+    rows += 1;
+    seenCells += row.cells.length;
+    const tr = document.createElement("tr");
+    tr.className = "fresh";
+    tr.innerHTML = `<td class="rowno">${row.rowIndex + 1}</td>` +
+      row.cells.map((cell) => `<td class="${cell.type}"></td>`).join("");
+    row.cells.forEach((cell, i) => { tr.children[i + 1].textContent = cell.text; });
+    $("grid-body").appendChild(tr);
+    if (totalCells > 0) $("progress").style.width = `${(100 * seenCells / totalCells).toFixed(1)}%`;
+    const ms = performance.now() - startedAt;
+    $("stats").textContent = `${seenCells} / ${totalCells} cells · ${rows} rows · ${ms.toFixed(0)} ms`;
+  });
+
+  source.addEventListener("calamine-error", (e) => {
+    const detail = JSON.parse(e.data);
+    showError(`calamine ${detail.error?.kind ?? ""}: ${detail.error?.message ?? "unknown"}${detail.terminal ? " (terminal)" : ""}`);
+  });
+  source.addEventListener("grpc-error", (e) => showError(`gRPC: ${JSON.parse(e.data).message}`));
+  source.addEventListener("done", () => {
+    $("progress").style.width = "100%";
+    source.close();
+    // The stream finished with no rows: say why, rather than showing a blank
+    // grid. Formula mode with no formulas is the common case here.
+    if (rows === 0) {
+      const sheet = state.sheets[index]?.name ?? "This sheet";
+      $("empty-note").innerHTML = formulas
+        ? `<strong>No formulas in “${sheet}”.</strong><br>Every cell is a literal value — untick “show formulas” to see them.`
+        : `<strong>“${sheet}” is empty.</strong><br>The parser reported no cells in this sheet.`;
+      $("empty-note").style.display = "block";
+      $("stats").textContent = formulas ? "0 formulas" : "empty sheet";
+    }
+  });
+}
+
+window.addEventListener("pagehide", () => {
+  // Best-effort handle release on navigation/close. sendBeacon can only POST,
+  // so a keepalive DELETE is the right tool for our REST-style endpoint.
+  if (state.workbookId) {
+    fetch(`/api/workbooks/${state.workbookId}`, { method: "DELETE", keepalive: true });
+  }
+});
+</script>
+</body>
+</html>

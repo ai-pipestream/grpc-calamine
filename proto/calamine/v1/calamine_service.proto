@@ -16,6 +16,9 @@ package calamine.v1;
 
 import "calamine/v1/types.proto";
 
+option java_multiple_files = true;
+option java_outer_classname = "CalamineServiceProto";
+
 // CalamineService exposes the calamine spreadsheet reader over gRPC with
 // server-streaming reads.
 service CalamineService {

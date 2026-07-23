@@ -20,8 +20,8 @@ use std::io::Cursor;
 use std::sync::{Arc, RwLock};
 
 use calamine::{
-    open_workbook_auto_from_rs, open_workbook_from_rs, HeaderRow, Ods, Reader, Sheets, Xls, Xlsb,
-    Xlsx,
+    HeaderRow, Ods, Reader, Sheets, Xls, Xlsb, Xlsx, open_workbook_auto_from_rs,
+    open_workbook_from_rs,
 };
 
 use crate::convert;
@@ -43,6 +43,9 @@ pub struct WorkbookEntry {
     pub header_row: Option<HeaderRow>,
     /// Metadata snapshot taken at open time (sheets and defined names).
     pub metadata: pb::Metadata,
+    /// Workbook-level 1904 date-system flag, read once at open time via
+    /// `has_1904_epoch` and stamped onto every streamed datetime cell.
+    pub is_1904: bool,
 }
 
 impl WorkbookEntry {
@@ -50,6 +53,11 @@ impl WorkbookEntry {
     ///
     /// This is blocking CPU work; callers must run it inside
     /// `tokio::task::spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenError`] when calamine cannot re-open the bytes in the
+    /// format recorded at open time.
     pub fn reader(&self) -> Result<WorkbookReader, OpenError> {
         let mut workbook = open_as(Cursor::new(Arc::clone(&self.bytes)), self.format)?;
         if let Some(header_row) = self.header_row {
@@ -119,6 +127,7 @@ impl std::error::Error for OpenError {}
 
 impl WorkbookStore {
     /// Create an empty store.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -127,6 +136,15 @@ impl WorkbookStore {
     ///
     /// This is blocking CPU work; callers must run it inside
     /// `tokio::task::spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenError`] when the bytes cannot be parsed as a workbook
+    /// (or as the specific format given by `format_hint`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store lock was poisoned by a panic on another thread.
     pub fn open(
         &self,
         bytes: Vec<u8>,
@@ -154,6 +172,7 @@ impl WorkbookStore {
                 })
                 .collect(),
         };
+        let is_1904 = convert::has_1904_epoch(&probe);
         drop(probe);
 
         let entry = Arc::new(WorkbookEntry {
@@ -161,6 +180,7 @@ impl WorkbookStore {
             format,
             header_row,
             metadata,
+            is_1904,
         });
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -172,6 +192,11 @@ impl WorkbookStore {
     }
 
     /// Look up an open workbook by id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store lock was poisoned by a panic on another thread.
+    #[must_use]
     pub fn get(&self, id: &str) -> Option<Arc<WorkbookEntry>> {
         self.inner
             .read()
@@ -181,6 +206,10 @@ impl WorkbookStore {
     }
 
     /// Remove a workbook from the store. Returns true if it existed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store lock was poisoned by a panic on another thread.
     pub fn close(&self, id: &str) -> bool {
         self.inner
             .write()
@@ -190,10 +219,21 @@ impl WorkbookStore {
     }
 
     /// Number of currently open workbooks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store lock was poisoned by a panic on another thread.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.inner
             .read()
             .expect("workbook store lock poisoned")
             .len()
+    }
+
+    /// Whether the store currently holds no workbooks.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }

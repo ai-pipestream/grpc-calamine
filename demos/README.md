@@ -1,0 +1,129 @@
+# grpc-calamine demos
+
+Self-contained clients in three languages, all speaking the same
+`calamine.v1` contract from [`../proto`](../proto). Each demo generates (or
+dynamically loads) its stubs from the repository's proto files at build/run
+time — no generated client code is checked in.
+
+Start the server first, from the repository root:
+
+```bash
+cargo run --release
+# grpc-calamine listening on 0.0.0.0:50051
+```
+
+| Demo | Stack | What it shows |
+|---|---|---|
+| [`node-client`](node-client) | Node 20+, `@grpc/grpc-js` | CLI streamer **and a live web viewer** that renders sheets in the browser as the server parses them (gRPC → SSE → DOM) |
+| [`python-client`](python-client) | Python 3.11+, `grpcio` | CLI streamer with formula and VBA-project streaming |
+| [`java-client`](java-client) | Java 17+, Maven, `grpc-java` | Client-streaming upload + blocking server-stream consumption |
+
+## Quick start
+
+```bash
+# Node web viewer (the visual one) — then open http://127.0.0.1:8080
+cd node-client && npm install && npm start
+
+# Node CLI
+cd node-client && node cli.js ../sample-data/date.xlsx
+
+# Python
+cd python-client && ./run.sh ../sample-data/vba.xlsm --vba --formulas
+
+# Java
+cd java-client && mvn -q compile exec:java -Dexec.args="../sample-data/date.xlsx"
+```
+
+All demos accept a sheet name or zero-based index as the second argument
+and honor `CALAMINE_ADDR` (default `127.0.0.1:50051`).
+
+## The API in one workflow
+
+The service is **handle-based**: you upload a workbook once and then issue
+any number of concurrent reads against the returned `workbook_id`. Every
+demo follows the same five steps; the file:line references point at where
+each one is implemented.
+
+1. **Open (client-streaming upload).** Send an `OpenWorkbook` stream whose
+   **first** frame is a `WorkbookOptions` (format hint + optional header
+   row) and whose remaining frames are file `chunk`s in order. The server
+   replies once with `{ workbook_id, detected_format, metadata }`.
+   → `node-client/lib/calamine.js` `openWorkbookStream`,
+   `python-client/client.py` `upload_frames`,
+   `java-client/…/CalamineDemo.java` `openWorkbook`.
+
+2. **Inspect metadata.** The open response already carries `Metadata`
+   (every `Sheet` with its name / type / visibility, plus defined names).
+   `GetMetadata` and `GetDefinedNames` return the same snapshot later.
+
+3. **Stream a worksheet (server-streaming).** Call `StreamWorksheetRange`
+   with the handle and a `SheetSelector` (`sheet_name` **or**
+   `sheet_index`). The first event is always a `RangeStarted` header
+   (resolved sheet name, dimensions, total cell count); then one
+   `WorksheetRow` per row arrives as it is parsed. `StreamWorksheetFormula`
+   has the identical shape but carries formula strings.
+
+4. **Handle errors two ways.** Unknown handle or bad request → the RPC
+   fails with a gRPC status (`NOT_FOUND`, `INVALID_ARGUMENT`,
+   `RESOURCE_EXHAUSTED`). A recoverable per-item failure (e.g. one bad
+   sheet) arrives **in-band** as a `StreamError` event carrying a typed
+   `CalamineError`, so the rest of the stream survives.
+
+5. **Close.** `CloseWorkbook` releases the handle (safe to call on an
+   unknown id). Handles otherwise live until the server stops.
+
+Other reads follow the same streaming shape: `StreamVbaProject`
+(`VbaProjectInfo` header, then one `VbaModule` per module) and
+`GetPictures` (one `Picture` per embedded image).
+
+The one value worth understanding is `CellData`: a `oneof` mirroring
+calamine's `Data`/`DataRef` exactly — `int`, `float`, `string`,
+`shared_string`, `bool`, `date_time` (an Excel serial + the workbook's
+1904 flag), `date_time_iso`, `duration_iso`, `error` (a typed enum), and an
+explicit `empty`. Each demo has a `renderCell` / `render_cell` function
+that turns one `CellData` into display text — that's the whole client-side
+mapping you need.
+
+The contract itself is the source of truth: see
+[`../proto/calamine/v1`](../proto/calamine/v1), whose comments document
+every field.
+
+## See the streaming, not just the result
+
+The point of this service is that rows are emitted **as the parser walks the
+sheet**, never buffered whole. The small fixtures here finish in about a
+millisecond, so to actually watch it stream, feed it a big workbook.
+
+A good one is the ~100 MB sample (≈1M rows) from
+<https://examplefile.com/document/xlsx/100-mb-xlsx> — download it from that
+page in your browser (the site gates direct `curl`), then:
+
+- **Web viewer** — drop the file onto the page and watch rows fill the grid
+  live while the progress bar advances. The bridge forwards each row the
+  instant the Rust server parses it and never holds the whole file (see
+  `openWorkbookStream` in `node-client/lib/calamine.js`).
+- **CLI** — `node cli.js path/to/100mb.xlsx | head` prints the first rows
+  before the sheet has finished parsing.
+
+Nothing in the pipeline touches disk: the browser upload streams straight
+into the gRPC call, and the server keeps only one shared `Arc<[u8]>` of the
+bytes in memory for as long as the handle is open.
+
+## Sample data
+
+[`sample-data/`](sample-data) holds small workbooks originally from the
+[calamine](https://github.com/tafia/calamine) test suite (MIT licensed),
+each chosen to exercise a specific corner of the contract:
+
+| File | Shows off |
+|---|---|
+| `date.xlsx`, `date.xlsb`, `date.xls`, `date.ods` | the same dates across all four formats (1900 epoch) |
+| `date_1904.xlsx` | the workbook-level 1904 date system, carried per cell |
+| `errors.xlsx` | typed error cells (`#DIV/0!`, `#N/A`, …) |
+| `any_sheets.xlsx` | hidden / very-hidden sheets and a chart sheet |
+| `formula.issue.xlsx` | formula streaming (`--formulas` / the "show formulas" toggle) |
+| `vba.xlsm` | a VBA project with modules (`--vba`) |
+| `temperature.xlsx` | a plain numeric sheet |
+
+The Rust integration tests stream these same files and compare every cell
+against calamine's own output.

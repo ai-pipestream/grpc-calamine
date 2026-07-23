@@ -24,3 +24,23 @@ target
 # Added by cargo
 
 /target
+
+# --- Demo build artifacts (generated; never committed) ---
+# Node: installed deps. package-lock.json IS committed for reproducibility.
+demos/node-client/node_modules/
+# Python: virtualenv and protoc-generated stubs.
+demos/python-client/.venv/
+demos/python-client/gen/
+# Java: Maven output (includes protoc-generated sources).
+demos/java-client/target/
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# --- Local logs and scratch ---
+*.log

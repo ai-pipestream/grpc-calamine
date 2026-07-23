@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 
 //! Conversions between `calamine` types and the `calamine.v1` protobuf
 //! messages.

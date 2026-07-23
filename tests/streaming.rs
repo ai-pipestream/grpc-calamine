@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 
 //! End-to-end tests: a real tonic server on an ephemeral port, the generated
 //! protobuf client, and real workbook files from the calamine test suite.

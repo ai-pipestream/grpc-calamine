@@ -8,14 +8,17 @@ keywords = ["excel", "ods", "grpc", "streaming", "calamine"]
 categories = ["parsing", "network-programming"]
 edition = "2024"
 rust-version = "1.88" # Matches calamine's MSRV.
-publish = false # Depends on a local calamine checkout; not for crates.io.
+publish = false # Server binary plus demos; not a library for crates.io.
+# `bench/` is its own crate with a path dependency back on this one, so it is
+# built and run explicitly and never lands in this package or in CI.
+exclude = ["bench", "demos"]
 
 [dependencies]
 calamine = { version = "0.36.0", features = ["picture"] }
 prost = "0.14.4"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
-tonic = "0.14.6"
+tonic = { version = "0.14.6", features = ["gzip", "zstd"] }
 tonic-prost = "0.14.6"
 uuid = { version = "1.24.0", features = ["v4"] }
 

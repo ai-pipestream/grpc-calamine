@@ -105,14 +105,22 @@ def stream_rows(stub: rpc.CalamineServiceStub, workbook_id: str, sheet: str) -> 
     request = svc.StreamWorksheetRangeRequest(
         workbook_id=workbook_id, sheet=sheet_selector(sheet)
     )
+    def print_row(row: svc.WorksheetRow) -> None:
+        cells = " │ ".join(render_cell(c) for c in row.values)
+        print(f"{row.row_index + 1:>6} │ {cells}")
+
     for event in stub.StreamWorksheetRange(request):
         match event.WhichOneof("event"):
             case "started":
                 started = event.started
                 print(f'\nstreaming "{started.sheet_name}" — {started.total_cells} cells\n')
+            # Rows arrive batched by default; the single-row carrier is used
+            # only when the client asks for max_rows_per_message=1.
             case "row":
-                cells = " │ ".join(render_cell(c) for c in event.row.values)
-                print(f"{event.row.row_index + 1:>6} │ {cells}")
+                print_row(event.row)
+            case "rows":
+                for row in event.rows.rows:
+                    print_row(row)
             case "error":
                 detail = event.error.error
                 print(f"in-band error: {detail.message}", file=sys.stderr)

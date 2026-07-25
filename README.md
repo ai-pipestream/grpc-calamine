@@ -77,9 +77,14 @@ After editing anything under `proto/`, re-run
 ## Run
 
 ```bash
-cargo run
+cargo run --release
 # grpc-calamine listening on 0.0.0.0:50051
 ```
+
+Use `--release`. Parsing a workbook is inflate plus XML tokenization, and
+both collapse without optimization: on a large workbook the debug build is
+more than an order of magnitude slower at the same work. Measure it on yours
+with [`bench/`](bench).
 
 Configuration via environment variables:
 
@@ -88,6 +93,22 @@ Configuration via environment variables:
 | `GRPC_CALAMINE_ADDR`             | `0.0.0.0:50051`| Listen address                           |
 | `GRPC_CALAMINE_WORKERS`          | CPU count      | tokio worker threads                     |
 | `GRPC_CALAMINE_BLOCKING_THREADS` | `512`          | max threads for calamine parsing tasks   |
+| `GRPC_CALAMINE_WINDOW_BYTES`     | `52428800`     | HTTP/2 initial stream and connection window |
+
+`GRPC_CALAMINE_WINDOW_BYTES` sizes what the server *receives*, so it governs the
+`OpenWorkbook` upload. HTTP/2 flow control is directional: a client that wants a
+wide window for the row stream sets its own. The default is 50 MiB rather than
+hyper's 1 MiB because window size divided by round-trip time is a hard
+throughput ceiling, and 1 MiB over a 10 ms link caps a bulk transfer near
+100 MB/s. On loopback it makes no measurable difference, and it was measured
+rather than assumed: see [`bench/`](bench).
+
+The server accepts **gzip- and zstd-compressed requests** and compresses
+responses for any client that negotiates it (`grpc-accept-encoding`), with no
+configuration on either side beyond the client asking. The row stream is
+mostly repeated strings, so compression trades CPU for a large wire
+reduction; whether that trade wins depends on your link, and the bench
+harness measures it (`BENCH_COMPRESSION=zstd`) rather than assuming.
 
 Hard limits (compile-time, `src/service.rs`): 512 MiB max workbook upload,
 32 MiB max gRPC frame, 64-event stream backpressure channel.
@@ -104,9 +125,34 @@ concurrent reads against the returned `workbook_id`.
 - `CloseWorkbook` — releases the handle (idempotent-safe).
 - `GetMetadata`, `GetDefinedNames` — workbook metadata snapshots.
 - `StreamWorksheetRange` — server-streaming cell data: one `RangeStarted`
-  header (sheet name, dimensions, total cells), then one `WorksheetRow`
-  event per row, densely populated from the range start. Rows are emitted
-  as parsed (XLSX/XLSB) or after range parsing (XLS/ODS).
+  header (sheet name, dimensions, total cells), then dense rows anchored at
+  column A — a value's index is its absolute column — emitted as parsed
+  (XLSX/XLSB) or after range parsing (XLS/ODS). The streamed grid matches
+  calamine's own `worksheet_range`: trailing blank rows are trimmed and
+  interior gaps arrive as explicit empty rows, which the test suite asserts
+  against calamine for every fixture.
+
+  Rows arrive **batched**, in a `WorksheetRowBatch` on the `rows` event.
+  Batching is what keeps this contract from being message-rate bound: one
+  message per row makes a 1M-row sheet a million messages, and a few
+  microseconds of per-message cost in the client stack then sets the ceiling
+  long before the network does. The server fills up to
+  `max_rows_per_message` rows (default 256) but never holds the first row of
+  a batch longer than 5 ms, so a live view still streams. Set
+  `max_rows_per_message = 1` to get one `WorksheetRow` per message on the
+  `row` event instead. Measured effect and the reasoning are in
+  [`bench/`](bench).
+
+  Set `use_string_table = true` to opt into **dictionary encoding** for
+  shared strings: the stream gains `string_table` events defining each
+  distinct string once, and cells carry a `shared_string_id` instead of a
+  copy of the body. This restores on the wire the deduplication XLSX itself
+  uses, which on string-heavy sheets is most of the bytes. Every id is
+  defined by a chunk sent before the first row that references it, so a
+  client resolves ids with an append-only list. The server interns by
+  pointer identity against calamine's own shared-string borrows, so the
+  encode-side cost is a hash of two machine words per cell. XLSX/XLSB only;
+  other formats accept the flag and stream unchanged.
 - `StreamWorksheetFormula` — same shape, formula strings instead of values.
 - `StreamVbaProject` — `VbaProjectInfo` header (references, module names),
   then one `VbaModule` event per module (raw MBCS bytes; decoding to UTF-8
@@ -135,11 +181,13 @@ let mut rows = client
         sheet: Some(SheetSelector {
             selector: Some(sheet_selector::Selector::SheetName("Sheet1".into())),
         }),
+        // 0 = server default (batched). 1 = one row per message.
+        max_rows_per_message: 0,
     })
     .await?
     .into_inner();
 while let Some(event) = rows.message().await? {
-    // RangeStarted | WorksheetRow | StreamError
+    // RangeStarted | WorksheetRowBatch | WorksheetRow | StreamError
 }
 
 // 3. Release the handle.

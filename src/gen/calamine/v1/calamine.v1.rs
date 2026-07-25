@@ -35,7 +35,7 @@ pub struct ExcelDateTime {
 pub struct CellData {
     /// The cell value. The variants correspond one-to-one to the variants of
     /// `calamine::Data` / `calamine::DataRef`.
-    #[prost(oneof="cell_data::Value", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
+    #[prost(oneof="cell_data::Value", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
     pub value: ::core::option::Option<cell_data::Value>,
 }
 /// Nested message and enum types in `CellData`.
@@ -78,6 +78,15 @@ pub mod cell_data {
         /// set is the entire signal.
         #[prost(message, tag="10")]
         Empty(()),
+        /// Reference into the stream's shared-string table, produced instead of
+        /// `shared_string_value` when the caller opted in with
+        /// `use_string_table`. The id was defined by a `StringTableChunk` sent
+        /// earlier in the same stream; ids carry no meaning outside it. This is
+        /// the deduplication the workbook itself performs — XLSX stores each
+        /// distinct string once and references it per cell — carried through to
+        /// the wire instead of being re-expanded per cell.
+        #[prost(uint32, tag="11")]
+        SharedStringId(u32),
     }
 }
 /// CellPosition is the typed form of calamine's `(row, column)` tuples.
@@ -718,6 +727,31 @@ pub struct StreamWorksheetRangeRequest {
     /// Which worksheet to stream.
     #[prost(message, optional, tag="2")]
     pub sheet: ::core::option::Option<SheetSelector>,
+    /// Upper bound on how many rows the server may pack into one `rows` event.
+    ///
+    /// Batching is adaptive rather than fixed: the server sends as soon as the
+    /// consumer is ready and only accumulates while the consumer is behind, so a
+    /// fast reader still sees rows promptly and a slow one gets fewer, larger
+    /// messages. This value only caps how large that accumulation may grow.
+    ///
+    /// 0 selects the server default. 1 disables batching, restoring one row per
+    /// message.
+    #[prost(uint32, tag="3")]
+    pub max_rows_per_message: u32,
+    /// Opt in to dictionary encoding for shared strings.
+    ///
+    /// When set, cells that would carry `shared_string_value` carry
+    /// `shared_string_id` instead, and the stream gains `string_table` events
+    /// defining those ids. Every id is defined by a chunk sent before the
+    /// first row that references it, so a client can resolve ids with nothing
+    /// but an append-only list. On a string-heavy sheet this removes most of
+    /// the wire volume, because it restores the deduplication the workbook
+    /// itself uses.
+    ///
+    /// Only XLSX and XLSB reads have shared strings; for other formats the
+    /// flag is accepted and changes nothing.
+    #[prost(bool, tag="4")]
+    pub use_string_table: bool,
 }
 /// RangeStarted is the header event of a streamed range. It is always the
 /// first event of `StreamWorksheetRange` and `StreamWorksheetFormula` and
@@ -729,10 +763,17 @@ pub struct RangeStarted {
     pub sheet_name: ::prost::alloc::string::String,
     /// Absolute dimensions of the range. Absent when the range is empty,
     /// matching `Range::start()`/`Range::end()` returning `None`.
+    ///
+    /// For XLSX/XLSB value streams this is the workbook's *declared* extent, a
+    /// pre-allocation hint: `<dimension>` is optional in ECMA-376 and writers
+    /// get it wrong, so the rows that actually stream may undercut or exceed
+    /// it. For buffered formats (XLS/ODS) and formula streams it is the parsed
+    /// range, which is exact.
     #[prost(message, optional, tag="2")]
     pub dimensions: ::core::option::Option<Dimensions>,
     /// Total number of cells in the dense range
-    /// (`Range::get_size().0 * Range::get_size().1`).
+    /// (`Range::get_size().0 * Range::get_size().1`). Carries the same caveat
+    /// as `dimensions`: a hint for XLSX/XLSB value streams, exact elsewhere.
     #[prost(uint64, tag="3")]
     pub total_cells: u64,
 }
@@ -742,10 +783,43 @@ pub struct WorksheetRow {
     /// Absolute zero-based row index within the worksheet.
     #[prost(uint32, tag="1")]
     pub row_index: u32,
-    /// Dense values for this row, in column order starting at the range's
-    /// start column. Cells without content appear as `CellData.empty`.
+    /// Dense values for this row, in column order anchored at column A: a
+    /// value's index is its absolute zero-based column. Cells without content
+    /// appear as `CellData.empty`, and trailing empty cells may be omitted.
     #[prost(message, repeated, tag="2")]
     pub values: ::prost::alloc::vec::Vec<CellData>,
+}
+/// WorksheetRowBatch is one or more consecutive rows delivered together.
+///
+/// One protobuf message per row is correct but message-rate bound: a million
+/// row sheet is a million messages, and at a few microseconds of per-message
+/// cost in every client stack that ceiling is reached long before the network
+/// is. Packing consecutive rows into one message moves that ceiling without
+/// changing what a row is.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorksheetRowBatch {
+    /// Rows in worksheet order, each identical to what `WorksheetRow` would
+    /// carry on its own. Never empty.
+    #[prost(message, repeated, tag="1")]
+    pub rows: ::prost::alloc::vec::Vec<WorksheetRow>,
+}
+/// StringTableChunk defines a run of shared-string table entries for a
+/// stream in `use_string_table` mode.
+///
+/// Ids are dense from zero in order of first appearance, and chunks arrive
+/// in id order, so a client resolves them with an append-only list:
+/// `first_id` always equals the entries already collected. Chunks are
+/// interleaved with row events as the parser discovers new strings, and the
+/// contract guarantees a cell never references an id before the chunk that
+/// defines it. The table belongs to this stream alone.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StringTableChunk {
+    /// Id of `entries\[0\]`; entry N of this chunk defines id `first_id + N`.
+    #[prost(uint32, tag="1")]
+    pub first_id: u32,
+    /// The UTF-8 contents of the newly defined entries. Never empty.
+    #[prost(string, repeated, tag="2")]
+    pub entries: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// StreamError is an in-band error event on a streaming RPC.
 ///
@@ -765,7 +839,7 @@ pub struct StreamError {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StreamWorksheetRangeResponse {
     /// Exactly one event kind is set per message.
-    #[prost(oneof="stream_worksheet_range_response::Event", tags="1, 2, 3")]
+    #[prost(oneof="stream_worksheet_range_response::Event", tags="1, 2, 3, 4, 5")]
     pub event: ::core::option::Option<stream_worksheet_range_response::Event>,
 }
 /// Nested message and enum types in `StreamWorksheetRangeResponse`.
@@ -776,12 +850,23 @@ pub mod stream_worksheet_range_response {
         /// Stream header. Always the first event, sent exactly once.
         #[prost(message, tag="1")]
         Started(super::RangeStarted),
-        /// One row of cell data.
+        /// One row of cell data. Sent only when the caller sets
+        /// `max_rows_per_message = 1`; otherwise rows arrive in `rows`.
         #[prost(message, tag="2")]
         Row(super::WorksheetRow),
         /// An in-band error.
         #[prost(message, tag="3")]
         Error(super::StreamError),
+        /// One or more consecutive rows. This is the default carrier for row
+        /// data, so a client that handles only `row` must ask for
+        /// `max_rows_per_message = 1`.
+        #[prost(message, tag="4")]
+        Rows(super::WorksheetRowBatch),
+        /// Newly defined shared-string table entries. Only sent in
+        /// `use_string_table` mode, always before the first row that references
+        /// any id it defines.
+        #[prost(message, tag="5")]
+        StringTable(super::StringTableChunk),
     }
 }
 /// StreamWorksheetFormulaRequest selects the workbook and worksheet whose
@@ -801,8 +886,9 @@ pub struct FormulaRow {
     /// Absolute zero-based row index within the worksheet.
     #[prost(uint32, tag="1")]
     pub row_index: u32,
-    /// Dense formulas for this row, in column order starting at the range's
-    /// start column. Empty string means the cell has no formula.
+    /// Dense formulas for this row, in column order anchored at column A: a
+    /// formula's index is its absolute zero-based column. Empty string means
+    /// the cell has no formula.
     #[prost(string, repeated, tag="2")]
     pub formulas: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }

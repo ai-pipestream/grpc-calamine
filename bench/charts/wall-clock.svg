@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="780" height="374" viewBox="0 0 780 374" role="img" aria-label="Wall clock to read every cell, digest-checked (2026-07-24)">
+<text x="0" y="16" fill="#98a1ab" font-size="14" font-weight="600" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">Wall clock to read every cell, digest-checked (2026-07-24)</text>
+<text x="780" y="16" fill="#7d8590" font-size="11" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">seconds, lower is better; panel scales differ</text>
+<text x="0" y="34" fill="#98a1ab" font-size="13" font-weight="600" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">105.7 MB workbook, 985k rows, 7.9M cells</text>
+<text x="264" y="62" fill="#7d8590" font-size="12" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">calamine, in process (Rust)</text>
+<rect x="272" y="48" width="36.8" height="20" rx="2" fill="#8b96a8"/>
+<text x="316.8" y="62" fill="#7d8590" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">2.10 s</text>
+<text x="264" y="89" fill="#7d8590" font-size="12" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">gRPC stream, loopback (Rust client)</text>
+<rect x="272" y="75" width="32.6" height="20" rx="2" fill="#4478d0"/>
+<text x="312.6" y="89" fill="#7d8590" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">1.86 s</text>
+<text x="264" y="116" fill="#7d8590" font-size="12" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">python-calamine, in process</text>
+<rect x="272" y="102" width="97.4" height="20" rx="2" fill="#b0a0d8"/>
+<text x="377.4" y="116" fill="#7d8590" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">5.56 s</text>
+<text x="264" y="143" fill="#7d8590" font-size="12" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">gRPC stream into Python</text>
+<rect x="272" y="129" width="84.1" height="20" rx="2" fill="#4478d0"/>
+<text x="364.1" y="143" fill="#7d8590" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">4.80 s</text>
+<text x="264" y="170" fill="#7d8590" font-size="12" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">openpyxl read_only</text>
+<rect x="272" y="156" width="360.8" height="20" rx="2" fill="#c98a9a"/>
+<text x="640.8" y="170" fill="#7d8590" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">20.6 s</text>
+<text x="0" y="201" fill="#98a1ab" font-size="13" font-weight="600" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">NYC 311 sample, 1M rows, 41M cells (186 MB)</text>
+<text x="264" y="229" fill="#7d8590" font-size="12" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">calamine, in process (Rust)</text>
+<rect x="272" y="215" width="38.9" height="20" rx="2" fill="#8b96a8"/>
+<text x="318.9" y="229" fill="#7d8590" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">6.02 s</text>
+<text x="264" y="256" fill="#7d8590" font-size="12" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">gRPC stream, loopback (Rust client)</text>
+<rect x="272" y="242" width="42.7" height="20" rx="2" fill="#4478d0"/>
+<text x="322.7" y="256" fill="#7d8590" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">6.60 s</text>
+<text x="264" y="283" fill="#7d8590" font-size="12" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">python-calamine, in process</text>
+<rect x="272" y="269" width="115.1" height="20" rx="2" fill="#b0a0d8"/>
+<text x="395.1" y="283" fill="#7d8590" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">17.8 s</text>
+<text x="264" y="310" fill="#7d8590" font-size="12" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">gRPC stream into Python</text>
+<rect x="272" y="296" width="118.3" height="20" rx="2" fill="#4478d0"/>
+<text x="398.3" y="310" fill="#7d8590" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">18.3 s</text>
+<text x="264" y="337" fill="#7d8590" font-size="12" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">openpyxl read_only</text>
+<rect x="272" y="323" width="360.8" height="20" rx="2" fill="#c98a9a"/>
+<text x="640.8" y="337" fill="#7d8590" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">55.8 s</text>
+</svg>

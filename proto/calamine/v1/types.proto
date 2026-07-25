@@ -136,6 +136,15 @@ message CellData {
     // Empty cell. Maps to `Data::Empty`. Carries no data; the variant being
     // set is the entire signal.
     google.protobuf.Empty empty = 10;
+
+    // Reference into the stream's shared-string table, produced instead of
+    // `shared_string_value` when the caller opted in with
+    // `use_string_table`. The id was defined by a `StringTableChunk` sent
+    // earlier in the same stream; ids carry no meaning outside it. This is
+    // the deduplication the workbook itself performs — XLSX stores each
+    // distinct string once and references it per cell — carried through to
+    // the wire instead of being re-expanded per cell.
+    uint32 shared_string_id = 11;
   }
 }
 

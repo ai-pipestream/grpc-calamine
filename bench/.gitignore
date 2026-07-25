@@ -1,0 +1,7 @@
+# Build output (this crate is deliberately outside the workspace).
+/target
+
+# Captured numbers stay out of the repository on purpose: results describe
+# one machine and one workbook on one day, and committed numbers rot into
+# claims. Run the harness yourself; published runs live outside the repo.
+/RESULTS.md

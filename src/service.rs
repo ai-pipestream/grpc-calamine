@@ -7,7 +7,10 @@
 //! slow consumers apply backpressure and many workbooks can stream
 //! concurrently. Workbook bytes are kept in memory only.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt::Display;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use calamine::{CellType, Data, HeaderRow, Range, Reader, Sheets};
@@ -26,10 +29,31 @@ const DEFAULT_MAX_WORKBOOK_BYTES: usize = 512 * 1024 * 1024;
 /// Channel capacity between a blocking parser task and the gRPC stream.
 const STREAM_CHANNEL_CAPACITY: usize = 64;
 
+/// Rows the server will pack into one `rows` event when the caller does not
+/// choose. Only reached while the consumer is behind; a consumer that keeps up
+/// receives smaller batches sooner. Sized so a batch of ordinary rows stays
+/// far below the frame limit.
+const DEFAULT_MAX_ROWS_PER_MESSAGE: usize = 256;
+
+/// How long the first row of a batch may wait for company.
+///
+/// Bounds the latency batching adds. Small enough to be invisible in a live
+/// view, large enough that a fast parser fills the row cap long before it
+/// expires.
+const DEFAULT_LINGER: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Rows between linger-deadline checks, so the clock is not read per row.
+const LINGER_CHECK_EVERY: usize = 32;
+
 /// Per-message gRPC frame limit: 32 MiB. Upload clients should chunk well
 /// below this (the reference chunking is 64 KiB–1 MiB); the encoding side
 /// covers very wide rows.
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
+
+/// Upper bound on the string bytes packed into one `StringTableChunk`, kept
+/// far under `MAX_FRAME_BYTES` so a burst of fresh strings (a wide sheet's
+/// first rows) can never build an unencodable event.
+const MAX_STRING_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 /// gRPC implementation of `calamine.v1.CalamineService`.
 pub struct CalamineGrpc {
@@ -56,11 +80,23 @@ impl CalamineGrpc {
 
     /// Wrap into the generated tonic service, with frame limits sized for
     /// chunked uploads and wide rows.
+    ///
+    /// Compression is advertised but never imposed: the server accepts
+    /// gzip- or zstd-compressed requests and will compress responses only
+    /// for a client that asks (`grpc-accept-encoding`). The row stream is
+    /// mostly repeated strings, so zstd trades CPU for a large wire
+    /// reduction; the bench harness measures the exchange rate rather than
+    /// assuming it.
     #[must_use]
     pub fn into_service(self) -> CalamineServiceServer<Self> {
+        use tonic::codec::CompressionEncoding;
         CalamineServiceServer::new(self)
             .max_decoding_message_size(MAX_FRAME_BYTES)
             .max_encoding_message_size(MAX_FRAME_BYTES)
+            .accept_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Zstd)
+            .send_compressed(CompressionEncoding::Gzip)
+            .send_compressed(CompressionEncoding::Zstd)
     }
 }
 
@@ -214,6 +250,192 @@ fn range_row(row_index: u32, values: Vec<pb::CellData>) -> pb::StreamWorksheetRa
     }
 }
 
+/// Wrap a batch of rows into a range-stream response.
+fn range_rows(rows: Vec<pb::WorksheetRow>) -> pb::StreamWorksheetRangeResponse {
+    pb::StreamWorksheetRangeResponse {
+        event: Some(pb::stream_worksheet_range_response::Event::Rows(
+            pb::WorksheetRowBatch { rows },
+        )),
+    }
+}
+
+fn range_string_table(chunk: pb::StringTableChunk) -> pb::StreamWorksheetRangeResponse {
+    pb::StreamWorksheetRangeResponse {
+        event: Some(pb::stream_worksheet_range_response::Event::StringTable(
+            chunk,
+        )),
+    }
+}
+
+/// Per-stream shared-string table for `use_string_table` mode.
+///
+/// `DataRef::SharedString` borrows into the workbook's own shared-strings
+/// table, which is stable for the lifetime of the read, so entries are
+/// interned by pointer identity: a hash of two machine words per cell, never
+/// of the string body. Ids are dense from zero in order of first appearance,
+/// and the batcher sends every pending entry as a `StringTableChunk` before
+/// the first row event that could reference it. The table lives and dies
+/// with one stream; ids carry no meaning outside it.
+struct StringTable {
+    index: HashMap<(usize, usize), u32>,
+    /// Entries interned since the last chunk was taken, in id order.
+    pending: Vec<String>,
+    next_id: u32,
+}
+
+impl StringTable {
+    fn new() -> Self {
+        Self {
+            index: HashMap::new(),
+            pending: Vec::new(),
+            next_id: 0,
+        }
+    }
+
+    /// Intern one shared-string borrow, returning its stream-scoped id.
+    fn intern(&mut self, s: &str) -> u32 {
+        let key = (s.as_ptr() as usize, s.len());
+        if let Some(id) = self.index.get(&key) {
+            return *id;
+        }
+        let id = self.next_id;
+        self.index.insert(key, id);
+        self.pending.push(s.to_string());
+        self.next_id += 1;
+        id
+    }
+
+    /// Take the next chunk of not-yet-sent entries, bounded by
+    /// `MAX_STRING_CHUNK_BYTES` (always at least one entry). `None` when
+    /// everything interned so far is already on the wire.
+    fn take_chunk(&mut self) -> Option<pb::StringTableChunk> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let first_id = self.next_id - self.pending.len() as u32;
+        let mut bytes = 0usize;
+        let mut n = 0usize;
+        for s in &self.pending {
+            if n > 0 && bytes + s.len() > MAX_STRING_CHUNK_BYTES {
+                break;
+            }
+            bytes += s.len();
+            n += 1;
+        }
+        let rest = self.pending.split_off(n);
+        let entries = std::mem::replace(&mut self.pending, rest);
+        Some(pb::StringTableChunk { first_id, entries })
+    }
+}
+
+/// Accumulates rows and decides when to hand them to the channel.
+///
+/// This is Kafka's producer policy: fill up to `batch.size` rows, but never
+/// hold the first row of a batch longer than `linger`. Waiting is what buys
+/// the throughput, because the cost being amortized is per *message*, not per
+/// row, in every client stack. An earlier version flushed as soon as the
+/// channel had capacity (`linger.ms = 0`); that never batched at all here,
+/// because calamine is the slow side of this pipeline and the consumer has
+/// always drained by the time the next row is parsed.
+///
+/// The linger bounds the added latency, so a sheet that parses slowly still
+/// streams rather than stalling until `cap` rows exist.
+struct RowBatcher {
+    rows: Vec<pb::WorksheetRow>,
+    cap: usize,
+    linger: std::time::Duration,
+    /// When the batch's first row was queued.
+    opened_at: Option<std::time::Instant>,
+    /// When true, emit a bare `row` event per row, as the contract's
+    /// `max_rows_per_message = 1` mode requires.
+    single: bool,
+    /// The stream's shared-string table in `use_string_table` mode. Shared
+    /// with the cell conversion that interns into it; the batcher's job is
+    /// to put pending entries on the wire before the rows that need them.
+    strings: Option<Rc<RefCell<StringTable>>>,
+}
+
+impl RowBatcher {
+    fn new(max_rows_per_message: u32, strings: Option<Rc<RefCell<StringTable>>>) -> Self {
+        let cap = match max_rows_per_message {
+            0 => DEFAULT_MAX_ROWS_PER_MESSAGE,
+            n => n as usize,
+        };
+        Self {
+            rows: Vec::new(),
+            cap,
+            linger: DEFAULT_LINGER,
+            opened_at: None,
+            single: cap == 1,
+            strings,
+        }
+    }
+
+    /// Put every string-table entry interned since the last row event on the
+    /// wire. Called before sending rows, which is what upholds the
+    /// contract's "defined before first referenced" guarantee.
+    fn send_new_strings(
+        &mut self,
+        tx: &mpsc::Sender<Result<pb::StreamWorksheetRangeResponse, Status>>,
+    ) -> bool {
+        let Some(table) = &self.strings else {
+            return true;
+        };
+        loop {
+            let chunk = table.borrow_mut().take_chunk();
+            match chunk {
+                Some(chunk) => {
+                    if !send_event(tx, range_string_table(chunk)) {
+                        return false;
+                    }
+                }
+                None => return true,
+            }
+        }
+    }
+
+    /// Queue one row, flushing on the row cap or the linger deadline.
+    /// Returns false once the client has gone away.
+    fn push(
+        &mut self,
+        tx: &mpsc::Sender<Result<pb::StreamWorksheetRangeResponse, Status>>,
+        row_index: u32,
+        values: Vec<pb::CellData>,
+    ) -> bool {
+        if self.single {
+            return self.send_new_strings(tx) && send_event(tx, range_row(row_index, values));
+        }
+        if self.rows.is_empty() {
+            self.opened_at = Some(std::time::Instant::now());
+        }
+        self.rows.push(pb::WorksheetRow { row_index, values });
+
+        if self.rows.len() >= self.cap {
+            return self.flush(tx);
+        }
+        // Checking the clock per row would cost more than it saves on a wide
+        // sheet, and the cap already bounds the batch, so sample it instead.
+        if self.rows.len().is_multiple_of(LINGER_CHECK_EVERY)
+            && self.opened_at.is_some_and(|t| t.elapsed() >= self.linger)
+        {
+            return self.flush(tx);
+        }
+        true
+    }
+
+    /// Send whatever has accumulated. Returns false once the client is gone.
+    fn flush(
+        &mut self,
+        tx: &mpsc::Sender<Result<pb::StreamWorksheetRangeResponse, Status>>,
+    ) -> bool {
+        if self.rows.is_empty() {
+            return true;
+        }
+        self.opened_at = None;
+        self.send_new_strings(tx) && send_event(tx, range_rows(std::mem::take(&mut self.rows)))
+    }
+}
+
 /// Wrap a header into a formula-stream response.
 fn formula_started(header: pb::RangeStarted) -> pb::StreamWorksheetFormulaResponse {
     pb::StreamWorksheetFormulaResponse {
@@ -241,6 +463,7 @@ fn emit_range(
     sheet_name: &str,
     range: &Range<Data>,
     is_1904: bool,
+    batcher: &mut RowBatcher,
     tx: &mpsc::Sender<Result<pb::StreamWorksheetRangeResponse, Status>>,
 ) {
     if !send_event(tx, range_started(range_header(sheet_name, range))) {
@@ -248,29 +471,40 @@ fn emit_range(
     }
     // Empty range: the header is the whole stream.
     let Some(start) = range.start() else { return };
+    // Rows are anchored at column 0 to match the incremental path: a value's
+    // index is its absolute column, so a client never needs the header to
+    // place a cell.
+    let pad = start.1 as usize;
     for (offset, row) in range.rows().enumerate() {
-        let values = row
-            .iter()
-            .map(|d| convert::cell_data(convert::data_value(d, is_1904)))
-            .collect();
-        if !send_event(tx, range_row(start.0 + offset as u32, values)) {
+        let mut values = Vec::with_capacity(pad + row.len());
+        values.resize(pad, convert::empty_cell_data());
+        values.extend(
+            row.iter()
+                .map(|d| convert::cell_data(convert::data_value(d, is_1904))),
+        );
+        if !batcher.push(tx, start.0 + offset as u32, values) {
             return;
         }
     }
+    batcher.flush(tx);
 }
 
 /// Stream cells from an incremental calamine cell reader (XLSX and XLSB),
 /// densifying the sparse cell stream into full rows as they arrive.
 ///
-/// Rows are emitted densely from the declared start row up to the last row
-/// that actually contains a cell: gaps between populated rows are filled
-/// with empty rows, and trailing declared-but-absent rows are not emitted.
+/// The emitted grid matches what calamine's own `worksheet_range` reports in
+/// row extent and populated cells: it spans the first to the last row holding
+/// a non-empty cell, interior gaps are filled with empty rows, and leading or
+/// trailing rows of blanks are not emitted even when the reader yields cells
+/// for them. Rows are dense from column 0, so a value's index is its absolute
+/// column.
 /// `next_cell` yields `Ok(None)` at end of sheet.
 fn emit_incremental<E: Display>(
     sheet_name: &str,
     dims: calamine::Dimensions,
     mut next_cell: impl FnMut() -> Result<Option<(u32, u32, pb::cell_data::Value)>, E>,
     kind: pb::CalamineErrorKind,
+    batcher: &mut RowBatcher,
     tx: &mpsc::Sender<Result<pb::StreamWorksheetRangeResponse, Status>>,
 ) {
     let header = pb::RangeStarted {
@@ -282,14 +516,60 @@ fn emit_incremental<E: Display>(
         return;
     }
 
-    // Degenerate or inverted dimensions: nothing to stream.
-    if dims.end.0 < dims.start.0 || dims.end.1 < dims.start.1 {
-        return;
-    }
-    let width = (dims.end.1 - dims.start.1 + 1) as usize;
+    // The declared extent is a hint, not a guarantee. `<dimension>` is
+    // optional in ECMA-376 and writers get it wrong, which is why calamine's
+    // own `worksheet_range` ignores it and rebuilds the extent from the cells
+    // it actually sees (`Range::from_sparse`). Treating it as a filter would
+    // silently drop every cell outside a wrong or absent declaration, so it is
+    // used only to pre-size the row: a cell past it grows the row instead.
+    //
+    // Rows are anchored at column 0, never at the declared start column. A
+    // one-pass stream that anchors at the declaration cannot re-base rows it
+    // has already sent when a cell arrives left of a wrong declared start, so
+    // anchoring there forces a choice between dropping cells and aborting;
+    // anchoring at zero makes a value's index its absolute column and the
+    // problem impossible.
+    let mut width = dims.end.1 as usize + 1;
     let mut current_row = dims.start.0;
     let mut values = vec![convert::empty_cell_data(); width];
-    let mut row_touched = false;
+
+    // `values`/`current_row` describe a real row.
+    let mut open = false;
+    // The row under construction holds at least one non-empty cell.
+    let mut row_has_value = false;
+    // A non-empty row has already been emitted.
+    let mut started = false;
+    // Completed all-empty rows held back, waiting to learn whether they are an
+    // interior gap or the sheet's trailing padding.
+    let mut pending_empty: u32 = 0;
+
+    // A row is only real to calamine if it holds a non-empty cell:
+    // `Range::from_sparse` builds the extent from non-empty cells alone, so
+    // leading and trailing rows of blanks are not part of the sheet even when
+    // the reader emits cells for them. A worksheet can carry thousands of such
+    // rows (styled but blank), so they are held back rather than streamed: an
+    // interior gap is released once a later non-empty row proves it was a gap,
+    // and trailing padding is simply dropped at end of sheet.
+    macro_rules! complete_row {
+        ($index:expr, $row:expr) => {{
+            let index: u32 = $index;
+            if row_has_value {
+                for back in (1..=pending_empty).rev() {
+                    if !batcher.push(tx, index - back, vec![convert::empty_cell_data(); width]) {
+                        return;
+                    }
+                }
+                pending_empty = 0;
+                started = true;
+                if !batcher.push(tx, index, $row) {
+                    return;
+                }
+            } else if started {
+                pending_empty += 1;
+            }
+            row_has_value = false;
+        }};
+    }
 
     loop {
         let cell = match next_cell() {
@@ -298,40 +578,69 @@ fn emit_incremental<E: Display>(
             Err(e) => return abort_with(tx, kind, e),
         };
         let (row, col, value) = cell;
+        let idx = col as usize;
 
-        // Defensive: ignore cells outside the declared dimensions.
-        if row < dims.start.0 || row > dims.end.0 || col < dims.start.1 || col > dims.end.1 {
-            continue;
+        if open {
+            while current_row < row {
+                let flushed =
+                    std::mem::replace(&mut values, vec![convert::empty_cell_data(); width]);
+                complete_row!(current_row, flushed);
+                current_row += 1;
+            }
+        } else {
+            // Cells arrive in row-major order, so the first one fixes the
+            // starting row. Snapping to it keeps an under-declared start from
+            // manufacturing leading empty rows that calamine would not report.
+            current_row = row;
+            open = true;
         }
 
-        // Flush the current row and any fully-empty gap rows before it.
-        while current_row < row {
-            let flushed = std::mem::replace(&mut values, vec![convert::empty_cell_data(); width]);
-            if !send_event(tx, range_row(current_row, flushed)) {
+        if idx >= width {
+            width = idx + 1;
+            values.resize(width, convert::empty_cell_data());
+        }
+        if !matches!(value, pb::cell_data::Value::Empty(())) {
+            row_has_value = true;
+        }
+        values[idx] = convert::cell_data(value);
+    }
+
+    // Complete the final row. Written out rather than reusing the macro
+    // because none of its bookkeeping is read again. Anything still pending is
+    // trailing padding and is deliberately not emitted.
+    if open && row_has_value {
+        for back in (1..=pending_empty).rev() {
+            if !batcher.push(
+                tx,
+                current_row - back,
+                vec![convert::empty_cell_data(); width],
+            ) {
                 return;
             }
-            current_row += 1;
         }
-
-        values[(col - dims.start.1) as usize] = convert::cell_data(value);
-        row_touched = true;
+        if !batcher.push(tx, current_row, values) {
+            return;
+        }
     }
-
-    // Flush the final row, unless no cell was ever seen (an empty sheet
-    // emits just the header).
-    if row_touched {
-        let _ = send_event(tx, range_row(current_row, values));
-    }
+    batcher.flush(tx);
 }
 
 /// Convert one `Cell<DataRef>` from an incremental reader into the tuple
-/// form used by `emit_incremental`.
+/// form used by `emit_incremental`. With a string table, shared strings
+/// become ids interned against the borrow instead of copies of the body.
 fn cell_tuple(
     cell: calamine::Cell<calamine::DataRef<'_>>,
     is_1904: bool,
+    table: Option<&Rc<RefCell<StringTable>>>,
 ) -> (u32, u32, pb::cell_data::Value) {
     let (row, col) = cell.get_position();
-    (row, col, convert::data_ref_value(cell.get_value(), is_1904))
+    let value = match (cell.get_value(), table) {
+        (calamine::DataRef::SharedString(s), Some(table)) => {
+            pb::cell_data::Value::SharedStringId(table.borrow_mut().intern(s))
+        }
+        (value, _) => convert::data_ref_value(value, is_1904),
+    };
+    (row, col, value)
 }
 
 /// The blocking body of `StreamWorksheetRange`.
@@ -342,8 +651,14 @@ fn cell_tuple(
 fn run_stream_worksheet_range(
     entry: &WorkbookEntry,
     selector: Option<&pb::SheetSelector>,
+    max_rows_per_message: u32,
+    use_string_table: bool,
     tx: &mpsc::Sender<Result<pb::StreamWorksheetRangeResponse, Status>>,
 ) {
+    // Only the incremental readers produce shared strings, so only they can
+    // fill the table; for other formats the flag is an accepted no-op.
+    let table = use_string_table.then(|| Rc::new(RefCell::new(StringTable::new())));
+    let mut batcher = RowBatcher::new(max_rows_per_message, table.clone());
     let sheet_name = match resolve_sheet_name(entry, selector) {
         Ok(name) => name,
         Err(status) => {
@@ -359,49 +674,74 @@ fn run_stream_worksheet_range(
     };
 
     let is_1904 = entry.is_1904;
-    match &mut workbook {
+    match &mut *workbook {
         Sheets::Xlsx(xlsx) => {
-            let mut reader = match xlsx.worksheet_cells_reader(&sheet_name) {
-                Ok(reader) => reader,
-                Err(e) => return abort_with(tx, kind, e),
+            // The cells reader refuses non-worksheets (e.g. chartsheets)
+            // that `worksheet_range` still answers for with an empty range.
+            // The contract is parity with calamine's own API, so fall back
+            // to the buffered path and only fail if calamine itself does.
+            // The scope ends the reader's borrow before the fallback
+            // re-borrows the workbook.
+            let streamed = match xlsx.worksheet_cells_reader(&sheet_name) {
+                Ok(mut reader) => {
+                    let dims = reader.dimensions();
+                    emit_incremental(
+                        &sheet_name,
+                        dims,
+                        || {
+                            reader
+                                .next_cell()
+                                .map(|opt| opt.map(|cell| cell_tuple(cell, is_1904, table.as_ref())))
+                        },
+                        kind,
+                        &mut batcher,
+                        tx,
+                    );
+                    true
+                }
+                Err(_) => false,
             };
-            let dims = reader.dimensions();
-            emit_incremental(
-                &sheet_name,
-                dims,
-                || {
-                    reader
-                        .next_cell()
-                        .map(|opt| opt.map(|cell| cell_tuple(cell, is_1904)))
-                },
-                kind,
-                tx,
-            );
+            if !streamed {
+                match xlsx.worksheet_range(&sheet_name) {
+                    Ok(range) => emit_range(&sheet_name, &range, is_1904, &mut batcher, tx),
+                    Err(e) => abort_with(tx, kind, e),
+                }
+            }
         }
         Sheets::Xlsb(xlsb) => {
-            let mut reader = match xlsb.worksheet_cells_reader(&sheet_name) {
-                Ok(reader) => reader,
-                Err(e) => return abort_with(tx, kind, e),
+            // Same chartsheet fallback as the XLSX arm.
+            let streamed = match xlsb.worksheet_cells_reader(&sheet_name) {
+                Ok(mut reader) => {
+                    let dims = reader.dimensions();
+                    emit_incremental(
+                        &sheet_name,
+                        dims,
+                        || {
+                            reader
+                                .next_cell()
+                                .map(|opt| opt.map(|cell| cell_tuple(cell, is_1904, table.as_ref())))
+                        },
+                        kind,
+                        &mut batcher,
+                        tx,
+                    );
+                    true
+                }
+                Err(_) => false,
             };
-            let dims = reader.dimensions();
-            emit_incremental(
-                &sheet_name,
-                dims,
-                || {
-                    reader
-                        .next_cell()
-                        .map(|opt| opt.map(|cell| cell_tuple(cell, is_1904)))
-                },
-                kind,
-                tx,
-            );
+            if !streamed {
+                match xlsb.worksheet_range(&sheet_name) {
+                    Ok(range) => emit_range(&sheet_name, &range, is_1904, &mut batcher, tx),
+                    Err(e) => abort_with(tx, kind, e),
+                }
+            }
         }
         other => {
             let range = match other.worksheet_range(&sheet_name) {
                 Ok(range) => range,
                 Err(e) => return abort_with(tx, kind, e),
             };
-            emit_range(&sheet_name, &range, is_1904, tx);
+            emit_range(&sheet_name, &range, is_1904, &mut batcher, tx);
         }
     }
 }
@@ -438,8 +778,13 @@ fn run_stream_worksheet_formula(
     }
     // Empty range: the header is the whole stream.
     let Some(start) = range.start() else { return };
+    // Anchored at column 0 like the value stream: a formula's index is its
+    // absolute column. Cells without formulas are empty strings either way.
+    let pad = start.1 as usize;
     for (offset, row) in range.rows().enumerate() {
-        if !send_event(tx, formula_row(start.0 + offset as u32, row.to_vec())) {
+        let mut formulas = vec![String::new(); pad];
+        formulas.extend_from_slice(row);
+        if !send_event(tx, formula_row(start.0 + offset as u32, formulas)) {
             return;
         }
     }
@@ -660,7 +1005,13 @@ impl CalamineService for CalamineGrpc {
         let req = request.into_inner();
         let entry = get_entry(&self.store, &req.workbook_id)?;
         Ok(spawn_blocking_stream(move |tx| {
-            run_stream_worksheet_range(&entry, req.sheet.as_ref(), &tx);
+            run_stream_worksheet_range(
+                &entry,
+                req.sheet.as_ref(),
+                req.max_rows_per_message,
+                req.use_string_table,
+                &tx,
+            );
         }))
     }
 

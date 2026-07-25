@@ -164,6 +164,31 @@ message StreamWorksheetRangeRequest {
 
   // Which worksheet to stream.
   SheetSelector sheet = 2;
+
+  // Upper bound on how many rows the server may pack into one `rows` event.
+  //
+  // Batching is adaptive rather than fixed: the server sends as soon as the
+  // consumer is ready and only accumulates while the consumer is behind, so a
+  // fast reader still sees rows promptly and a slow one gets fewer, larger
+  // messages. This value only caps how large that accumulation may grow.
+  //
+  // 0 selects the server default. 1 disables batching, restoring one row per
+  // message.
+  uint32 max_rows_per_message = 3;
+
+  // Opt in to dictionary encoding for shared strings.
+  //
+  // When set, cells that would carry `shared_string_value` carry
+  // `shared_string_id` instead, and the stream gains `string_table` events
+  // defining those ids. Every id is defined by a chunk sent before the
+  // first row that references it, so a client can resolve ids with nothing
+  // but an append-only list. On a string-heavy sheet this removes most of
+  // the wire volume, because it restores the deduplication the workbook
+  // itself uses.
+  //
+  // Only XLSX and XLSB reads have shared strings; for other formats the
+  // flag is accepted and changes nothing.
+  bool use_string_table = 4;
 }
 
 // RangeStarted is the header event of a streamed range. It is always the
@@ -175,10 +200,17 @@ message RangeStarted {
 
   // Absolute dimensions of the range. Absent when the range is empty,
   // matching `Range::start()`/`Range::end()` returning `None`.
+  //
+  // For XLSX/XLSB value streams this is the workbook's *declared* extent, a
+  // pre-allocation hint: `<dimension>` is optional in ECMA-376 and writers
+  // get it wrong, so the rows that actually stream may undercut or exceed
+  // it. For buffered formats (XLS/ODS) and formula streams it is the parsed
+  // range, which is exact.
   Dimensions dimensions = 2;
 
   // Total number of cells in the dense range
-  // (`Range::get_size().0 * Range::get_size().1`).
+  // (`Range::get_size().0 * Range::get_size().1`). Carries the same caveat
+  // as `dimensions`: a hint for XLSX/XLSB value streams, exact elsewhere.
   uint64 total_cells = 3;
 }
 
@@ -187,9 +219,40 @@ message WorksheetRow {
   // Absolute zero-based row index within the worksheet.
   uint32 row_index = 1;
 
-  // Dense values for this row, in column order starting at the range's
-  // start column. Cells without content appear as `CellData.empty`.
+  // Dense values for this row, in column order anchored at column A: a
+  // value's index is its absolute zero-based column. Cells without content
+  // appear as `CellData.empty`, and trailing empty cells may be omitted.
   repeated CellData values = 2;
+}
+
+// WorksheetRowBatch is one or more consecutive rows delivered together.
+//
+// One protobuf message per row is correct but message-rate bound: a million
+// row sheet is a million messages, and at a few microseconds of per-message
+// cost in every client stack that ceiling is reached long before the network
+// is. Packing consecutive rows into one message moves that ceiling without
+// changing what a row is.
+message WorksheetRowBatch {
+  // Rows in worksheet order, each identical to what `WorksheetRow` would
+  // carry on its own. Never empty.
+  repeated WorksheetRow rows = 1;
+}
+
+// StringTableChunk defines a run of shared-string table entries for a
+// stream in `use_string_table` mode.
+//
+// Ids are dense from zero in order of first appearance, and chunks arrive
+// in id order, so a client resolves them with an append-only list:
+// `first_id` always equals the entries already collected. Chunks are
+// interleaved with row events as the parser discovers new strings, and the
+// contract guarantees a cell never references an id before the chunk that
+// defines it. The table belongs to this stream alone.
+message StringTableChunk {
+  // Id of `entries[0]`; entry N of this chunk defines id `first_id + N`.
+  uint32 first_id = 1;
+
+  // The UTF-8 contents of the newly defined entries. Never empty.
+  repeated string entries = 2;
 }
 
 // StreamError is an in-band error event on a streaming RPC.
@@ -212,11 +275,22 @@ message StreamWorksheetRangeResponse {
     // Stream header. Always the first event, sent exactly once.
     RangeStarted started = 1;
 
-    // One row of cell data.
+    // One row of cell data. Sent only when the caller sets
+    // `max_rows_per_message = 1`; otherwise rows arrive in `rows`.
     WorksheetRow row = 2;
 
     // An in-band error.
     StreamError error = 3;
+
+    // One or more consecutive rows. This is the default carrier for row
+    // data, so a client that handles only `row` must ask for
+    // `max_rows_per_message = 1`.
+    WorksheetRowBatch rows = 4;
+
+    // Newly defined shared-string table entries. Only sent in
+    // `use_string_table` mode, always before the first row that references
+    // any id it defines.
+    StringTableChunk string_table = 5;
   }
 }
 
@@ -235,8 +309,9 @@ message FormulaRow {
   // Absolute zero-based row index within the worksheet.
   uint32 row_index = 1;
 
-  // Dense formulas for this row, in column order starting at the range's
-  // start column. Empty string means the cell has no formula.
+  // Dense formulas for this row, in column order anchored at column A: a
+  // formula's index is its absolute zero-based column. Empty string means
+  // the cell has no formula.
   repeated string formulas = 2;
 }
 

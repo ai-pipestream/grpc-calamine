@@ -37,6 +37,13 @@ if (opened.metadata.definedNames.length > 0) {
 const started = process.hrtime.bigint();
 let rowCount = 0;
 
+/** Print one streamed row, whichever carrier delivered it. */
+function printRow(row) {
+  rowCount += 1;
+  const cells = row.values.map((cell) => renderCell(cell).text || "·");
+  console.log(`${String(row.rowIndex + 1).padStart(6)} │ ${cells.join(" │ ")}`);
+}
+
 const stream = client.streamWorksheetRange(opened.workbookId, sheet);
 stream.on("data", (message) => {
   switch (message.event) {
@@ -49,12 +56,14 @@ stream.on("data", (message) => {
       console.log(`\nstreaming "${sheetName}" ${where} — ${totalCells} cells\n`);
       break;
     }
-    case "row": {
-      rowCount += 1;
-      const cells = message.row.values.map((cell) => renderCell(cell).text || "·");
-      console.log(`${String(message.row.rowIndex + 1).padStart(6)} │ ${cells.join(" │ ")}`);
+    // Rows arrive batched by default and one at a time only when the client
+    // asks for `maxRowsPerMessage: 1`, so both carriers are handled.
+    case "row":
+      printRow(message.row);
       break;
-    }
+    case "rows":
+      message.rows.rows.forEach(printRow);
+      break;
     case "error":
       console.error("in-band error:", message.error.error?.kind, message.error.error?.message);
       if (message.error.terminal) process.exitCode = 1;

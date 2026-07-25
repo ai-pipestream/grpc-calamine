@@ -7,6 +7,8 @@
 //! - `GRPC_CALAMINE_WORKERS` — tokio worker threads (default: CPU count).
 //! - `GRPC_CALAMINE_BLOCKING_THREADS` — cap of the blocking pool that runs
 //!   calamine parsing (default: 512, tokio's own default).
+//! - `GRPC_CALAMINE_WINDOW_BYTES` — HTTP/2 initial stream and connection
+//!   window (default: 50 MiB).
 
 use std::time::Duration;
 
@@ -16,6 +18,13 @@ use grpc_calamine::{CalamineGrpc, WorkbookStore};
 
 /// Default listen address when `GRPC_CALAMINE_ADDR` is not set.
 const DEFAULT_ADDR: &str = "0.0.0.0:50051";
+
+/// Default HTTP/2 initial window, for both the stream and the connection.
+///
+/// hyper's own default is 1 MiB. Workbook uploads are bulk transfers of tens
+/// or hundreds of megabytes, so a wide window keeps them from being paced at
+/// one window per round trip over any link with real latency.
+const DEFAULT_WINDOW_BYTES: u32 = 50 * 1024 * 1024;
 
 /// Read a `usize` environment variable, falling back to `default`.
 fn env_usize(name: &str, default: usize) -> usize {
@@ -51,13 +60,26 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
     let service = CalamineGrpc::new(WorkbookStore::new()).into_service();
 
-    eprintln!("grpc-calamine listening on {addr}");
+    // HTTP/2 flow control is directional: this governs what the server
+    // *receives*, so it sizes the `OpenWorkbook` upload, not the row stream.
+    // A client that wants a wide download window has to set its own; hyper
+    // defaults both to 1 MiB, which throttles a bulk transfer to one window
+    // per round trip once there is real latency in the path.
+    let window = u32::try_from(env_usize(
+        "GRPC_CALAMINE_WINDOW_BYTES",
+        DEFAULT_WINDOW_BYTES as usize,
+    ))
+    .unwrap_or(DEFAULT_WINDOW_BYTES);
+
+    eprintln!("grpc-calamine listening on {addr} (http2 window {window} bytes)");
     Server::builder()
         // Latency/throughput tuning for many concurrent streaming clients.
         .tcp_nodelay(true)
         .tcp_keepalive(Some(Duration::from_secs(60)))
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
+        .initial_stream_window_size(window)
+        .initial_connection_window_size(window)
         .max_concurrent_streams(1024)
         .add_service(service)
         .serve_with_shutdown(addr, shutdown_signal())

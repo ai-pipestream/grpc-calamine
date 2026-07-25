@@ -1055,3 +1055,97 @@ impl CalamineService for CalamineGrpc {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ids are dense from zero in first-appearance order, and repeats of the
+    /// same borrow resolve to the same id without growing the table.
+    #[test]
+    fn string_table_ids_are_dense_and_pointer_deduped() {
+        let backing = String::from("alpha beta alpha");
+        let mut table = StringTable::new();
+
+        let alpha = &backing[0..5];
+        let beta = &backing[6..10];
+        assert_eq!(table.intern(alpha), 0);
+        assert_eq!(table.intern(beta), 1);
+        assert_eq!(table.intern(alpha), 0, "same borrow, same id");
+        assert_eq!(table.intern(beta), 1);
+
+        let chunk = table.take_chunk().expect("two entries pending");
+        assert_eq!(chunk.first_id, 0);
+        assert_eq!(chunk.entries, vec!["alpha".to_string(), "beta".to_string()]);
+        assert!(table.take_chunk().is_none(), "nothing left after the take");
+    }
+
+    /// Interning is by pointer identity, mirroring the workbook's own table:
+    /// equal text at a different address is a different entry, exactly as
+    /// two identical entries in an sst would be.
+    #[test]
+    fn string_table_distinguishes_equal_text_at_different_addresses() {
+        let a = String::from("same");
+        let b = String::from("same");
+        let mut table = StringTable::new();
+        assert_eq!(table.intern(&a), 0);
+        assert_eq!(table.intern(&b), 1);
+    }
+
+    /// A burst of large fresh strings splits across chunks at the byte cap,
+    /// preserving order and id continuity, so no chunk can outgrow the gRPC
+    /// frame limit.
+    #[test]
+    fn string_table_chunks_split_at_the_byte_cap() {
+        // Three strings of 3 MiB against a 4 MiB cap: the first chunk takes
+        // one string plus whatever fits (only the first, since two exceed
+        // the cap), and the remainder follows in later chunks.
+        let big: Vec<String> = (0..3)
+            .map(|i| {
+                let mut s = String::with_capacity(3 * 1024 * 1024);
+                while s.len() < 3 * 1024 * 1024 {
+                    s.push(char::from(b'a' + i));
+                }
+                s
+            })
+            .collect();
+        let mut table = StringTable::new();
+        for s in &big {
+            table.intern(s);
+        }
+
+        let mut collected: Vec<String> = Vec::new();
+        let mut next_expected_id = 0u32;
+        while let Some(chunk) = table.take_chunk() {
+            assert_eq!(
+                chunk.first_id, next_expected_id,
+                "chunks are dense and in order"
+            );
+            let bytes: usize = chunk.entries.iter().map(String::len).sum();
+            assert!(
+                bytes <= MAX_STRING_CHUNK_BYTES || chunk.entries.len() == 1,
+                "a chunk only exceeds the cap when a single entry does"
+            );
+            next_expected_id += chunk.entries.len() as u32;
+            collected.extend(chunk.entries);
+        }
+        assert_eq!(collected, big, "every entry arrives exactly once, in order");
+    }
+
+    /// An entry bigger than the cap still ships, alone in its chunk.
+    #[test]
+    fn string_table_oversized_entry_ships_alone() {
+        let huge = "x".repeat(MAX_STRING_CHUNK_BYTES + 1);
+        let small = String::from("small");
+        let mut table = StringTable::new();
+        table.intern(&huge);
+        table.intern(&small);
+
+        let first = table.take_chunk().expect("first chunk");
+        assert_eq!(first.entries.len(), 1, "the oversized entry ships alone");
+        assert_eq!(first.entries[0].len(), MAX_STRING_CHUNK_BYTES + 1);
+        let second = table.take_chunk().expect("second chunk");
+        assert_eq!(second.first_id, 1);
+        assert_eq!(second.entries, vec![small]);
+    }
+}

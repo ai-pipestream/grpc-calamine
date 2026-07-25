@@ -85,7 +85,7 @@ def p2_python_calamine(path, sheet):
     return (time.perf_counter() - t) * 1e3, d
 
 
-def p3_grpc(path, sheet, addr):
+def p3_grpc(path, sheet, addr, use_dict=False):
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "gen"))
     import grpc
     from calamine.v1 import calamine_service_pb2 as svc
@@ -114,6 +114,9 @@ def p3_grpc(path, sheet, addr):
 
         t = time.perf_counter()
         d = Digest()
+        # In dictionary mode ids resolve against an append-only list; the
+        # contract guarantees every id is defined before its first use.
+        table = []
 
         def take(r):
             d.row()
@@ -121,6 +124,8 @@ def p3_grpc(path, sheet, addr):
                 which = c.WhichOneof("value")
                 if which in ("string_value", "shared_string_value"):
                     d.cell(getattr(c, which))
+                elif which == "shared_string_id":
+                    d.cell(table[c.shared_string_id])
                 elif which == "float_value":
                     d.cell(c.float_value)
                 elif which == "int_value":
@@ -138,6 +143,7 @@ def p3_grpc(path, sheet, addr):
             workbook_id=opened.workbook_id,
             sheet=svc.SheetSelector(sheet_name=sheet),
             max_rows_per_message=int(os.environ.get("BATCH", "0")),
+            use_string_table=use_dict,
         )
         msgs = 0
         for ev in stub.StreamWorksheetRange(req):
@@ -149,6 +155,9 @@ def p3_grpc(path, sheet, addr):
             elif k == "row":
                 msgs += 1
                 take(ev.row)
+            elif k == "string_table":
+                assert ev.string_table.first_id == len(table), "chunks arrive in id order"
+                table.extend(ev.string_table.entries)
         ms = (time.perf_counter() - t) * 1e3
         stub.CloseWorkbook(svc.CloseWorkbookRequest(workbook_id=opened.workbook_id))
         return ms, d, upload_ms, msgs
@@ -167,6 +176,11 @@ def main():
         ms, d, up, msgs = p3_grpc(path, sheet, addr)
         results.append(("P3 grpc-calamine over gRPC", ms, d))
         print(f"  upload once: {up:.0f} ms, {msgs} messages")
+
+    if only in (None, "p4"):
+        ms, d, up, msgs = p3_grpc(path, sheet, addr, use_dict=True)
+        results.append(("P4 gRPC + use_string_table", ms, d))
+        print(f"  upload once: {up:.0f} ms, {msgs} messages (dict)")
 
     if only in (None, "p2"):
         ms, d = p2_python_calamine(path, sheet)

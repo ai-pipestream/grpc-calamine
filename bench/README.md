@@ -3,10 +3,10 @@
 A library call is free. A socket is not. This harness measures the difference
 on a real workbook, in a way built to be hard to accuse of stacking the deck.
 
-This directory commits the instrument, never the readings. Numbers describe
-one machine, one file and one day, and committed numbers rot into claims, so
-`RESULTS.md` is gitignored on purpose. Run the harness on your own workbook;
-our captured runs are published separately.
+Captured runs live in [RESULTS.md](RESULTS.md), dated and hardware-stamped,
+with addresses rewritten to documentation ranges. They describe one machine,
+one file and one day. When the code changes enough for them to drift, rerun
+and replace them; don't quote them against different hardware.
 
 ```bash
 cargo build --release        # from the repository root, builds the server
@@ -193,6 +193,8 @@ the harness so cross-implementation agreement is checkable:
 
 ## Captured results
 
-Deliberately not here. `RESULTS.md` stays out of git; published numbers live
-outside the repository, with the hardware, link speed and workbook shape
-stated next to every table.
+[RESULTS.md](RESULTS.md), with the hardware, link speed and workbook shape
+stated next to every table. Machine-specific settings for reruns (addresses,
+workbook paths) go in `bench/.env`, which is gitignored; copy
+[`.env.example`](.env.example) and edit. Real environment variables override
+the file.

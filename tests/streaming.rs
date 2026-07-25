@@ -1036,3 +1036,21 @@ async fn string_table_deduplicates() {
         "table size must equal the distinct shared strings on the sheet"
     );
 }
+
+/// The dictionary composes with wire compression: a zstd-negotiating client
+/// in `use_string_table` mode still resolves to the identical rows.
+#[tokio::test]
+async fn string_table_mode_composes_with_compression() {
+    let client = start_server().await;
+    let opened = upload(&client, "temperature.xlsx").await;
+    let (_, plain) = stream_range(&client, &opened.workbook_id, 0).await;
+
+    let compressed_client = client
+        .clone()
+        .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
+    let (resolved, table_len) =
+        stream_range_resolved(&compressed_client, &opened.workbook_id, 0, 0).await;
+
+    assert_eq!(resolved, plain);
+    assert!(table_len > 0);
+}

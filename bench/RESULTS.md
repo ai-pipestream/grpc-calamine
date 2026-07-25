@@ -941,17 +941,23 @@ Summary, dense-cell throughput on arm 3:
 |---|---|---|---|
 | calamine alone, in process | 6.02 s | | |
 | grpc-calamine | 6.60 s | 662.2 MB | 3.56x |
+| + zstd alone | 6.53 s | 158.4 MB | 0.85x |
 | + use_string_table | 6.50 s | 300.8 MB | 1.62x |
-| + zstd as well | 6.47 s | 103.9 MB | 0.56x |
+| + use_string_table + zstd | 6.47 s | 103.9 MB | 0.56x |
 
 The dictionary also cuts arm 3 CPU from 11.5 s to 9.7 s: 2.8 million table
-entries replace 28 million per-cell string copies.
+entries replace 28 million per-cell string copies. On this file zstd alone
+out-compresses the dictionary alone (the 311 text is highly repetitive),
+but pays for it in CPU: 12.5 s against the dictionary's 9.7 s. On the
+105.7 MB workbook above the two ranked the other way around; which single
+fix wins on bytes depends on the data, and the combination is smallest on
+both.
 
 ```
 ### plain
 grpc-calamine: in-process calamine vs the same work over gRPC
 
-workbook    : /home/krickert/Documents/lo-convert/NYC_311_SR_2010-2020-sample-1M.xlsx
+workbook    : NYC_311_SR_2010-2020-sample-1M.xlsx
 size        : 186.0 MB
 sheet       : NYC_311_SR_2010-2020-sample-1M   (of 1: NYC_311_SR_2010-2020-sample-1M)
 iterations  : 3, arms interleaved
@@ -1026,7 +1032,7 @@ upload leg, counted separately
 ### BENCH_DICT=1
 grpc-calamine: in-process calamine vs the same work over gRPC
 
-workbook    : /home/krickert/Documents/lo-convert/NYC_311_SR_2010-2020-sample-1M.xlsx
+workbook    : NYC_311_SR_2010-2020-sample-1M.xlsx
 size        : 186.0 MB
 sheet       : NYC_311_SR_2010-2020-sample-1M   (of 1: NYC_311_SR_2010-2020-sample-1M)
 iterations  : 3, arms interleaved
@@ -1102,7 +1108,7 @@ upload leg, counted separately
 ### BENCH_DICT=1 BENCH_COMPRESSION=zstd
 grpc-calamine: in-process calamine vs the same work over gRPC
 
-workbook    : /home/krickert/Documents/lo-convert/NYC_311_SR_2010-2020-sample-1M.xlsx
+workbook    : NYC_311_SR_2010-2020-sample-1M.xlsx
 size        : 186.0 MB
 sheet       : NYC_311_SR_2010-2020-sample-1M   (of 1: NYC_311_SR_2010-2020-sample-1M)
 iterations  : 3, arms interleaved
@@ -1176,10 +1182,88 @@ upload leg, counted separately
   paid once per workbook, then any number of reads reuse the handle.
 ```
 
+### BENCH_COMPRESSION=zstd (no dict)
+
+```
+grpc-calamine: in-process calamine vs the same work over gRPC
+
+workbook    : NYC_311_SR_2010-2020-sample-1M.xlsx
+size        : 186.0 MB
+sheet       : NYC_311_SR_2010-2020-sample-1M   (of 1: NYC_311_SR_2010-2020-sample-1M)
+iterations  : 3, arms interleaved
+host        : 32 logical cores
+profile     : release (cargo defaults; no [profile.release] overrides)
+
+client http2 window: 52428800 bytes
+compression : zstd (grpc-encoding for the row stream)
+string dict : off
+
+
+  iteration 1/3
+  iteration 2/3
+  iteration 3/3
+                        
+same-work proof (digest of the canonical cell stream)
+  0 calamine sparse walk             d403ab267fbefeac/28103666r/28103666c
+  1 native dense                     20dd91d5215cbcd4/1000001r/41000041c
+  2 native dense + protobuf encode   20dd91d5215cbcd4/1000001r/41000041c
+  3 gRPC end to end                  20dd91d5215cbcd4/1000001r/41000041c
+
+  arms 1-3 identical: yes
+  arm 0 walks only populated cells (28103666 vs 41000041), so it is not comparable and is shown as a floor.
+
+wall clock ms (min / median / p95), and CPU seconds burned per run
+                                               min      med      p95     CPU s
+  0  calamine alone, populated cells only    5737.2   5759.5   5793.5      5.80
+  1  + dense canonical grid                  6412.8   6412.8   6436.0      6.46
+  2  + protobuf convert and encode           6920.6   6963.9   6995.7      6.99
+  3  + gRPC socket, decoded by the client    6500.1   6525.5   6564.9     12.50
+
+where the in-process time goes (arms 0-2 are one serial thread)
+  calamine parse, the floor                  5759.5 ms   82.7%
+  densify into the contract's grid            653.4 ms    9.4%
+  protobuf convert + encode                   551.1 ms    7.9%
+  total the server must do per read          6963.9 ms
+
+what the gRPC surface actually costs
+  same work, one thread, in process (2)      6963.9 ms wall    6.99 s CPU
+  same work, over the wire (3)               6525.5 ms wall   12.50 s CPU
+  wall clock                                 -438.4 ms  (-6.3%)
+  CPU                                         +5.51 s   (1.79x)
+  parallelism used by arm 3                    1.92 cores (CPU / wall)
+
+  Read the two columns together. gRPC finishes sooner in wall clock because
+  the server parses while the client decodes, on different cores; it is not
+  doing less work. The honest cost of the surface is the CPU column and the
+  bytes below, not latency.
+
+  versus plain calamine in your own process (arm 0):
+    wall +766.0 ms (1.13x), CPU +6.70 s (2.16x)
+  server peak RSS                             371.7 MiB
+
+shape and wire
+  rows                                     1000001
+  cells (dense)                            41000041
+  protobuf payload (arm 2 encode)             661.8 MB
+  bytes on the socket (arm 3)                 158.4 MB  (compression: zstd, dict: off)
+  expansion over the source file               0.85x  (socket / source)
+  messages on the stream                   3907  (256.0 rows each)
+  throughput (arm 3, median)                 153245 rows/s, 6283030 cells/s
+
+latency to the first row
+  gRPC stream (min / median / p95)              3.8      3.9      4.0 ms
+  a batch API cannot answer before           6963.9 ms  (arm 2 completes)
+
+upload leg, counted separately
+  OpenWorkbook for 186.0 MB                  641.4 ms  (290 MB/s)
+  bytes written on the socket                 186.1 MB
+  paid once per workbook, then any number of reads reuse the handle.
+```
+
 Python, same file:
 
 ```
-workbook : /home/krickert/Documents/lo-convert/NYC_311_SR_2010-2020-sample-1M.xlsx
+workbook : NYC_311_SR_2010-2020-sample-1M.xlsx
 sheet    : NYC_311_SR_2010-2020-sample-1M
 
   upload once: 602 ms, 3907 messages
@@ -1211,7 +1295,7 @@ same class of disagreement the synthetic fixtures in `tests/` pin down.
 ### plain
 grpc-calamine: in-process calamine vs the same work over gRPC
 
-workbook    : /home/krickert/Documents/NYC_311_SR_2010-2020-sample-1M.xlsx
+workbook    : NYC_311_SR_2010-2020-sample-1M.xlsx
 size        : 250.9 MB
 sheet       : NYC_311_SR_2010-2020-sample-1M   (of 1: NYC_311_SR_2010-2020-sample-1M)
 iterations  : 3, arms interleaved
@@ -1286,7 +1370,7 @@ upload leg, counted separately
 ### BENCH_DICT=1 (0 table entries: no sst to intern)
 grpc-calamine: in-process calamine vs the same work over gRPC
 
-workbook    : /home/krickert/Documents/NYC_311_SR_2010-2020-sample-1M.xlsx
+workbook    : NYC_311_SR_2010-2020-sample-1M.xlsx
 size        : 250.9 MB
 sheet       : NYC_311_SR_2010-2020-sample-1M   (of 1: NYC_311_SR_2010-2020-sample-1M)
 iterations  : 3, arms interleaved
@@ -1363,7 +1447,7 @@ upload leg, counted separately
 Python, same file:
 
 ```
-workbook : /home/krickert/Documents/NYC_311_SR_2010-2020-sample-1M.xlsx
+workbook : NYC_311_SR_2010-2020-sample-1M.xlsx
 sheet    : NYC_311_SR_2010-2020-sample-1M
 
   upload once: 167 ms, 3907 messages

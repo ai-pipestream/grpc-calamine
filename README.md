@@ -10,37 +10,53 @@ Formats: `.xls`/`.xla`, `.xlsx`/`.xlsm`/`.xlam`, `.xlsb`, `.ods`.
 
 ## Speed
 
-Numbers from a 105.7 MB, 985,351-row `.xlsx` (7.9 million cells) on a Ryzen
-9 9950X3D, captured 2026-07-24. Full runs and methodology live in
+Two workbooks, measured 2026-07-24 on a Ryzen 9 9950X3D: a 105.7 MB
+`.xlsx` with 985,351 rows (7.9 million cells), and the NYC 311 1M-row
+sample (41 million cells) that calamine's own README benchmarks against,
+converted from the published CSV with LibreOffice into the same 186 MB
+file upstream reports. Full captures and methodology live in
 [bench/RESULTS.md](bench/RESULTS.md) and [bench/](bench).
 
-|                                             | wall clock |
-|---------------------------------------------|------------|
-| calamine as a library, in your own process  | 2.10 s     |
-| the same sheet over grpc-calamine, loopback | 1.86 s     |
-| time to the first row                       | 1.5 ms     |
-| python-calamine, in process                 | 5.5 s      |
-| the same rows into Python over gRPC         | 4.8 s      |
+| wall clock                          | 105.7 MB | NYC 311 |
+|-------------------------------------|----------|---------|
+| calamine as a library, in process   | 2.10 s   | 6.02 s  |
+| the same sheet over gRPC, loopback  | 1.86 s   | 6.60 s  |
+| python-calamine, in process         | 5.5 s    | 17.8 s  |
+| the same rows into Python over gRPC | 4.8 s    | 18.3 s  |
+| openpyxl `read_only`, in process    | 20.6 s   | 55.8 s  |
 
-The stream finishes before the in-process library call because the server
-parses while the client decodes, on different cores. What it costs is CPU
-(about 1.6x the single-threaded work) and wire size: protobuf re-expands
-the strings that XLSX stores once, 789 MB for this file. Both fixes are
-built in, and both are measured rather than assumed:
+The first streamed row arrives in a few milliseconds; a batch API answers
+after the whole parse. End to end, the stream lands within 10% of the
+in-process library call, and on the smaller file it wins outright, because
+the server parses while the client decodes on other cores. What the socket
+costs is CPU (roughly 1.6x the single-threaded work) and bytes: protobuf
+re-expands the strings the workbook stores once. Both fixes are built in,
+and measured rather than assumed:
 
-| row stream         | on the socket | vs the 105.7 MB file |
-|--------------------|---------------|----------------------|
-| plain              | 789 MB        | 7.5x                 |
-| zstd compression   | 290 MB        | 2.7x                 |
-| `use_string_table` | 173 MB        | 1.6x                 |
-| both               | 62 MB         | 0.6x                 |
+| on the socket      | 105.7 MB file | NYC 311 (186 MB) |
+|--------------------|---------------|------------------|
+| plain              | 789 MB (7.5x) | 662 MB (3.6x)    |
+| zstd compression   | 290 MB (2.7x) | 158 MB (0.9x)    |
+| `use_string_table` | 173 MB (1.6x) | 301 MB (1.6x)    |
+| both               | 62 MB (0.6x)  | 104 MB (0.6x)    |
 
-`use_string_table` is dictionary encoding. Each distinct string crosses the
-wire once and cells carry u32 ids, which also costs less CPU than the plain
-stream since neither side copies string bodies per cell. Every mode feeds
+Multiples are of the source file's own size.
+
+`use_string_table` is dictionary encoding: each distinct string crosses
+the wire once and cells carry u32 ids. It is also the cheapest mode on
+CPU, since neither side copies string bodies per cell; zstd buys its bytes
+with extra CPU instead. Which one wins on bytes alone depends on the data,
+as the two files above show, and the combination is the smallest in every
+run, at just over half the size of the source `.xlsx`. Every mode feeds
 the same digest check, so none of them can win by dropping data.
 
-Your workbook and your hardware will move these numbers. The bench reruns
+Two Python notes, because they would be easy to overclaim: dictionary mode
+does not change Python wall clock on loopback (the interpreter's per-cell
+loop is the bottleneck; the win there is the wire), and openpyxl's rows
+above cover a slightly different grid, since it trusts the workbook's
+declared dimension where calamine trims to the real extent.
+
+Your workbook and your hardware will move all of this. The bench reruns
 everything with one command.
 
 ## How it works

@@ -98,6 +98,13 @@ def bar_chart(title, panels, value_label, out, shared_scale=None, marker=None):
             f'<text x="0" y="{y}" fill="{STRONG}" font-size="13" font-weight="600" {FONT}>{panel_title}</text>'
         )
         y += panel_head - 20
+        if marker is not None:
+            # Label above the bars so the widest bar can't paint over it.
+            mx = label_w + marker / scale_max * bar_area
+            body.append(
+                f'<text x="{mx + 6:.1f}" y="{y + 10}" fill="{TEXT}" font-size="11" {FONT}>size of the source file</text>'
+            )
+            y += 16
         top = y
         for label, value, color, text in rows:
             w = max(2, value / scale_max * bar_area)
@@ -115,9 +122,6 @@ def bar_chart(title, panels, value_label, out, shared_scale=None, marker=None):
             mx = label_w + marker / scale_max * bar_area
             body.append(
                 f'<line x1="{mx:.1f}" y1="{top - 4}" x2="{mx:.1f}" y2="{y - 3}" stroke="{TEXT}" stroke-dasharray="4 3" stroke-width="1"/>'
-            )
-            body.append(
-                f'<text x="{mx + 6:.1f}" y="{top + 8}" fill="{TEXT}" font-size="11" {FONT}>size of the source file</text>'
             )
         y += panel_gap
     height = y + 6

@@ -194,7 +194,9 @@ the harness so cross-implementation agreement is checkable:
 ## Captured results
 
 [RESULTS.md](RESULTS.md), with the hardware, link speed and workbook shape
-stated next to every table. Machine-specific settings for reruns (addresses,
-workbook paths) go in `bench/.env`, which is gitignored; copy
-[`.env.example`](.env.example) and edit. Real environment variables override
-the file.
+stated next to every table. The charts the README embeds are rendered from
+those captures by [`charts.py`](charts.py) into [`charts/`](charts);
+regenerate them whenever the captures change. Machine-specific settings
+for reruns (addresses, workbook paths) go in `bench/.env`, which is
+gitignored; copy [`.env.example`](.env.example) and edit. Real environment
+variables override the file.

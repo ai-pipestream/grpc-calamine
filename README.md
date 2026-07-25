@@ -17,13 +17,7 @@ converted from the published CSV with LibreOffice into the same 186 MB
 file upstream reports. Full captures and methodology live in
 [bench/RESULTS.md](bench/RESULTS.md) and [bench/](bench).
 
-| wall clock                          | 105.7 MB | NYC 311 |
-|-------------------------------------|----------|---------|
-| calamine as a library, in process   | 2.10 s   | 6.02 s  |
-| the same sheet over gRPC, loopback  | 1.86 s   | 6.60 s  |
-| python-calamine, in process         | 5.5 s    | 17.8 s  |
-| the same rows into Python over gRPC | 4.8 s    | 18.3 s  |
-| openpyxl `read_only`, in process    | 20.6 s   | 55.8 s  |
+![Wall clock to read every cell, both datasets](bench/charts/wall-clock.svg)
 
 The first streamed row arrives in a few milliseconds; a batch API answers
 after the whole parse. End to end, the stream lands within 10% of the
@@ -33,14 +27,7 @@ costs is CPU (roughly 1.6x the single-threaded work) and bytes: protobuf
 re-expands the strings the workbook stores once. Both fixes are built in,
 and measured rather than assumed:
 
-| on the socket      | 105.7 MB file | NYC 311 (186 MB) |
-|--------------------|---------------|------------------|
-| plain              | 789 MB (7.5x) | 662 MB (3.6x)    |
-| zstd compression   | 290 MB (2.7x) | 158 MB (0.9x)    |
-| `use_string_table` | 173 MB (1.6x) | 301 MB (1.6x)    |
-| both               | 62 MB (0.6x)  | 104 MB (0.6x)    |
-
-Multiples are of the source file's own size.
+![Bytes on the socket per mode, both datasets](bench/charts/wire-bytes.svg)
 
 `use_string_table` is dictionary encoding: each distinct string crosses
 the wire once and cells carry u32 ids. It is also the cheapest mode on
@@ -49,6 +36,18 @@ with extra CPU instead. Which one wins on bytes alone depends on the data,
 as the two files above show, and the combination is the smallest in every
 run, at just over half the size of the source `.xlsx`. Every mode feeds
 the same digest check, so none of them can win by dropping data.
+
+The wire sizes stop being an abstraction once a real network sits between
+the machines. Same 105.7 MB workbook, server on a second machine, the
+link shaped with `tc`:
+
+![Streaming the same workbook over a real link](bench/charts/network.svg)
+
+On a saturated link the transfer is bytes divided by bandwidth, so the
+smaller stream is the faster stream: at 250 Mbit/s the dictionary with
+zstd is 10x faster than the plain stream, and at 1 Gbit/s it beats plain
+mode running on 10 GbE, because 62 MB stays under the parse time even at
+gigabit rates.
 
 Two Python notes, because they would be easy to overclaim: dictionary mode
 does not change Python wall clock on loopback (the interpreter's per-cell

@@ -1,0 +1,912 @@
+# Captured results
+
+Captured 2026-07-23/24. These numbers describe one machine, one workbook and
+one day; rerun the harness (see [README.md](README.md)) rather than quoting
+them against different hardware. IP addresses in the captures are rewritten
+to documentation ranges; the network runs used a real 10 GbE LAN and a real
+WireGuard (Tailscale) path between two machines.
+
+Host: AMD Ryzen 9 9950X3D, 32 logical cores, Linux 7.0.0-28-generic.
+Second machine (network runs): AMD Ryzen 9 9950X, 32 logical cores, 10 GbE.
+Build: release profile, cargo defaults (no `[profile.release]` overrides).
+Workbook: 105,709,047 bytes, 4 sheets; `Worksheet` is the largest.
+
+The grid is 985,351 rows x 8 cols. That is what calamine's own
+`worksheet_range` reports for this sheet: the declared `<dimension>` claims
+1,043,928 rows, but the last 58,577 hold only blanks and `Range::from_sparse`
+trims them.
+
+```
+grpc-calamine: in-process calamine vs the same work over gRPC
+
+workbook    : 100mb.xlsx
+size        : 105.7 MB
+sheet       : Worksheet   (of 4: Worksheet (2), Worksheet (3), Tablo3, Worksheet)
+iterations  : 5, arms interleaved
+host        : 32 logical cores
+profile     : release (cargo defaults; no [profile.release] overrides)
+
+client http2 window: 52428800 bytes
+
+
+  iteration 1/5
+  iteration 2/5
+  iteration 3/5
+  iteration 4/5
+  iteration 5/5
+                        
+same-work proof (digest of the canonical cell stream)
+  0 calamine sparse walk             7b7ae3deea46e84e/7888232r/7888232c
+  1 native dense                     b1ec698bf30cde49/985351r/7882808c
+  2 native dense + protobuf encode   b1ec698bf30cde49/985351r/7882808c
+  3 gRPC end to end                  b1ec698bf30cde49/985351r/7882808c
+
+  arms 1-3 identical: yes
+  arm 0 walks only populated cells (7888232 vs 7882808), so it is not comparable and is shown as a floor.
+
+wall clock ms (min / median / p95), and CPU seconds burned per run
+                                               min      med      p95     CPU s
+  0  calamine alone, populated cells only    2082.7   2097.1   2106.7      2.12
+  1  + dense canonical grid                  2310.6   2314.1   2327.8      2.34
+  2  + protobuf convert and encode           2417.2   2428.0   2441.2      2.45
+  3  + gRPC socket, decoded by the client    1799.5   1836.9   1878.1      4.03
+
+where the in-process time goes (arms 0-2 are one serial thread)
+  calamine parse, the floor                  2097.1 ms   86.4%
+  densify into the contract's grid            217.0 ms    8.9%
+  protobuf convert + encode                   114.0 ms    4.7%
+  total the server must do per read          2428.0 ms
+
+what the gRPC surface actually costs
+  same work, one thread, in process (2)      2428.0 ms wall    2.45 s CPU
+  same work, over the wire (3)               1836.9 ms wall    4.03 s CPU
+  wall clock                                 -591.1 ms  (-24.3%)
+  CPU                                         +1.57 s   (1.64x)
+  parallelism used by arm 3                    2.19 cores (CPU / wall)
+
+  Read the two columns together. gRPC finishes sooner in wall clock because
+  the server parses while the client decodes, on different cores; it is not
+  doing less work. The honest cost of the surface is the CPU column and the
+  bytes below, not latency.
+
+  versus plain calamine in your own process (arm 0):
+    wall -260.2 ms (0.88x), CPU +1.90 s (1.90x)
+  server peak RSS                             296.1 MiB
+
+shape and wire
+  rows                                     985351
+  cells (dense)                            7882808
+  protobuf on the wire                        788.9 MB
+  expansion over the source file               7.46x
+  messages on the stream                   3850  (255.9 rows each)
+  throughput (arm 3, median)                 536415 rows/s, 4291323 cells/s
+
+latency to the first row
+  gRPC stream (min / median / p95)              1.3      1.5      1.8 ms
+  a batch API cannot answer before           2428.0 ms  (arm 2 completes)
+
+upload leg, counted separately
+  OpenWorkbook for 105.7 MB                  492.5 ms  (215 MB/s)
+  paid once per workbook, then any number of reads reuse the handle.
+
+```
+
+## `max_rows_per_message = 1`
+
+```
+grpc-calamine: in-process calamine vs the same work over gRPC
+
+workbook    : 100mb.xlsx
+size        : 105.7 MB
+sheet       : Worksheet   (of 4: Worksheet (2), Worksheet (3), Tablo3, Worksheet)
+iterations  : 5, arms interleaved
+host        : 32 logical cores
+profile     : release (cargo defaults; no [profile.release] overrides)
+
+client http2 window: 52428800 bytes
+
+
+  iteration 1/5
+  iteration 2/5
+  iteration 3/5
+  iteration 4/5
+  iteration 5/5
+                        
+same-work proof (digest of the canonical cell stream)
+  0 calamine sparse walk             7b7ae3deea46e84e/7888232r/7888232c
+  1 native dense                     b1ec698bf30cde49/985351r/7882808c
+  2 native dense + protobuf encode   b1ec698bf30cde49/985351r/7882808c
+  3 gRPC end to end                  b1ec698bf30cde49/985351r/7882808c
+
+  arms 1-3 identical: yes
+  arm 0 walks only populated cells (7888232 vs 7882808), so it is not comparable and is shown as a floor.
+
+wall clock ms (min / median / p95), and CPU seconds burned per run
+                                               min      med      p95     CPU s
+  0  calamine alone, populated cells only    2089.1   2109.1   2124.1      2.13
+  1  + dense canonical grid                  2313.5   2342.2   2350.0      2.36
+  2  + protobuf convert and encode           2409.9   2428.9   2449.8      2.45
+  3  + gRPC socket, decoded by the client    2018.7   2059.2   2194.1      7.05
+
+where the in-process time goes (arms 0-2 are one serial thread)
+  calamine parse, the floor                  2109.1 ms   86.8%
+  densify into the contract's grid            233.0 ms    9.6%
+  protobuf convert + encode                    86.7 ms    3.6%
+  total the server must do per read          2428.9 ms
+
+what the gRPC surface actually costs
+  same work, one thread, in process (2)      2428.9 ms wall    2.45 s CPU
+  same work, over the wire (3)               2059.2 ms wall    7.05 s CPU
+  wall clock                                 -369.7 ms  (-15.2%)
+  CPU                                         +4.60 s   (2.87x)
+  parallelism used by arm 3                    3.43 cores (CPU / wall)
+
+  Read the two columns together. gRPC finishes sooner in wall clock because
+  the server parses while the client decodes, on different cores; it is not
+  doing less work. The honest cost of the surface is the CPU column and the
+  bytes below, not latency.
+
+  versus plain calamine in your own process (arm 0):
+    wall -49.9 ms (0.98x), CPU +4.92 s (3.31x)
+  server peak RSS                             291.8 MiB
+
+shape and wire
+  rows                                     985351
+  cells (dense)                            7882808
+  protobuf on the wire                        788.9 MB
+  expansion over the source file               7.46x
+  messages on the stream                   985351  (1.0 rows each)
+  throughput (arm 3, median)                 478509 rows/s, 3828074 cells/s
+
+latency to the first row
+  gRPC stream (min / median / p95)              0.3      0.4      0.4 ms
+  a batch API cannot answer before           2428.9 ms  (arm 2 completes)
+
+upload leg, counted separately
+  OpenWorkbook for 105.7 MB                  499.2 ms  (212 MB/s)
+  paid once per workbook, then any number of reads reuse the handle.
+
+```
+
+## Packed-buffer experiment
+
+Updated 2026-07-24: the walk now mirrors the server's canonical grid (trimmed
+to 985,351 rows, digest-identical to the main harness), and the dictionary is
+built during the walk by pointer identity, so the encode column prices the
+dictionary's steady state and the table-derivation cost is reported
+separately.
+
+```
+packed-buffer experiment: what does per-cell framing cost?
+
+workbook   : 100mb.xlsx
+sheet      : Worksheet
+batch      : 256 rows per message
+
+grid       : 985351 rows x 8 cols = 7882808 cells
+messages   : 3850
+
+lossless proof (digest of the decoded cell stream)
+  source grid             b1ec698bf30cde49/985351r/7882808c
+  A contract              b1ec698bf30cde49/985351r/7882808c
+  B packed                b1ec698bf30cde49/985351r/7882808c
+  C packed + dictionary   b1ec698bf30cde49/985351r/7882808c
+  all match the source grid: yes
+
+wire size
+  source .xlsx                          105.7 MB
+  A contract (CellData per cell)        788.9 MB    7.46x source    100.1 B/cell
+  B packed arrays                       786.3 MB    7.44x source     99.8 B/cell    -0.3% vs A
+  C packed + dictionary                 192.7 MB    1.82x source     24.4 B/cell   -75.6% vs A
+      of which the table, sent once     121.7 MB   (1047814 unique strings)
+
+CPU, ms for the whole sheet
+                                        encode    decode
+  A contract                             402.8    1017.2
+  B packed                               141.5     545.3   (-65% / -46%)
+  C packed + dictionary                   23.9     592.5   (-94% / -42%)
+
+shared-string table derivation, ms (not part of the encode column)
+  by pointer identity, inside the walk     805.8   (walk 2854.6 ms with it, 2048.8 ms without)
+  by content hash, after the fact         1022.7   (1047814 unique strings; table itself 1047814 entries)
+  Pointer identity (the `DataRef::SharedString` borrows all point into the
+  workbook's own table) hashes two machine words per cell; content hashing
+  walks every string body. Measured, the two cost about the same, because
+  the bill is materializing the table -- one allocation and copy per unique
+  string -- not the hashing that finds it. calamine already holds this exact
+  table in memory and resolves indices into it during the parse; an upstream
+  accessor exposing it would make the derivation cost zero.
+
+note: B and C are hand-rolled little-endian buffers, so they carry no
+type information and no field numbers. That is the whole point of the
+experiment, and also the whole cost: the contract stops being
+self-describing, protobuf cannot evolve it field by field, and every
+client needs a hand-written decoder that agrees on byte order.
+```
+
+## Over a network (second machine, 10 GbE LAN)
+
+Server on a second machine; arms 0-2 remain local. The CPU column for arm 3
+is client-only here, since the server is on another host.
+
+```
+### LAN 10GbE (192.0.2.10), batched
+grpc-calamine: in-process calamine vs the same work over gRPC
+
+workbook    : 100mb.xlsx
+size        : 105.7 MB
+sheet       : Worksheet   (of 4: Worksheet (2), Worksheet (3), Tablo3, Worksheet)
+iterations  : 3, arms interleaved
+host        : 32 logical cores
+profile     : release (cargo defaults; no [profile.release] overrides)
+
+client http2 window: 52428800 bytes
+
+server     : remote at 192.0.2.10:50055 (arms 0-2 remain local)
+
+
+  iteration 1/3
+  iteration 2/3
+  iteration 3/3
+                        
+same-work proof (digest of the canonical cell stream)
+  0 calamine sparse walk             7b7ae3deea46e84e/7888232r/7888232c
+  1 native dense                     b1ec698bf30cde49/985351r/7882808c
+  2 native dense + protobuf encode   b1ec698bf30cde49/985351r/7882808c
+  3 gRPC end to end                  b1ec698bf30cde49/985351r/7882808c
+
+  arms 1-3 identical: yes
+  arm 0 walks only populated cells (7888232 vs 7882808), so it is not comparable and is shown as a floor.
+
+wall clock ms (min / median / p95), and CPU seconds burned per run
+                                               min      med      p95     CPU s
+  0  calamine alone, populated cells only    2135.6   2153.9   2179.6      2.18
+  1  + dense canonical grid                  2390.1   2393.9   2399.9      2.42
+  2  + protobuf convert and encode           2493.0   2495.0   2523.1      2.53
+  3  + gRPC socket, decoded by the client    1726.3   1729.9   1758.7      1.32
+
+where the in-process time goes (arms 0-2 are one serial thread)
+  calamine parse, the floor                  2153.9 ms   86.3%
+  densify into the contract's grid            240.0 ms    9.6%
+  protobuf convert + encode                   101.2 ms    4.1%
+  total the server must do per read          2495.0 ms
+
+what the gRPC surface actually costs
+  same work, one thread, in process (2)      2495.0 ms wall    2.53 s CPU
+  same work, over the wire (3)               1729.9 ms wall    1.32 s CPU
+  wall clock                                 -765.1 ms  (-30.7%)
+  CPU                                         -1.21 s   (0.52x)
+  parallelism used by arm 3                    0.76 cores (CPU / wall)
+
+  Read the two columns together. gRPC finishes sooner in wall clock because
+  the server parses while the client decodes, on different cores; it is not
+  doing less work. The honest cost of the surface is the CPU column and the
+  bytes below, not latency.
+
+  versus plain calamine in your own process (arm 0):
+    wall -424.0 ms (0.80x), CPU -0.86 s (0.61x)
+  server peak RSS                               0.0 MiB
+
+shape and wire
+  rows                                     985351
+  cells (dense)                            7882808
+  protobuf on the wire                        788.9 MB
+  expansion over the source file               7.46x
+  messages on the stream                   3850  (255.9 rows each)
+  throughput (arm 3, median)                 569605 rows/s, 4556841 cells/s
+
+latency to the first row
+  gRPC stream (min / median / p95)              2.3      2.3      2.4 ms
+  a batch API cannot answer before           2495.0 ms  (arm 2 completes)
+
+upload leg, counted separately
+  OpenWorkbook for 105.7 MB                  631.3 ms  (167 MB/s)
+  paid once per workbook, then any number of reads reuse the handle.
+
+### LAN, max_rows_per_message=1
+grpc-calamine: in-process calamine vs the same work over gRPC
+
+workbook    : 100mb.xlsx
+size        : 105.7 MB
+sheet       : Worksheet   (of 4: Worksheet (2), Worksheet (3), Tablo3, Worksheet)
+iterations  : 3, arms interleaved
+host        : 32 logical cores
+profile     : release (cargo defaults; no [profile.release] overrides)
+
+client http2 window: 52428800 bytes
+
+server     : remote at 192.0.2.10:50055 (arms 0-2 remain local)
+
+
+  iteration 1/3
+  iteration 2/3
+  iteration 3/3
+                        
+same-work proof (digest of the canonical cell stream)
+  0 calamine sparse walk             7b7ae3deea46e84e/7888232r/7888232c
+  1 native dense                     b1ec698bf30cde49/985351r/7882808c
+  2 native dense + protobuf encode   b1ec698bf30cde49/985351r/7882808c
+  3 gRPC end to end                  b1ec698bf30cde49/985351r/7882808c
+
+  arms 1-3 identical: yes
+  arm 0 walks only populated cells (7888232 vs 7882808), so it is not comparable and is shown as a floor.
+
+wall clock ms (min / median / p95), and CPU seconds burned per run
+                                               min      med      p95     CPU s
+  0  calamine alone, populated cells only    2152.1   2165.7   2174.6      2.19
+  1  + dense canonical grid                  2397.0   2400.0   2449.9      2.45
+  2  + protobuf convert and encode           2488.8   2526.0   2708.2      2.61
+  3  + gRPC socket, decoded by the client    1922.3   1960.6   1999.4      1.61
+
+where the in-process time goes (arms 0-2 are one serial thread)
+  calamine parse, the floor                  2165.7 ms   85.7%
+  densify into the contract's grid            234.3 ms    9.3%
+  protobuf convert + encode                   126.0 ms    5.0%
+  total the server must do per read          2526.0 ms
+
+what the gRPC surface actually costs
+  same work, one thread, in process (2)      2526.0 ms wall    2.61 s CPU
+  same work, over the wire (3)               1960.6 ms wall    1.61 s CPU
+  wall clock                                 -565.3 ms  (-22.4%)
+  CPU                                         -1.00 s   (0.62x)
+  parallelism used by arm 3                    0.82 cores (CPU / wall)
+
+  Read the two columns together. gRPC finishes sooner in wall clock because
+  the server parses while the client decodes, on different cores; it is not
+  doing less work. The honest cost of the surface is the CPU column and the
+  bytes below, not latency.
+
+  versus plain calamine in your own process (arm 0):
+    wall -205.0 ms (0.91x), CPU -0.58 s (0.74x)
+  server peak RSS                               0.0 MiB
+
+shape and wire
+  rows                                     985351
+  cells (dense)                            7882808
+  protobuf on the wire                        788.9 MB
+  expansion over the source file               7.46x
+  messages on the stream                   985351  (1.0 rows each)
+  throughput (arm 3, median)                 502564 rows/s, 4020512 cells/s
+
+latency to the first row
+  gRPC stream (min / median / p95)              0.5      0.7      0.7 ms
+  a batch API cannot answer before           2526.0 ms  (arm 2 completes)
+
+upload leg, counted separately
+  OpenWorkbook for 105.7 MB                  627.8 ms  (168 MB/s)
+  paid once per workbook, then any number of reads reuse the handle.
+
+### Tailscale (100.64.0.10), batched
+grpc-calamine: in-process calamine vs the same work over gRPC
+
+workbook    : 100mb.xlsx
+size        : 105.7 MB
+sheet       : Worksheet   (of 4: Worksheet (2), Worksheet (3), Tablo3, Worksheet)
+iterations  : 3, arms interleaved
+host        : 32 logical cores
+profile     : release (cargo defaults; no [profile.release] overrides)
+
+client http2 window: 52428800 bytes
+
+server     : remote at 100.64.0.10:50055 (arms 0-2 remain local)
+
+
+  iteration 1/3
+  iteration 2/3
+  iteration 3/3
+                        
+same-work proof (digest of the canonical cell stream)
+  0 calamine sparse walk             7b7ae3deea46e84e/7888232r/7888232c
+  1 native dense                     b1ec698bf30cde49/985351r/7882808c
+  2 native dense + protobuf encode   b1ec698bf30cde49/985351r/7882808c
+  3 gRPC end to end                  b1ec698bf30cde49/985351r/7882808c
+
+  arms 1-3 identical: yes
+  arm 0 walks only populated cells (7888232 vs 7882808), so it is not comparable and is shown as a floor.
+
+wall clock ms (min / median / p95), and CPU seconds burned per run
+                                               min      med      p95     CPU s
+  0  calamine alone, populated cells only    2181.9   2194.8   2264.7      2.24
+  1  + dense canonical grid                  2370.5   2385.4   2393.6      2.41
+  2  + protobuf convert and encode           2458.2   2474.1   2478.8      2.49
+  3  + gRPC socket, decoded by the client    1915.5   1919.6   1930.6      1.41
+
+where the in-process time goes (arms 0-2 are one serial thread)
+  calamine parse, the floor                  2194.8 ms   88.7%
+  densify into the contract's grid            190.7 ms    7.7%
+  protobuf convert + encode                    88.6 ms    3.6%
+  total the server must do per read          2474.1 ms
+
+what the gRPC surface actually costs
+  same work, one thread, in process (2)      2474.1 ms wall    2.49 s CPU
+  same work, over the wire (3)               1919.6 ms wall    1.41 s CPU
+  wall clock                                 -554.5 ms  (-22.4%)
+  CPU                                         -1.08 s   (0.57x)
+  parallelism used by arm 3                    0.73 cores (CPU / wall)
+
+  Read the two columns together. gRPC finishes sooner in wall clock because
+  the server parses while the client decodes, on different cores; it is not
+  doing less work. The honest cost of the surface is the CPU column and the
+  bytes below, not latency.
+
+  versus plain calamine in your own process (arm 0):
+    wall -275.2 ms (0.87x), CPU -0.83 s (0.63x)
+  server peak RSS                               0.0 MiB
+
+shape and wire
+  rows                                     985351
+  cells (dense)                            7882808
+  protobuf on the wire                        788.9 MB
+  expansion over the source file               7.46x
+  messages on the stream                   3850  (255.9 rows each)
+  throughput (arm 3, median)                 513311 rows/s, 4106487 cells/s
+
+latency to the first row
+  gRPC stream (min / median / p95)              3.3      3.6      3.8 ms
+  a batch API cannot answer before           2474.1 ms  (arm 2 completes)
+
+upload leg, counted separately
+  OpenWorkbook for 105.7 MB                  795.7 ms  (133 MB/s)
+  paid once per workbook, then any number of reads reuse the handle.
+```
+
+### Shaped links
+
+Same setup with `tc tbf` on the server egress, to find where bytes overtake
+the parse as the bottleneck.
+
+```
+### shaped to 2500mbit
+qdisc tbf 8001: root refcnt 33 rate 2500Mbit burst 4Mb lat 300ms 
+  arms 1-3 identical: yes
+  3  + gRPC socket, decoded by the client    2629.7   2629.8   2629.9      1.40
+  OpenWorkbook for 105.7 MB                  630.4 ms  (168 MB/s)
+
+### shaped to 1000mbit
+qdisc tbf 8001: root refcnt 33 rate 1Gbit burst 4Mb lat 300ms 
+  arms 1-3 identical: yes
+  3  + gRPC socket, decoded by the client    6571.1   6571.1   6571.1      1.31
+  OpenWorkbook for 105.7 MB                  626.3 ms  (169 MB/s)
+
+### shaped to 250mbit
+qdisc tbf 8001: root refcnt 33 rate 250Mbit burst 4Mb lat 300ms 
+  arms 1-3 identical: yes
+  3  + gRPC socket, decoded by the client   26277.8  26277.8  26277.8      1.50
+  OpenWorkbook for 105.7 MB                  619.3 ms  (171 MB/s)
+
+```
+
+## Client on the far machine (server here, client on the second machine)
+
+### Python client
+```
+client on the second machine, server 192.0.2.20
+
+L2 python-calamine (local file)         5283 ms     186526 rows/s  000000002203c957/985351r/7882808c
+N1 grpc-calamine over gRPC              4730 ms     208320 rows/s  000000002203c957/985351r/7882808c  upload 652 ms
+N2 same rows as NDJSON/HTTP             4925 ms     200057 rows/s  000000002203c957/985351r/7882808c  983 MB downloaded
+```
+
+### Rust gRPC client
+```
+  arms 1-3 identical: yes
+  0  calamine alone, populated cells only    2104.7   2105.0   2109.9      2.13
+  1  + dense canonical grid                  2317.0   2332.4   2333.5      2.35
+  2  + protobuf convert and encode           2433.9   2435.9   2455.7      2.47
+  3  + gRPC socket, decoded by the client    2081.0   2126.4   2207.4      1.36
+  wall clock                                 -309.6 ms  (-12.7%)
+  CPU                                         -1.11 s   (0.55x)
+  protobuf on the wire                        788.9 MB
+  messages on the stream                   3850  (255.9 rows each)
+  OpenWorkbook for 105.7 MB                  607.0 ms  (174 MB/s)
+```
+
+### Rust NDJSON client (same rows, no gRPC in the path)
+```
+rust NDJSON/HTTP       2828 ms     348396 rows/s  000000002203c957/985351r/7882808c  983 MB
+rust NDJSON/HTTP       2829 ms     348334 rows/s  000000002203c957/985351r/7882808c  983 MB
+rust NDJSON/HTTP       2830 ms     348222 rows/s  000000002203c957/985351r/7882808c  983 MB
+```
+
+## Compression (loopback, 2026-07-24)
+
+Same workbook and sheet, 3 iterations, server and client on the one box.
+`BENCH_COMPRESSION` sets the grpc-encoding the client requests for the row
+stream; wire size is counted at the socket.
+
+```
+### BENCH_COMPRESSION=none
+grpc-calamine: in-process calamine vs the same work over gRPC
+
+workbook    : 100mb.xlsx
+size        : 105.7 MB
+sheet       : Worksheet   (of 4: Worksheet (2), Worksheet (3), Tablo3, Worksheet)
+iterations  : 3, arms interleaved
+host        : 32 logical cores
+profile     : release (cargo defaults; no [profile.release] overrides)
+
+client http2 window: 52428800 bytes
+compression : none (grpc-encoding for the row stream)
+
+
+  iteration 1/3
+  iteration 2/3
+  iteration 3/3
+                        
+same-work proof (digest of the canonical cell stream)
+  0 calamine sparse walk             7b7ae3deea46e84e/7888232r/7888232c
+  1 native dense                     b1ec698bf30cde49/985351r/7882808c
+  2 native dense + protobuf encode   b1ec698bf30cde49/985351r/7882808c
+  3 gRPC end to end                  b1ec698bf30cde49/985351r/7882808c
+
+  arms 1-3 identical: yes
+  arm 0 walks only populated cells (7888232 vs 7882808), so it is not comparable and is shown as a floor.
+
+wall clock ms (min / median / p95), and CPU seconds burned per run
+                                               min      med      p95     CPU s
+  0  calamine alone, populated cells only    2096.0   2119.9   2129.1      2.14
+  1  + dense canonical grid                  2331.1   2341.6   2353.9      2.37
+  2  + protobuf convert and encode           2445.0   2459.3   2461.8      2.48
+  3  + gRPC socket, decoded by the client    1839.7   1863.4   1864.2      4.03
+
+where the in-process time goes (arms 0-2 are one serial thread)
+  calamine parse, the floor                  2119.9 ms   86.2%
+  densify into the contract's grid            221.7 ms    9.0%
+  protobuf convert + encode                   117.7 ms    4.8%
+  total the server must do per read          2459.3 ms
+
+what the gRPC surface actually costs
+  same work, one thread, in process (2)      2459.3 ms wall    2.48 s CPU
+  same work, over the wire (3)               1863.4 ms wall    4.03 s CPU
+  wall clock                                 -595.9 ms  (-24.2%)
+  CPU                                         +1.55 s   (1.62x)
+  parallelism used by arm 3                    2.16 cores (CPU / wall)
+
+  Read the two columns together. gRPC finishes sooner in wall clock because
+  the server parses while the client decodes, on different cores; it is not
+  doing less work. The honest cost of the surface is the CPU column and the
+  bytes below, not latency.
+
+  versus plain calamine in your own process (arm 0):
+    wall -256.5 ms (0.88x), CPU +1.89 s (1.88x)
+  server peak RSS                             303.4 MiB
+
+shape and wire
+  rows                                     985351
+  cells (dense)                            7882808
+  protobuf payload (arm 2 encode)             788.9 MB
+  bytes on the socket (arm 3)                 789.3 MB  (compression: none)
+  expansion over the source file               7.47x  (socket / source)
+  messages on the stream                   3850  (255.9 rows each)
+  throughput (arm 3, median)                 528795 rows/s, 4230358 cells/s
+
+latency to the first row
+  gRPC stream (min / median / p95)              1.3      1.3      1.5 ms
+  a batch API cannot answer before           2459.3 ms  (arm 2 completes)
+
+upload leg, counted separately
+  OpenWorkbook for 105.7 MB                  496.1 ms  (213 MB/s)
+  bytes written on the socket                 105.8 MB
+  paid once per workbook, then any number of reads reuse the handle.
+
+### BENCH_COMPRESSION=zstd
+grpc-calamine: in-process calamine vs the same work over gRPC
+
+workbook    : 100mb.xlsx
+size        : 105.7 MB
+sheet       : Worksheet   (of 4: Worksheet (2), Worksheet (3), Tablo3, Worksheet)
+iterations  : 3, arms interleaved
+host        : 32 logical cores
+profile     : release (cargo defaults; no [profile.release] overrides)
+
+client http2 window: 52428800 bytes
+compression : zstd (grpc-encoding for the row stream)
+
+
+  iteration 1/3
+  iteration 2/3
+  iteration 3/3
+                        
+same-work proof (digest of the canonical cell stream)
+  0 calamine sparse walk             7b7ae3deea46e84e/7888232r/7888232c
+  1 native dense                     b1ec698bf30cde49/985351r/7882808c
+  2 native dense + protobuf encode   b1ec698bf30cde49/985351r/7882808c
+  3 gRPC end to end                  b1ec698bf30cde49/985351r/7882808c
+
+  arms 1-3 identical: yes
+  arm 0 walks only populated cells (7888232 vs 7882808), so it is not comparable and is shown as a floor.
+
+wall clock ms (min / median / p95), and CPU seconds burned per run
+                                               min      med      p95     CPU s
+  0  calamine alone, populated cells only    2097.0   2114.2   2126.0      2.14
+  1  + dense canonical grid                  2328.3   2331.7   2339.1      2.36
+  2  + protobuf convert and encode           2434.6   2441.6   2483.3      2.48
+  3  + gRPC socket, decoded by the client    3427.0   3500.7   3592.0      7.17
+
+where the in-process time goes (arms 0-2 are one serial thread)
+  calamine parse, the floor                  2114.2 ms   86.6%
+  densify into the contract's grid            217.6 ms    8.9%
+  protobuf convert + encode                   109.8 ms    4.5%
+  total the server must do per read          2441.6 ms
+
+what the gRPC surface actually costs
+  same work, one thread, in process (2)      2441.6 ms wall    2.48 s CPU
+  same work, over the wire (3)               3500.7 ms wall    7.17 s CPU
+  wall clock                                +1059.1 ms  (+43.4%)
+  CPU                                         +4.69 s   (2.89x)
+  parallelism used by arm 3                    2.05 cores (CPU / wall)
+
+  Read the two columns together. gRPC finishes sooner in wall clock because
+  the server parses while the client decodes, on different cores; it is not
+  doing less work. The honest cost of the surface is the CPU column and the
+  bytes below, not latency.
+
+  versus plain calamine in your own process (arm 0):
+    wall +1386.5 ms (1.66x), CPU +5.03 s (3.35x)
+  server peak RSS                             321.4 MiB
+
+shape and wire
+  rows                                     985351
+  cells (dense)                            7882808
+  protobuf payload (arm 2 encode)             788.9 MB
+  bytes on the socket (arm 3)                 290.1 MB  (compression: zstd)
+  expansion over the source file               2.74x  (socket / source)
+  messages on the stream                   3850  (255.9 rows each)
+  throughput (arm 3, median)                 281476 rows/s, 2251805 cells/s
+
+latency to the first row
+  gRPC stream (min / median / p95)              7.8      7.8      9.0 ms
+  a batch API cannot answer before           2441.6 ms  (arm 2 completes)
+
+upload leg, counted separately
+  OpenWorkbook for 105.7 MB                  493.6 ms  (214 MB/s)
+  bytes written on the socket                 105.8 MB
+  paid once per workbook, then any number of reads reuse the handle.
+
+### BENCH_COMPRESSION=gzip
+grpc-calamine: in-process calamine vs the same work over gRPC
+
+workbook    : 100mb.xlsx
+size        : 105.7 MB
+sheet       : Worksheet   (of 4: Worksheet (2), Worksheet (3), Tablo3, Worksheet)
+iterations  : 3, arms interleaved
+host        : 32 logical cores
+profile     : release (cargo defaults; no [profile.release] overrides)
+
+client http2 window: 52428800 bytes
+compression : gzip (grpc-encoding for the row stream)
+
+
+  iteration 1/3
+  iteration 2/3
+  iteration 3/3
+                        
+same-work proof (digest of the canonical cell stream)
+  0 calamine sparse walk             7b7ae3deea46e84e/7888232r/7888232c
+  1 native dense                     b1ec698bf30cde49/985351r/7882808c
+  2 native dense + protobuf encode   b1ec698bf30cde49/985351r/7882808c
+  3 gRPC end to end                  b1ec698bf30cde49/985351r/7882808c
+
+  arms 1-3 identical: yes
+  arm 0 walks only populated cells (7888232 vs 7882808), so it is not comparable and is shown as a floor.
+
+wall clock ms (min / median / p95), and CPU seconds burned per run
+                                               min      med      p95     CPU s
+  0  calamine alone, populated cells only    2105.6   2118.0   2483.1      2.26
+  1  + dense canonical grid                  2328.1   2336.3   2528.0      2.42
+  2  + protobuf convert and encode           2450.3   2460.4   2527.0      2.51
+  3  + gRPC socket, decoded by the client   10114.8  10229.2  10315.8     14.67
+
+where the in-process time goes (arms 0-2 are one serial thread)
+  calamine parse, the floor                  2118.0 ms   86.1%
+  densify into the contract's grid            218.3 ms    8.9%
+  protobuf convert + encode                   124.1 ms    5.0%
+  total the server must do per read          2460.4 ms
+
+what the gRPC surface actually costs
+  same work, one thread, in process (2)      2460.4 ms wall    2.51 s CPU
+  same work, over the wire (3)              10229.2 ms wall   14.67 s CPU
+  wall clock                                +7768.8 ms  (+315.8%)
+  CPU                                        +12.17 s   (5.85x)
+  parallelism used by arm 3                    1.43 cores (CPU / wall)
+
+  Read the two columns together. gRPC finishes sooner in wall clock because
+  the server parses while the client decodes, on different cores; it is not
+  doing less work. The honest cost of the surface is the CPU column and the
+  bytes below, not latency.
+
+  versus plain calamine in your own process (arm 0):
+    wall +8111.2 ms (4.83x), CPU +12.41 s (6.48x)
+  server peak RSS                             315.6 MiB
+
+shape and wire
+  rows                                     985351
+  cells (dense)                            7882808
+  protobuf payload (arm 2 encode)             788.9 MB
+  bytes on the socket (arm 3)                 295.8 MB  (compression: gzip)
+  expansion over the source file               2.80x  (socket / source)
+  messages on the stream                   3850  (255.9 rows each)
+  throughput (arm 3, median)                  96328 rows/s, 770620 cells/s
+
+latency to the first row
+  gRPC stream (min / median / p95)             19.1     19.6     20.1 ms
+  a batch API cannot answer before           2460.4 ms  (arm 2 completes)
+
+upload leg, counted separately
+  OpenWorkbook for 105.7 MB                  492.1 ms  (215 MB/s)
+  bytes written on the socket                 105.8 MB
+  paid once per workbook, then any number of reads reuse the handle.
+```
+
+## Dictionary mode (`use_string_table`, loopback, 2026-07-24)
+
+The contract's opt-in dictionary encoding, end to end: shared strings arrive
+once in `string_table` chunks and as u32 ids per cell; the client resolves
+them and the digest gate holds the resolved stream to the same canonical
+cells as every other arm.
+
+Summary against the runs above (same workbook, sheet, machine):
+
+| mode                | wall, med | CPU    | on the socket | vs source |
+|---------------------|-----------|--------|---------------|-----------|
+| plain contract      | 1863 ms   | 4.03 s | 789.3 MB      | 7.47x     |
+| zstd                | 3501 ms   | 7.17 s | 290.1 MB      | 2.74x     |
+| dictionary          | 2101 ms   | 3.47 s | 172.5 MB      | 1.63x     |
+| dictionary + zstd   | 2176 ms   | 4.07 s | 61.6 MB       | 0.58x     |
+
+Dictionary mode beats zstd on every axis at once, and combined they put the
+stream at barely half the size of the source .xlsx.
+
+```
+### BENCH_DICT=1
+grpc-calamine: in-process calamine vs the same work over gRPC
+
+workbook    : 100mb.xlsx
+size        : 105.7 MB
+sheet       : Worksheet   (of 4: Worksheet (2), Worksheet (3), Tablo3, Worksheet)
+iterations  : 3, arms interleaved
+host        : 32 logical cores
+profile     : release (cargo defaults; no [profile.release] overrides)
+
+client http2 window: 52428800 bytes
+compression : none (grpc-encoding for the row stream)
+string dict : on (use_string_table)
+
+
+  iteration 1/3
+  iteration 2/3
+  iteration 3/3
+                        
+same-work proof (digest of the canonical cell stream)
+  0 calamine sparse walk             7b7ae3deea46e84e/7888232r/7888232c
+  1 native dense                     b1ec698bf30cde49/985351r/7882808c
+  2 native dense + protobuf encode   b1ec698bf30cde49/985351r/7882808c
+  3 gRPC end to end                  b1ec698bf30cde49/985351r/7882808c
+
+  arms 1-3 identical: yes
+  arm 0 walks only populated cells (7888232 vs 7882808), so it is not comparable and is shown as a floor.
+
+wall clock ms (min / median / p95), and CPU seconds burned per run
+                                               min      med      p95     CPU s
+  0  calamine alone, populated cells only    2113.7   2129.0   2132.2      2.15
+  1  + dense canonical grid                  2373.7   2374.9   2375.3      2.40
+  2  + protobuf convert and encode           2476.5   2480.8   2483.3      2.51
+  3  + gRPC socket, decoded by the client    2083.5   2100.9   2223.1      3.47
+
+where the in-process time goes (arms 0-2 are one serial thread)
+  calamine parse, the floor                  2129.0 ms   85.8%
+  densify into the contract's grid            245.9 ms    9.9%
+  protobuf convert + encode                   105.9 ms    4.3%
+  total the server must do per read          2480.8 ms
+
+what the gRPC surface actually costs
+  same work, one thread, in process (2)      2480.8 ms wall    2.51 s CPU
+  same work, over the wire (3)               2100.9 ms wall    3.47 s CPU
+  wall clock                                 -379.8 ms  (-15.3%)
+  CPU                                         +0.97 s   (1.39x)
+  parallelism used by arm 3                    1.65 cores (CPU / wall)
+
+  Read the two columns together. gRPC finishes sooner in wall clock because
+  the server parses while the client decodes, on different cores; it is not
+  doing less work. The honest cost of the surface is the CPU column and the
+  bytes below, not latency.
+
+  versus plain calamine in your own process (arm 0):
+    wall -28.0 ms (0.99x), CPU +1.32 s (1.61x)
+  server peak RSS                             399.8 MiB
+
+shape and wire
+  rows                                     985351
+  cells (dense)                            7882808
+  protobuf payload (arm 2 encode)             788.9 MB
+  bytes on the socket (arm 3)                 172.5 MB  (compression: none, dict: on)
+  string table                             1047814 entries, sent once in-stream
+  expansion over the source file               1.63x  (socket / source)
+  messages on the stream                   3851  (255.9 rows each)
+  throughput (arm 3, median)                 469005 rows/s, 3752040 cells/s
+
+latency to the first row
+  gRPC stream (min / median / p95)              1.4      1.6      1.7 ms
+  a batch API cannot answer before           2480.8 ms  (arm 2 completes)
+
+upload leg, counted separately
+  OpenWorkbook for 105.7 MB                  488.2 ms  (217 MB/s)
+  bytes written on the socket                 105.8 MB
+  paid once per workbook, then any number of reads reuse the handle.
+
+### BENCH_DICT=1 BENCH_COMPRESSION=zstd
+grpc-calamine: in-process calamine vs the same work over gRPC
+
+workbook    : 100mb.xlsx
+size        : 105.7 MB
+sheet       : Worksheet   (of 4: Worksheet (2), Worksheet (3), Tablo3, Worksheet)
+iterations  : 3, arms interleaved
+host        : 32 logical cores
+profile     : release (cargo defaults; no [profile.release] overrides)
+
+client http2 window: 52428800 bytes
+compression : zstd (grpc-encoding for the row stream)
+string dict : on (use_string_table)
+
+
+  iteration 1/3
+  iteration 2/3
+  iteration 3/3
+                        
+same-work proof (digest of the canonical cell stream)
+  0 calamine sparse walk             7b7ae3deea46e84e/7888232r/7888232c
+  1 native dense                     b1ec698bf30cde49/985351r/7882808c
+  2 native dense + protobuf encode   b1ec698bf30cde49/985351r/7882808c
+  3 gRPC end to end                  b1ec698bf30cde49/985351r/7882808c
+
+  arms 1-3 identical: yes
+  arm 0 walks only populated cells (7888232 vs 7882808), so it is not comparable and is shown as a floor.
+
+wall clock ms (min / median / p95), and CPU seconds burned per run
+                                               min      med      p95     CPU s
+  0  calamine alone, populated cells only    2124.3   2140.2   2141.0      2.16
+  1  + dense canonical grid                  2355.8   2358.6   2384.6      2.39
+  2  + protobuf convert and encode           2444.5   2460.2   2473.2      2.49
+  3  + gRPC socket, decoded by the client    2155.5   2175.8   2218.7      4.07
+
+where the in-process time goes (arms 0-2 are one serial thread)
+  calamine parse, the floor                  2140.2 ms   87.0%
+  densify into the contract's grid            218.4 ms    8.9%
+  protobuf convert + encode                   101.5 ms    4.1%
+  total the server must do per read          2460.2 ms
+
+what the gRPC surface actually costs
+  same work, one thread, in process (2)      2460.2 ms wall    2.49 s CPU
+  same work, over the wire (3)               2175.8 ms wall    4.07 s CPU
+  wall clock                                 -284.4 ms  (-11.6%)
+  CPU                                         +1.59 s   (1.64x)
+  parallelism used by arm 3                    1.87 cores (CPU / wall)
+
+  Read the two columns together. gRPC finishes sooner in wall clock because
+  the server parses while the client decodes, on different cores; it is not
+  doing less work. The honest cost of the surface is the CPU column and the
+  bytes below, not latency.
+
+  versus plain calamine in your own process (arm 0):
+    wall +35.6 ms (1.02x), CPU +1.91 s (1.89x)
+  server peak RSS                             410.4 MiB
+
+shape and wire
+  rows                                     985351
+  cells (dense)                            7882808
+  protobuf payload (arm 2 encode)             788.9 MB
+  bytes on the socket (arm 3)                  61.6 MB  (compression: zstd, dict: on)
+  string table                             1047814 entries, sent once in-stream
+  expansion over the source file               0.58x  (socket / source)
+  messages on the stream                   3851  (255.9 rows each)
+  throughput (arm 3, median)                 452872 rows/s, 3622976 cells/s
+
+latency to the first row
+  gRPC stream (min / median / p95)              6.6      6.8      7.0 ms
+  a batch API cannot answer before           2460.2 ms  (arm 2 completes)
+
+upload leg, counted separately
+  OpenWorkbook for 105.7 MB                  491.5 ms  (215 MB/s)
+  bytes written on the socket                 105.8 MB
+  paid once per workbook, then any number of reads reuse the handle.
+```

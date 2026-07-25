@@ -33,6 +33,8 @@
 //! cd bench && cargo run --release -- <workbook.xlsx> [sheet] [iterations]
 //! ```
 
+mod envfile;
+
 use std::io::{Cursor, IoSlice};
 use std::pin::Pin;
 use std::process::{Child, Command};
@@ -664,7 +666,11 @@ async fn main() {
     let mut args = std::env::args().skip(1);
     let path = args
         .next()
-        .expect("usage: grpc-calamine-bench <workbook.xlsx> [sheet] [iterations]");
+        .or_else(|| envfile::var("BENCH_WORKBOOK"))
+        .expect(
+            "usage: grpc-calamine-bench <workbook.xlsx> [sheet] [iterations], \
+             or set BENCH_WORKBOOK in bench/.env",
+        );
     let want_sheet = args.next();
     let iterations: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(7);
 
@@ -713,7 +719,7 @@ async fn main() {
     // over-a-network runs are done: arms 0-2 stay local (they are the "just
     // parse it here" baseline) while arm 3 crosses the wire. Server CPU and RSS
     // are only observable for a local child, so they are reported as 0 remotely.
-    let remote = std::env::var("BENCH_ADDR").ok();
+    let remote = envfile::var("BENCH_ADDR");
     let server = remote.is_none().then(start_server);
     let server_pid = server.as_ref().map_or(0, Child::id);
 
@@ -723,8 +729,7 @@ async fn main() {
     // directional, so the server's setting sizes the upload and this one sizes
     // the download. `WINDOW_BYTES=0` leaves hyper's 1 MiB default in place, so
     // the two can be compared.
-    let window: u32 = std::env::var("WINDOW_BYTES")
-        .ok()
+    let window: u32 = envfile::var("WINDOW_BYTES")
         .and_then(|v| v.parse().ok())
         .unwrap_or(50 * 1024 * 1024);
     println!(
@@ -740,7 +745,7 @@ async fn main() {
     // to use for responses: none (default), gzip or zstd. The upload leg
     // stays uncompressed either way; a workbook is already deflated and
     // recompressing it spends CPU on bytes that do not shrink.
-    let compression_label = std::env::var("BENCH_COMPRESSION").unwrap_or_else(|_| "none".into());
+    let compression_label = envfile::var("BENCH_COMPRESSION").unwrap_or_else(|| "none".into());
     let compression = match compression_label.as_str() {
         "none" | "" => None,
         "gzip" => Some(tonic::codec::CompressionEncoding::Gzip),
@@ -753,7 +758,7 @@ async fn main() {
     // shared strings arrive once in table chunks and as u32 ids per cell,
     // and the client resolves them. The digest gate holds it to the same
     // canonical cell stream as every other arm.
-    let dict = std::env::var("BENCH_DICT").is_ok_and(|v| v == "1" || v == "true");
+    let dict = envfile::var("BENCH_DICT").is_some_and(|v| v == "1" || v == "true");
     println!(
         "string dict : {}\n",
         if dict { "on (use_string_table)" } else { "off" }
@@ -805,8 +810,7 @@ async fn main() {
     let mut socket_bytes = 0u64;
     let mut grpc_messages = 0u64;
     let mut table_entries = 0u64;
-    let batch: u32 = std::env::var("BATCH")
-        .ok()
+    let batch: u32 = envfile::var("BATCH")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let mut client_cpu = 0.0;

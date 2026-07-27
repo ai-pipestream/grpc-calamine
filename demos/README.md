@@ -57,12 +57,47 @@ empty sheet rather than a bug. Handle both:
 started      -> the header, once
 rows         -> batch.rows, the default carrier   <-- do not skip this one
 row          -> a single row, only if you asked for max_rows_per_message = 1
+row_gap      -> a run of rows holding nothing
 string_table -> only in use_string_table mode
 error        -> in-band StreamError
 ```
 
 Set `max_rows_per_message = 1` if you would rather have the simpler
 single-row carrier and can afford one message per row.
+
+## Empty rows do not arrive as rows
+
+Only rows holding at least one value arrive as a row. A run of empty ones
+arrives as a single `row_gap` — a first index and a count — however long the
+run is.
+
+This exists because a sheet's populated cells can sit arbitrarily far apart.
+`sample-data/corners.xlsx` is 2,341 bytes and holds two cells, one at `A1`
+and one at `XFD1048576`. The rows between them are 1,048,574 of nothing, and
+spelling them out costs a message and a client-side object each: 17.2 billion
+cells, which is what OOM-killed the Node viewer before this event existed.
+One gap says the same thing in constant space. Try it:
+
+```bash
+node cli.js ../sample-data/corners.xlsx
+```
+
+```
+     1 │ 1
+     ⋮ │ (1,048,574 empty rows, 2-1,048,575)
+1048576 │ · │ · │ ...
+```
+
+Handling it is a one-liner in whichever direction you need:
+
+- **Building a dense grid?** Expand it into `row_count` blank rows.
+- **Collecting populated cells?** Skip it. It covers none by definition.
+- **Only care about values?** Ignore the event entirely. `row_index` is
+  absolute, so every populated row still lands where it belongs whether or
+  not you ever look at a gap.
+
+The one thing you cannot do is treat a gap as data loss. Nothing is lost:
+a gap covers no cells, which is exactly why it can be a gap.
 
 ## The API in one workflow
 

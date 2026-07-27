@@ -14,6 +14,7 @@ import calamine.v1.StreamWorksheetRangeResponse;
 import calamine.v1.WorkbookFormat;
 import calamine.v1.WorkbookOptions;
 import calamine.v1.WorksheetRow;
+import calamine.v1.WorksheetRowGap;
 import com.google.protobuf.ByteString;
 import io.grpc.Grpc;
 import io.grpc.InsecureChannelCredentials;
@@ -165,6 +166,22 @@ public final class CalamineDemo {
                 // A client that handles only ROW silently prints nothing.
                 case ROWS -> event.getRows().getRowsList().forEach(CalamineDemo::printRow);
                 case ROW -> printRow(event.getRow());
+                // A run of rows holding nothing. Only rows with values arrive
+                // as rows, so a run of empties costs one small message however
+                // long it is: corners.xlsx is 2 KB and its two cells are
+                // 1,048,574 rows apart. Expand it into blank rows if you are
+                // building a dense grid, or ignore it entirely -- getRowIndex()
+                // is absolute, so every later row still lands where it should.
+                case ROW_GAP -> {
+                    WorksheetRowGap gap = event.getRowGap();
+                    long n = Integer.toUnsignedLong(gap.getRowCount());
+                    long first = Integer.toUnsignedLong(gap.getFirstRowIndex()) + 1;
+                    String what =
+                            n == 1
+                                    ? String.format("empty row %,d", first)
+                                    : String.format("%,d empty rows, %,d-%,d", n, first, first + n - 1);
+                    System.out.printf("%6s │ (%s)%n", "⋮", what);
+                }
                 case ERROR -> {
                     System.err.println(
                             "in-band error: " + event.getError().getError().getMessage());

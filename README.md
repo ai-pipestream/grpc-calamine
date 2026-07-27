@@ -65,11 +65,20 @@ everything with one command.
 - **Rows stream during the parse.** XLSX and XLSB use calamine's incremental
   cell readers. XLS and ODS only support whole-range parsing, so those parse
   first and then stream. The wire contract is identical either way, and the
-  streamed grid matches calamine's own `worksheet_range`: trailing blank
-  rows trimmed, interior gaps sent as explicit empty rows, `header_row`
-  honored the same on every format. The test suite asserts that parity
-  against calamine for every sheet of every fixture, including synthetic
-  workbooks whose declared `<dimension>` lies.
+  streamed grid covers the same cells as calamine's own `worksheet_range`:
+  leading and trailing blank rows trimmed, `header_row` honored the same on
+  every format. The test suite asserts that parity against calamine for
+  every sheet of every fixture, including synthetic workbooks whose declared
+  `<dimension>` lies.
+- **Empty rows cost one message, not one each.** Only rows holding a value
+  arrive as rows; a run of empty ones arrives as a single `row_gap` saying
+  where it starts and how long it is. `corners.xlsx` is a 2 KB file whose
+  two cells sit at opposite corners of the grid, which is 1,048,576 rows of
+  which exactly two hold anything: it streams as two rows and one gap, in
+  8 ms. Spelling those rows out instead is 17.2 billion cells, and it is
+  what used to OOM-kill the Node demo. Expand the gap if you want a dense
+  grid, skip it if you are collecting cells, or ignore it entirely —
+  `row_index` is absolute, so nothing moves either way.
 - **Reads don't block each other.** Each read builds its own calamine reader
   over the shared bytes, so many clients can stream one workbook at once.
   Parsing runs on tokio's blocking pool behind a bounded channel, so a slow
@@ -142,7 +151,8 @@ very few cells can still reach it.
 ```
 
 The value stream is not affected either way: it streams cells and never
-calls `from_sparse`. If you build against unpatched calamine, do not expose
+calls `from_sparse`, which is what makes a `row_gap` possible there and not
+here. If you build against unpatched calamine, do not expose
 `StreamWorksheetFormula` to untrusted uploads.
 
 ## API

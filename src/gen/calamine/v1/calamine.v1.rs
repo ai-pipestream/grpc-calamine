@@ -729,13 +729,15 @@ pub struct StreamWorksheetRangeRequest {
     pub sheet: ::core::option::Option<SheetSelector>,
     /// Upper bound on how many rows the server may pack into one `rows` event.
     ///
-    /// Batching is adaptive rather than fixed: the server sends as soon as the
-    /// consumer is ready and only accumulates while the consumer is behind, so a
-    /// fast reader still sees rows promptly and a slow one gets fewer, larger
-    /// messages. This value only caps how large that accumulation may grow.
+    /// The server fills a batch up to this many rows, but never holds the first
+    /// row of a batch longer than a few milliseconds, so a slowly parsing sheet
+    /// still streams instead of stalling until the cap is reached. A batch is
+    /// also closed early once its encoded size approaches the frame limit,
+    /// which is what keeps a very wide sheet encodable regardless of this
+    /// value.
     ///
     /// 0 selects the server default. 1 disables batching, restoring one row per
-    /// message.
+    /// message. Very large values are capped by the server.
     #[prost(uint32, tag="3")]
     pub max_rows_per_message: u32,
     /// Opt in to dictionary encoding for shared strings.
@@ -761,19 +763,26 @@ pub struct RangeStarted {
     /// Resolved name of the worksheet being streamed.
     #[prost(string, tag="1")]
     pub sheet_name: ::prost::alloc::string::String,
-    /// Absolute dimensions of the range. Absent when the range is empty,
-    /// matching `Range::start()`/`Range::end()` returning `None`.
+    /// Absolute dimensions of the range.
     ///
     /// For XLSX/XLSB value streams this is the workbook's *declared* extent, a
     /// pre-allocation hint: `<dimension>` is optional in ECMA-376 and writers
     /// get it wrong, so the rows that actually stream may undercut or exceed
-    /// it. For buffered formats (XLS/ODS) and formula streams it is the parsed
-    /// range, which is exact.
+    /// it, and it is present even for a sheet that goes on to stream no rows
+    /// at all. Never size an allocation from it.
+    ///
+    /// For buffered formats (XLS/ODS) and for formula streams it is the parsed
+    /// range, which is exact, and it is absent when that range is empty,
+    /// matching `Range::start()`/`Range::end()` returning `None`.
     #[prost(message, optional, tag="2")]
     pub dimensions: ::core::option::Option<Dimensions>,
     /// Total number of cells in the dense range
     /// (`Range::get_size().0 * Range::get_size().1`). Carries the same caveat
     /// as `dimensions`: a hint for XLSX/XLSB value streams, exact elsewhere.
+    ///
+    /// Reported as 0 when the declared extent is degenerate, i.e. when its end
+    /// precedes its start. Nothing forbids that ordering in a `ref`, and the
+    /// arithmetic on it would otherwise underflow.
     #[prost(uint64, tag="3")]
     pub total_cells: u64,
 }

@@ -101,6 +101,68 @@ OFFSET = (
 """,
 )
 
+# A declaration whose end is BEFORE its start. ECMA-376 does not forbid the
+# ordering, and calamine computes the extent with unchecked u32 subtraction
+# (xlsx/mod.rs:2789, and Dimensions::len at lib.rs:181), so a reversed range
+# underflows: `total_cells` becomes astronomical in a release build, and in a
+# build with overflow checks the parse panics outright. Both are the server's
+# problem, because the client sees either a nonsense progress denominator or a
+# stream that ends successfully having sent nothing at all.
+REVERSED = (
+    "C5:A1",
+    """<row r="1"><c r="A1"><v>1</v></c></row>
+<row r="5"><c r="C5"><v>9</v></c></row>
+""",
+)
+
+# Rows in descending order. Nothing in ECMA-376 requires <row> elements to be
+# sorted, and the `r` attribute on each <c> is what fixes the position, so
+# calamine reads this correctly: `Range::from_sparse` sorts the cells it
+# collected and reports A1=2, A2 empty, A3=1. The incremental densifier walks
+# the cell stream in arrival order and only ever moves forward, so a row that
+# arrives out of order is folded into the row already under construction.
+OUT_OF_ORDER = (
+    "A1:A3",
+    """<row r="3"><c r="A3"><v>1</v></c></row>
+<row r="1"><c r="A1"><v>2</v></c></row>
+""",
+)
+
+# Fully reversed: 40 rows written last-to-first. Reachable one-pass because
+# nothing is committed while the whole sheet still fits in the batcher's unsent
+# queue, so every late row is placed rather than lost.
+ROWS_DESCENDING = (
+    "A1:A40",
+    "".join(
+        f'<row r="{r}"><c r="A{r}"><v>{r}</v></c></row>\n' for r in range(40, 0, -1)
+    ),
+)
+
+# Out of order too late to repair: 600 ascending rows (which forces several
+# batches onto the wire) and only then a new cell back in row 1. gRPC cannot
+# retract a sent message, so the only honest outcome is a terminal in-band
+# error. calamine's own buffered API reads this file fine; that gap is the
+# documented cost of streaming in one pass.
+ROWS_LATE_BACKWARDS = (
+    "A1:B600",
+    "".join(f'<row r="{r}"><c r="A{r}"><v>{r}</v></c></row>\n' for r in range(1, 601))
+    + '<row r="1"><c r="B1"><v>999</v></c></row>\n',
+)
+
+# A declared width of 200,000 columns over a single cell at A1. calamine
+# ignores the declaration and reports a 1x1 range. The declared end column is
+# a file-controlled number used directly as an allocation length, and calamine
+# only warns past its 16,384 column limit rather than clamping, so the real
+# ceiling is the base-26 parse: `A1:ZZZZZZ1` is column 321,272,405, which is
+# ~10 GB of CellData before a single cell is read. 200,000 is the largest
+# value that demonstrates the same code path without making the test suite
+# allocate anything alarming.
+WIDE = (
+    "A1:KIVI1",
+    """<row r="1"><c r="A1"><v>1</v></c></row>
+""",
+)
+
 
 def write(name: str, dimension: str, sheet_data: str) -> None:
     with zipfile.ZipFile(name, "w", zipfile.ZIP_STORED) as z:
@@ -119,7 +181,14 @@ if __name__ == "__main__":
     write("dimension_underdeclared.xlsx", *UNDERDECLARED)
     write("dimension_shifted.xlsx", *SHIFTED)
     write("dimension_offset.xlsx", *OFFSET)
+    write("dimension_reversed.xlsx", *REVERSED)
+    write("dimension_wide.xlsx", *WIDE)
+    write("rows_out_of_order.xlsx", *OUT_OF_ORDER)
+    write("rows_descending.xlsx", *ROWS_DESCENDING)
+    write("rows_late_backwards.xlsx", *ROWS_LATE_BACKWARDS)
     print(
         "wrote dimension_inflated.xlsx dimension_underdeclared.xlsx "
-        "dimension_shifted.xlsx dimension_offset.xlsx"
+        "dimension_shifted.xlsx dimension_offset.xlsx dimension_reversed.xlsx "
+        "dimension_wide.xlsx rows_out_of_order.xlsx rows_descending.xlsx "
+        "rows_late_backwards.xlsx"
     )

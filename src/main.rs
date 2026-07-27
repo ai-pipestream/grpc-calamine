@@ -9,6 +9,9 @@
 //!   calamine parsing (default: 512, tokio's own default).
 //! - `GRPC_CALAMINE_WINDOW_BYTES` — HTTP/2 initial stream and connection
 //!   window (default: 50 MiB).
+//! - `GRPC_CALAMINE_MAX_CONCURRENT_STREAMS` — streaming reads admitted at
+//!   once (default: 128). Past the cap a read is refused with
+//!   `RESOURCE_EXHAUSTED` rather than queued.
 
 use std::time::Duration;
 
@@ -58,7 +61,16 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| DEFAULT_ADDR.to_string())
         .parse()?;
 
-    let service = CalamineGrpc::new(WorkbookStore::new()).into_service();
+    // Streaming reads are capped well below the blocking pool so they can
+    // never take every thread and leave uploads with none.
+    let mut grpc = CalamineGrpc::new(WorkbookStore::new());
+    if let Some(max) = std::env::var("GRPC_CALAMINE_MAX_CONCURRENT_STREAMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        grpc = grpc.with_max_concurrent_streams(max);
+    }
+    let service = grpc.into_service();
 
     // HTTP/2 flow control is directional: this governs what the server
     // *receives*, so it sizes the `OpenWorkbook` upload, not the row stream.

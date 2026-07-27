@@ -125,10 +125,18 @@ export class CalamineClient {
   /**
    * Server-streaming worksheet data. Returns the raw gRPC stream; each
    * message is a StreamWorksheetRangeResponse with `event` naming the set
-   * oneof field ("started" | "row" | "error").
+   * oneof field ("started" | "rows" | "row" | "stringTable" | "error").
+   *
+   * Rows arrive in `rows` batches by default. Pass
+   * `{ maxRowsPerMessage: 1 }` for one row per message, or
+   * `{ useStringTable: true }` for dictionary-encoded shared strings.
+   *
+   * @param {string} workbookId handle from openWorkbook.
+   * @param {object} sheet SheetSelector ({ sheetIndex } or { sheetName }).
+   * @param {object} [options] StreamWorksheetRangeRequest overrides.
    */
-  streamWorksheetRange(workbookId, sheet) {
-    return this.stub.streamWorksheetRange({ workbookId, sheet });
+  streamWorksheetRange(workbookId, sheet, options = {}) {
+    return this.stub.streamWorksheetRange({ workbookId, sheet, ...options });
   }
 
   /** Server-streaming worksheet formulas; same event shape as ranges. */

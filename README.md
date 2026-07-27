@@ -66,8 +66,10 @@ everything with one command.
   cell readers. XLS and ODS only support whole-range parsing, so those parse
   first and then stream. The wire contract is identical either way, and the
   streamed grid matches calamine's own `worksheet_range`: trailing blank
-  rows trimmed, interior gaps sent as explicit empty rows. The test suite
-  asserts that parity against calamine for every sheet of every fixture.
+  rows trimmed, interior gaps sent as explicit empty rows, `header_row`
+  honored the same on every format. The test suite asserts that parity
+  against calamine for every sheet of every fixture, including synthetic
+  workbooks whose declared `<dimension>` lies.
 - **Reads don't block each other.** Each read builds its own calamine reader
   over the shared bytes, so many clients can stream one workbook at once.
   Parsing runs on tokio's blocking pool behind a bounded channel, so a slow
@@ -92,6 +94,7 @@ slower.
 | `GRPC_CALAMINE_WORKERS`          | CPU count      | tokio worker threads                        |
 | `GRPC_CALAMINE_BLOCKING_THREADS` | `512`          | max threads for calamine parsing tasks      |
 | `GRPC_CALAMINE_WINDOW_BYTES`     | `52428800`     | HTTP/2 initial stream and connection window |
+| `GRPC_CALAMINE_MAX_CONCURRENT_STREAMS` | `128`    | streaming reads admitted at once            |
 
 The window default is 50 MiB because window size over round-trip time caps
 upload throughput; hyper's 1 MiB default holds a 10 ms link near 100 MB/s.
@@ -103,7 +106,33 @@ responses for any client that negotiates it. No configuration needed on
 either side beyond the client asking.
 
 Hard limits (compile-time, `src/service.rs`): 512 MiB max workbook upload,
-32 MiB max gRPC frame, 64-event stream backpressure channel.
+32 MiB max gRPC frame, 64-event stream backpressure channel, 8 MiB per row
+batch, 65,536 rows per batch, 30 s consumer stall.
+
+That last one is what keeps a client from taking the server down by opening
+streams and never reading them: a parse waits on a slow consumer, but not
+forever, and a stream abandoned that way ends with `DEADLINE_EXCEEDED`
+instead of pinning a parser thread permanently. The concurrency cap above
+bounds the same failure from the other side.
+
+Nothing read out of an uploaded file is trusted as a size. A declared
+`<dimension>` only reserves capacity, clamped to Excel's own 16,384-column
+limit, and the row's real width comes from the cells that arrive; calamine
+itself only warns past that limit rather than clamping, so `A1:ZZZZZZ1` in a
+2 KB upload parses to column 321,272,405. A declaration whose end precedes
+its start reports zero cells rather than underflowing. A panic anywhere in
+the parse is delivered as a gRPC `INTERNAL` status, never as a stream that
+ends successfully having sent nothing.
+
+**One known hole, upstream.** `StreamWorksheetFormula` has no incremental
+API in calamine, so it goes through `Range::from_sparse`, which densifies to
+`rows * cols` cells (`calamine/src/lib.rs:961`). Two formula cells at
+opposite corners of a sheet are ~17 billion `Data` values, or about 549 GB;
+the allocation failure is `handle_alloc_error`, which aborts the process
+rather than unwinding, so the panic supervisor above cannot catch it. The
+value stream is not affected — it never calls `from_sparse`. Do not expose
+`StreamWorksheetFormula` to untrusted uploads until calamine bounds that
+allocation.
 
 ## API
 
@@ -195,9 +224,12 @@ dedicated tests.
 
 ## Demos
 
-Self-contained clients in Java, Python, and Node live under
+Self-contained example clients in Java, Python, and Node live under
 [`demos/`](demos), including a web viewer that renders sheets in the browser
-as the server parses them. See [demos/README.md](demos/README.md).
+as the server parses them. Each one's README ends with a from-scratch
+tutorial for that language: the dependency, the stub generation, and a short
+program that uploads a workbook and prints its rows. See
+[demos/README.md](demos/README.md).
 
 ## License
 

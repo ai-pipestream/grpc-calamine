@@ -13,6 +13,7 @@ import calamine.v1.StreamWorksheetRangeRequest;
 import calamine.v1.StreamWorksheetRangeResponse;
 import calamine.v1.WorkbookFormat;
 import calamine.v1.WorkbookOptions;
+import calamine.v1.WorksheetRow;
 import com.google.protobuf.ByteString;
 import io.grpc.Grpc;
 import io.grpc.InsecureChannelCredentials;
@@ -159,13 +160,11 @@ public final class CalamineDemo {
                                 "%nstreaming \"%s\" — %d cells%n%n",
                                 event.getStarted().getSheetName(),
                                 event.getStarted().getTotalCells());
-                case ROW -> {
-                    String cells =
-                            event.getRow().getValuesList().stream()
-                                    .map(CalamineDemo::renderCell)
-                                    .collect(Collectors.joining(" │ "));
-                    System.out.printf("%6d │ %s%n", event.getRow().getRowIndex() + 1, cells);
-                }
+                // Rows arrive batched by default; the single-row carrier is
+                // used only when the client asks for maxRowsPerMessage = 1.
+                // A client that handles only ROW silently prints nothing.
+                case ROWS -> event.getRows().getRowsList().forEach(CalamineDemo::printRow);
+                case ROW -> printRow(event.getRow());
                 case ERROR -> {
                     System.err.println(
                             "in-band error: " + event.getError().getError().getMessage());
@@ -176,6 +175,15 @@ public final class CalamineDemo {
                 default -> { }
             }
         }
+    }
+
+    /** Print one streamed row, whichever carrier delivered it. */
+    private static void printRow(WorksheetRow row) {
+        String cells =
+                row.getValuesList().stream()
+                        .map(CalamineDemo::renderCell)
+                        .collect(Collectors.joining(" │ "));
+        System.out.printf("%6d │ %s%n", row.getRowIndex() + 1, cells);
     }
 
     /** Render one CellData oneof to display text. */

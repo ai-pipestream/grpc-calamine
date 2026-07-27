@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// NOT A DEMO. This is part of the benchmark harness in ../../../../../../bench,
+// and it lives in this directory only because it needs the generated stubs
+// this Maven project produces. It is a measurement tool: it prints timings,
+// not rows, and it is not written to be read as an example.
+//
+// To learn the API, read CalamineDemo.java instead. To run this, see
+// ../../../../../../bench/README.md ("The other-language arms").
 package demo;
 
 import calamine.v1.CalamineServiceGrpc;
@@ -24,6 +33,10 @@ import java.util.concurrent.CompletableFuture;
 
 /**
  * Timing-only client: consume every cell, print nothing per row.
+ *
+ * <p>Measures where a grpc-java client's time goes, which is mostly stub
+ * style and executor choice rather than the network. Not an example of how
+ * to use the API; see {@link CalamineDemo} for that.
  *
  * Environment:
  *   MODE=blocking|async     stub style (default blocking)

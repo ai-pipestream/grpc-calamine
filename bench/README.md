@@ -179,11 +179,11 @@ over gRPC, pull it as JSON, or just parse the file myself?" These reproduce
 the comparison from the consumer's side, each feeding a digest compatible with
 the harness so cross-implementation agreement is checkable:
 
-- **Python** — `demos/python-client/_pybench.py` runs python-calamine on a
-  local file, grpc-calamine over the wire, and the same rows as NDJSON over
-  HTTP. One hard-won caveat is written into it: the verification digest must
-  be cheaper than the parsers under test, or it becomes the thing being
-  measured.
+- **Python** — `demos/python-client/pybench.py` runs openpyxl and
+  python-calamine on a local file, grpc-calamine over the wire, and the same
+  rows as NDJSON over HTTP. One hard-won caveat is written into it: the
+  verification digest must be cheaper than the parsers under test, or it
+  becomes the thing being measured.
 - **Rust NDJSON** — `cargo run --release --bin jsonclient` pulls the NDJSON
   arm with a fast client, for when the interpreter is no longer the
   bottleneck and the format difference can show.

@@ -566,8 +566,12 @@ async fn arm_grpc(
     let mut ttfr = 0.0;
     let mut messages = 0u64;
     let mut table: Vec<String> = Vec::new();
-    let feed = |digest: &mut Digest, table: &[String], r: pb::WorksheetRow| {
+    // Width of the last row fed, so an expanded gap is as wide as the rows
+    // around it and the digest still matches the native arm's dense walk.
+    let mut width = 0usize;
+    let feed = |digest: &mut Digest, table: &[String], width: &mut usize, r: pb::WorksheetRow| {
         digest.row(r.row_index);
+        *width = r.values.len();
         for c in &r.values {
             match c.value.as_ref() {
                 Some(pb::cell_data::Value::SharedStringId(id)) => {
@@ -587,7 +591,7 @@ async fn arm_grpc(
                 }
                 messages += 1;
                 for r in batch.rows {
-                    feed(&mut digest, &table, r);
+                    feed(&mut digest, &table, &mut width, r);
                 }
             }
             Some(pb::stream_worksheet_range_response::Event::Row(r)) => {
@@ -595,7 +599,19 @@ async fn arm_grpc(
                     ttfr = t.elapsed().as_secs_f64() * 1e3;
                 }
                 messages += 1;
-                feed(&mut digest, &table, r);
+                feed(&mut digest, &table, &mut width, r);
+            }
+            // The native arm walks a dense range, so this one densifies too or
+            // the digests stop comparing. Doing it here rather than on the wire
+            // is exactly the saving: one message stands in for the whole run.
+            Some(pb::stream_worksheet_range_response::Event::RowGap(gap)) => {
+                messages += 1;
+                for offset in 0..gap.row_count {
+                    digest.row(gap.first_row_index + offset);
+                    for _ in 0..width {
+                        digest.push_pb(Some(&pb::cell_data::Value::Empty(())));
+                    }
+                }
             }
             Some(pb::stream_worksheet_range_response::Event::StringTable(chunk)) => {
                 assert_eq!(

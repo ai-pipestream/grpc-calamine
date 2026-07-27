@@ -57,6 +57,14 @@ thousands of trailing styled-blank rows that calamine itself trims. That
 second catch became a server fix and a regression test
 (`tests/streaming.rs`), which is the point of the gate.
 
+Arm 3 expands every `row_gap` back into the blank rows it stands for, so it
+still digests the same dense stream as arms 1 and 2. That expansion happening
+in the client rather than on the wire is precisely the saving the gap buys,
+and it does not show up in these numbers: the workbooks measured here are
+densely populated, which is where a gap has nothing to collapse. The sheets a
+gap is for are the sparse ones, and they were not a benchmark before this
+because they did not finish.
+
 Arm 0 is deliberately **not** gated. It walks only populated cells and hands
 back borrowed `&str`, so it is doing different and strictly less work than the
 others. It is reported as a floor, never as a peer.

@@ -1,3 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# NOT A DEMO. This is part of the benchmark harness in ../../bench and lives
+# here only because it shares the generated stubs run.sh produces. It prints
+# timings, not rows. To learn the API, read client.py instead; to run this,
+# see ../../bench/README.md ("The other-language arms").
 """How does grpc-calamine compare to reading the same sheet in Python?
 
 Three ways a Python program can get these cells:

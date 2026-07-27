@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use calamine::{Data, Reader, Sheets, open_workbook_auto};
+use calamine::{Data, HeaderRow, Reader, Sheets, open_workbook_auto};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Code;
 use tonic::transport::{Endpoint, Server};
@@ -53,15 +53,27 @@ async fn upload(
     client: &CalamineServiceClient<tonic::transport::Channel>,
     file: &str,
 ) -> pb::OpenWorkbookResponse {
+    upload_with_options(
+        client,
+        file,
+        pb::WorkbookOptions {
+            format_hint: pb::WorkbookFormat::Unspecified as i32,
+            header_row: None,
+        },
+    )
+    .await
+}
+
+/// Upload a workbook file with explicit open-time options.
+async fn upload_with_options(
+    client: &CalamineServiceClient<tonic::transport::Channel>,
+    file: &str,
+    options: pb::WorkbookOptions,
+) -> pb::OpenWorkbookResponse {
     let mut client = client.clone();
     let bytes = std::fs::read(fixtures().join(file)).expect("read fixture");
     let mut frames = vec![pb::OpenWorkbookRequest {
-        payload: Some(pb::open_workbook_request::Payload::Options(
-            pb::WorkbookOptions {
-                format_hint: pb::WorkbookFormat::Unspecified as i32,
-                header_row: None,
-            },
-        )),
+        payload: Some(pb::open_workbook_request::Payload::Options(options)),
     }];
     frames.extend(
         bytes
@@ -689,6 +701,14 @@ async fn every_sheet_of_every_fixture_matches_calamine_counts() {
         "dimension_underdeclared.xlsx",
         "dimension_shifted.xlsx",
         "dimension_offset.xlsx",
+        "dimension_wide.xlsx",
+        "rows_out_of_order.xlsx",
+        "rows_descending.xlsx",
+        // Deliberately absent: `dimension_reversed.xlsx`, whose declaration
+        // underflows calamine's own unchecked corner subtraction, so building
+        // the ground truth here would panic before the server was asked
+        // anything (it has its own test); and `rows_late_backwards.xlsx`,
+        // which calamine reads and a one-pass stream cannot (likewise).
     ];
     for file in files {
         let client = start_server().await;
@@ -870,6 +890,230 @@ async fn rows_are_anchored_at_column_a() {
     );
 }
 
+/// A `<dimension>` whose end is before its start must not break the stream.
+///
+/// ECMA-376 does not require `ref` to be ordered, and calamine subtracts the
+/// two corners with unchecked `u32` arithmetic (`get_dimension`,
+/// xlsx/mod.rs:2789, and `Dimensions::len`, lib.rs:181). Both underflow on a
+/// reversed range, and the server hands the result straight to the client as
+/// `RangeStarted.total_cells`. Two observable failures follow from the same
+/// input:
+///
+/// - **release** (overflow checks off): the extent wraps and `total_cells`
+///   comes back as 18,446,744,056,529,682,000, which is 10^9 times the whole
+///   Excel grid. Anything sizing a progress bar or preallocating from it is
+///   handed nonsense.
+/// - **debug** (overflow checks on): calamine panics inside the blocking
+///   parse task. The panic kills the task, which drops the channel sender,
+///   which ends the stream *successfully* with zero events. The caller sees
+///   no header, no in-band error, and an OK status: an empty sheet.
+///
+/// The second is the worse one, and it is not specific to this input. Any
+/// panic below `spawn_blocking_stream` (service.rs:175) is reported to the
+/// client as a clean, empty, successful stream.
+#[tokio::test]
+async fn a_reversed_declared_dimension_does_not_break_the_stream() {
+    // Excel's own grid: 1,048,576 rows x 16,384 columns. Nothing calamine can
+    // legitimately report may exceed it.
+    const MAX_GRID_CELLS: u64 = 1_048_576 * 16_384;
+
+    let mut client = start_server().await;
+    let opened = upload(&client, "dimension_reversed.xlsx").await;
+    let mut stream = client
+        .stream_worksheet_range(pb::StreamWorksheetRangeRequest {
+            workbook_id: opened.workbook_id,
+            sheet: Some(pb::SheetSelector {
+                selector: Some(pb::sheet_selector::Selector::SheetIndex(0)),
+            }),
+            max_rows_per_message: 0,
+            use_string_table: false,
+        })
+        .await
+        .expect("rpc itself succeeds")
+        .into_inner();
+
+    let mut header = None;
+    let mut rows = 0usize;
+    let mut in_band = None;
+    // A terminal failure is allowed to arrive as a gRPC status; what is not
+    // allowed is a clean, empty, successful stream.
+    let mut status = None;
+    loop {
+        match stream.message().await {
+            Ok(None) => break,
+            Ok(Some(event)) => match event.event.expect("event kind") {
+                pb::stream_worksheet_range_response::Event::Started(s) => header = Some(s),
+                pb::stream_worksheet_range_response::Event::Row(_) => rows += 1,
+                pb::stream_worksheet_range_response::Event::Rows(b) => rows += b.rows.len(),
+                pb::stream_worksheet_range_response::Event::Error(e) => in_band = Some(e),
+                pb::stream_worksheet_range_response::Event::StringTable(_) => {}
+            },
+            Err(s) => {
+                status = Some(s);
+                break;
+            }
+        }
+    }
+
+    assert!(
+        header.is_some() || in_band.is_some() || status.is_some(),
+        "the stream ended with no header, no rows ({rows}) and no error of any \
+         kind: a caller cannot tell this from an empty sheet"
+    );
+
+    if let Some(header) = header {
+        assert!(
+            header.total_cells <= MAX_GRID_CELLS,
+            "total_cells is {}, larger than the entire Excel grid ({MAX_GRID_CELLS}); \
+             the declared extent underflowed",
+            header.total_cells
+        );
+    }
+}
+
+/// Rows that arrive out of order must land at their own row index.
+///
+/// Nothing in ECMA-376 requires `<row>` elements to be sorted; the `r`
+/// attribute on each `<c>` is what fixes the position, and calamine reads
+/// such a sheet correctly because `Range::from_sparse` sorts the cells it
+/// collected. `emit_incremental` (service.rs:502) instead walks the cell
+/// stream in arrival order and only ever advances: `while current_row < row`
+/// (service.rs:584) has no branch for a row index that moves backwards, so a
+/// late-arriving earlier row is written into the row already under
+/// construction, at that row's index.
+///
+/// For `rows_out_of_order.xlsx` (`A3=1` written before `A1=2`) calamine
+/// reports three rows -- A1=2, A2 empty, A3=1 -- and the server emits one row
+/// at index 2 holding the value 2. The value 1 is dropped and the value 2 is
+/// reported at the wrong row. Both are silent: no error event, no gRPC
+/// status.
+#[tokio::test]
+async fn rows_arriving_out_of_order_keep_their_own_row_index() {
+    let client = start_server().await;
+    let opened = upload(&client, "rows_out_of_order.xlsx").await;
+    let (_header, rows) = stream_range(&client, &opened.workbook_id, 0).await;
+
+    assert_eq!(
+        populated_cells(&rows),
+        vec![
+            (0, 0, pb::cell_data::Value::FloatValue(2.0)),
+            (2, 0, pb::cell_data::Value::FloatValue(1.0)),
+        ],
+        "a row written after a later row must still land at its own index, \
+         and no value may be dropped"
+    );
+    assert_eq!(
+        rows.len(),
+        3,
+        "A1..A3 spans three rows, the middle one empty"
+    );
+}
+
+/// A fully reversed sheet still streams correctly, in ascending order.
+///
+/// 40 rows written last-to-first. Nothing is committed while the whole sheet
+/// fits in the batcher's unsent queue, so every late row is repaired in place
+/// rather than lost. This is the reach the one-pass densifier actually has.
+#[tokio::test]
+async fn a_fully_reversed_sheet_streams_in_ascending_order() {
+    let client = start_server().await;
+    let opened = upload(&client, "rows_descending.xlsx").await;
+    let (_header, rows) = stream_range(&client, &opened.workbook_id, 0).await;
+
+    let expected: Vec<(u32, u32, pb::cell_data::Value)> = (0..40)
+        .map(|r| (r, 0, pb::cell_data::Value::FloatValue(f64::from(r + 1))))
+        .collect();
+    assert_eq!(populated_cells(&rows), expected);
+    assert_eq!(
+        rows.iter().map(|r| r.row_index).collect::<Vec<_>>(),
+        (0..40).collect::<Vec<_>>(),
+        "rows must arrive in ascending order whatever order the file used"
+    );
+}
+
+/// Repair reach must not depend on which carrier the caller asked for.
+///
+/// `max_rows_per_message = 1` changes how rows are packed into messages, and
+/// nothing else. If it also shrank the window in which an out-of-order row can
+/// be repaired, the same file would succeed batched and fail row-per-message.
+#[tokio::test]
+async fn unsorted_rows_repair_identically_in_both_carriers() {
+    let client = start_server().await;
+    let opened = upload(&client, "rows_descending.xlsx").await;
+
+    let (batched_header, batched) = stream_range_batched(&client, &opened.workbook_id, 0, 0).await;
+    let (single_header, single) = stream_range_batched(&client, &opened.workbook_id, 0, 1).await;
+
+    assert_eq!(batched_header, single_header);
+    assert_eq!(
+        batched, single,
+        "an unsorted sheet must resolve to the same rows in either carrier"
+    );
+}
+
+/// Out of order too late to repair must fail loudly, never silently.
+///
+/// 600 ascending rows force several batches onto the wire, and only then does
+/// a cell arrive back in row 1. gRPC cannot retract a sent message, so the row
+/// cannot be placed. The contract's terminal in-band error is the only honest
+/// outcome; folding the cell into the row under construction, which is what
+/// the server used to do, is silent data loss.
+///
+/// calamine's own buffered API reads this file without complaint. That gap is
+/// the documented price of streaming in one pass, not a parity bug.
+#[tokio::test]
+async fn out_of_order_beyond_repair_fails_in_band() {
+    let client = start_server().await;
+    let opened = upload(&client, "rows_late_backwards.xlsx").await;
+    let (header, rows, error) = stream_range_outcome(&client, &opened.workbook_id, 0).await;
+
+    assert!(header.is_some(), "the header still arrives first");
+    let error = error.expect("an unrepairable row must produce an in-band error");
+    assert!(error.terminal, "the stream cannot continue past this");
+    let detail = error.error.expect("error detail");
+    assert!(
+        detail.message.contains("ascending order"),
+        "the message must say what is wrong with the file: {}",
+        detail.message
+    );
+    // Whatever did stream must still be correct and in order.
+    let indices: Vec<u32> = rows.iter().map(|r| r.row_index).collect();
+    assert!(
+        indices.windows(2).all(|w| w[0] < w[1]),
+        "rows delivered before the failure must still be ascending"
+    );
+}
+
+/// The declared `<dimension>` must not size the server's row buffer.
+///
+/// `emit_incremental` pre-sizes each row from the declaration
+/// (`width = dims.end.1 as usize + 1`, service.rs:532) and then allocates
+/// `vec![empty_cell_data(); width]` (service.rs:534) before reading a single
+/// cell. That end column comes straight out of the uploaded file, and calamine
+/// does not clamp it: `get_dimension` only logs a warning past its 16,384
+/// column limit (xlsx/mod.rs:2794). The base-26 parse accepts far more, so
+/// `<dimension ref="A1:ZZZZZZ1"/>` in a 2 KB upload is column 321,272,405 and
+/// commits roughly 10 GB before any work happens.
+///
+/// This fixture uses 200,000 columns over a single cell at A1: enough to
+/// demonstrate the same path, small enough that the suite stays safe. calamine
+/// reports a 1x1 range for it, so the emitted row should be one cell wide.
+#[tokio::test]
+async fn a_wide_declared_dimension_does_not_size_the_row_buffer() {
+    let client = start_server().await;
+    let opened = upload(&client, "dimension_wide.xlsx").await;
+    let (_header, rows) = stream_range(&client, &opened.workbook_id, 0).await;
+
+    assert_eq!(rows.len(), 1, "the sheet holds exactly one populated row");
+    assert_eq!(
+        rows[0].values.len(),
+        1,
+        "the row is sized from the declared 200,000 column extent rather than \
+         from the single cell present, so the declaration controls how much \
+         the server allocates"
+    );
+}
+
 /// Compression must change bytes on the wire, never content: a client that
 /// negotiates zstd (or gzip) gets exactly the rows a plain client gets.
 #[tokio::test]
@@ -983,8 +1227,7 @@ async fn string_table_mode_resolves_to_the_plain_stream() {
         let client = start_server().await;
         let opened = upload(&client, file).await;
         let (_, plain) = stream_range(&client, &opened.workbook_id, 0).await;
-        let (resolved, table_len) =
-            stream_range_resolved(&client, &opened.workbook_id, 0, 0).await;
+        let (resolved, table_len) = stream_range_resolved(&client, &opened.workbook_id, 0, 0).await;
 
         assert_eq!(
             resolved, plain,
@@ -1035,6 +1278,131 @@ async fn string_table_deduplicates() {
         distinct.len(),
         "table size must equal the distinct shared strings on the sheet"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Header row selection: `WorkbookOptions.header_row`.
+//
+// The contract (calamine_service.proto:86-89) says the setting is "applied to
+// subsequent worksheet reads on this handle, mirroring
+// `Reader::with_header_row`". calamine applies it where the range is
+// assembled, which differs per format:
+//
+//   XLS  -> Xls::worksheet_range            (xls.rs:430)   applied
+//   ODS  -> Ods::worksheet_range            (ods.rs:245)   applied
+//   XLSX -> Xlsx::worksheet_range_ref       (xlsx/mod.rs:2652) applied
+//   XLSB -> Xlsb::worksheet_range_ref       (xlsb/mod.rs:562)  applied
+//
+// but NOT in the incremental readers the server streams through:
+// `worksheet_cells_reader` (xlsx/mod.rs:2517, xlsb/mod.rs:418) never reads
+// `options.header_row`. So the XLSX/XLSB streaming path has to apply the
+// selection itself, and these tests hold every format to one meaning.
+// ---------------------------------------------------------------------------
+
+/// The populated cells calamine itself reports for a sheet read with an
+/// explicit header row, normalized exactly the way [`populated_cells`]
+/// normalizes the streamed side.
+fn expected_populated_with_header_row(
+    file: &str,
+    sheet_index: usize,
+    header_row: HeaderRow,
+) -> Vec<(u32, u32, pb::cell_data::Value)> {
+    let mut workbook: Sheets<_> = open_workbook_auto(fixtures().join(file)).expect("open fixture");
+    let is_1904 = convert::has_1904_epoch(&workbook);
+    workbook.with_header_row(header_row);
+    let name = workbook.sheet_names()[sheet_index].clone();
+    let range = workbook.worksheet_range(&name).expect("worksheet range");
+    let start = range.start().unwrap_or((0, 0));
+
+    let mut cells = Vec::new();
+    for (row_offset, row) in range.rows().enumerate() {
+        for (col_offset, data) in row.iter().enumerate() {
+            if matches!(data, Data::Empty) {
+                continue;
+            }
+            let value = match convert::data_value(data, is_1904) {
+                pb::cell_data::Value::SharedStringValue(s) => pb::cell_data::Value::StringValue(s),
+                v => v,
+            };
+            cells.push((
+                start.0 + row_offset as u32,
+                start.1 + col_offset as u32,
+                value,
+            ));
+        }
+    }
+    cells
+}
+
+/// `header_row = Row(n)` must drop everything above row `n`, on every format.
+///
+/// The `date.*` fixtures are the same three-row sheet in all four formats, so
+/// asking for row 1 as the header must drop row 0 four times over. XLS and ODS
+/// pass because the server streams them through `worksheet_range`, which
+/// applies the setting; XLSX and XLSB stream through `worksheet_cells_reader`,
+/// which does not, so the server silently returns the whole sheet.
+#[tokio::test]
+async fn header_row_selection_is_honoured_on_every_format() {
+    const HEADER: u32 = 1;
+
+    for file in ["date.xls", "date.ods", "date.xlsx", "date.xlsb"] {
+        let client = start_server().await;
+        let opened = upload_with_options(
+            &client,
+            file,
+            pb::WorkbookOptions {
+                format_hint: pb::WorkbookFormat::Unspecified as i32,
+                header_row: Some(pb::HeaderRow {
+                    selection: Some(pb::header_row::Selection::RowIndex(HEADER)),
+                }),
+            },
+        )
+        .await;
+
+        let (_header, rows) = stream_range(&client, &opened.workbook_id, 0).await;
+        let expected = expected_populated_with_header_row(file, 0, HeaderRow::Row(HEADER));
+
+        assert_eq!(
+            populated_cells(&rows),
+            expected,
+            "{file}: header_row = Row({HEADER}) was not applied to the stream"
+        );
+    }
+}
+
+/// The same selection, stated as the observable a caller actually reads: no
+/// row above the requested header row may appear in the stream.
+#[tokio::test]
+async fn header_row_selection_suppresses_rows_above_it() {
+    const HEADER: u32 = 1;
+
+    for file in ["date.xls", "date.ods", "date.xlsx", "date.xlsb"] {
+        let client = start_server().await;
+        let opened = upload_with_options(
+            &client,
+            file,
+            pb::WorkbookOptions {
+                format_hint: pb::WorkbookFormat::Unspecified as i32,
+                header_row: Some(pb::HeaderRow {
+                    selection: Some(pb::header_row::Selection::RowIndex(HEADER)),
+                }),
+            },
+        )
+        .await;
+
+        let (_header, rows) = stream_range(&client, &opened.workbook_id, 0).await;
+        let above: Vec<u32> = rows
+            .iter()
+            .map(|r| r.row_index)
+            .filter(|i| *i < HEADER)
+            .collect();
+
+        assert!(
+            above.is_empty(),
+            "{file}: rows {above:?} are above the requested header row {HEADER} \
+             and must not stream"
+        );
+    }
 }
 
 /// The dictionary composes with wire compression: a zstd-negotiating client

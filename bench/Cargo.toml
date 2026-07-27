@@ -23,3 +23,11 @@ serde_json = "1.0"
 # than inferred from encoded payloads, so compression is measured honestly.
 tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+
+# `bench` is its own crate, so it does not inherit the server's `[patch]`
+# section. Without this it would link calamine from crates.io while the server
+# links the fork, which would quietly break the "same calamine build" claim
+# above and make the native-vs-gRPC comparison dishonest. Keep in step with the
+# server's Cargo.toml; remove both together once the fixes are released.
+[patch.crates-io]
+calamine = { git = "https://github.com/ai-pipestream/calamine.git", branch = "pipestream-main" }

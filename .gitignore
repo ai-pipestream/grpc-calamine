@@ -28,9 +28,11 @@ target
 # --- Demo build artifacts (generated; never committed) ---
 # Node: installed deps. package-lock.json IS committed for reproducibility.
 demos/node-client/node_modules/
-# Python: virtualenv and protoc-generated stubs.
+# Python: virtualenv, protoc-generated stubs, and bytecode caches. The fixture
+# generator under demos/sample-data leaves one behind when it is imported.
 demos/python-client/.venv/
 demos/python-client/gen/
+__pycache__/
 # Java: Maven output (includes protoc-generated sources).
 demos/java-client/target/
 

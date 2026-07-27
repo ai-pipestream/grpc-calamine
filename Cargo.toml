@@ -25,6 +25,22 @@ uuid = { version = "1.24.0", features = ["v4"] }
 [dev-dependencies]
 tokio-stream = { version = "0.1.19", features = ["net"] }
 
+# Three defects found by this server are fixed upstream in tafia/calamine#695,
+# #696 and #697 but not yet released. `pipestream-main` is those three branches
+# merged and nothing else, so it is 0.36.0 plus exactly those fixes:
+#
+#   #695  a reversed `<dimension ref>` underflowed the extent arithmetic, so
+#         `Dimensions::len()` reported 18_446_744_056_529_682_435 cells
+#   #696  cell reference parsing overflowed u32 unchecked, so a crafted `r=`
+#         yielded a cell position that appears nowhere in the file
+#   #697  `Range::from_sparse` densified without bound, so a 2 KB worksheet
+#         aborted the process through `handle_alloc_error` (uncatchable)
+#
+# Drop this section once the three land in a release; the fixes are additive
+# and the server does not depend on any API they introduce.
+[patch.crates-io]
+calamine = { git = "https://github.com/ai-pipestream/calamine.git", branch = "pipestream-main" }
+
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "forbid"

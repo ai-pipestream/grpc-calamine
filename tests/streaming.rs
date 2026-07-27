@@ -134,6 +134,7 @@ async fn stream_range_batched(
                 assert!(!batch.rows.is_empty(), "a rows batch is never empty");
                 rows.extend(batch.rows);
             }
+            pb::stream_worksheet_range_response::Event::RowGap(gap) => expand_gap(&mut rows, gap),
             pb::stream_worksheet_range_response::Event::StringTable(_) => {
                 panic!("string table events must only appear when requested")
             }
@@ -143,6 +144,43 @@ async fn stream_range_batched(
         }
     }
     (header.expect("stream must start with a header"), rows)
+}
+
+/// Expand a `row_gap` back into the blank rows it stands for.
+///
+/// This is what a client wanting a dense grid does, and doing it here lets
+/// every assertion in this file keep comparing against calamine's own dense
+/// output: a gap carries no cells by definition, so expanding one can only
+/// ever produce blank rows. Their width is taken from the preceding row,
+/// which is what a densifying walk would have padded them to.
+///
+/// A client collecting populated cells instead just skips the event, and one
+/// that ignores it entirely still places every row correctly, because
+/// `row_index` is absolute.
+fn expand_gap(rows: &mut Vec<pb::WorksheetRow>, gap: pb::WorksheetRowGap) {
+    assert!(gap.row_count > 0, "a gap always covers at least one row");
+    // Width comes from the row before, which a gap normally has. The one case
+    // with nothing before it is a `HeaderRow::Row(n)` selection whose header
+    // row is blank: the sheet starts at `n`, so the gap leads. Zero width is
+    // the honest answer there, since no cell has arrived to imply one, and the
+    // contract allows a row to omit trailing empty cells anyway.
+    let width = match rows.last() {
+        Some(last) => {
+            assert_eq!(
+                gap.first_row_index,
+                last.row_index + 1,
+                "a gap starts immediately after the row before it"
+            );
+            last.values.len()
+        }
+        None => 0,
+    };
+    for offset in 0..gap.row_count {
+        rows.push(pb::WorksheetRow {
+            row_index: gap.first_row_index + offset,
+            values: vec![convert::empty_cell_data(); width],
+        });
+    }
 }
 
 /// Ground truth for a worksheet, parsed locally with calamine: the range and
@@ -651,6 +689,7 @@ async fn stream_range_outcome(
             pb::stream_worksheet_range_response::Event::Started(started) => header = Some(started),
             pb::stream_worksheet_range_response::Event::Row(row) => rows.push(row),
             pb::stream_worksheet_range_response::Event::Rows(batch) => rows.extend(batch.rows),
+            pb::stream_worksheet_range_response::Event::RowGap(gap) => expand_gap(&mut rows, gap),
             pb::stream_worksheet_range_response::Event::StringTable(_) => {
                 panic!("string table events must only appear when requested")
             }
@@ -704,11 +743,16 @@ async fn every_sheet_of_every_fixture_matches_calamine_counts() {
         "dimension_wide.xlsx",
         "rows_out_of_order.xlsx",
         "rows_descending.xlsx",
+        "rows_with_gaps.xlsx",
         // Deliberately absent: `dimension_reversed.xlsx`, whose declaration
         // underflows calamine's own unchecked corner subtraction, so building
         // the ground truth here would panic before the server was asked
-        // anything (it has its own test); and `rows_late_backwards.xlsx`,
-        // which calamine reads and a one-pass stream cannot (likewise).
+        // anything (it has its own test); `rows_late_backwards.xlsx`, which
+        // calamine reads and a one-pass stream cannot (likewise); and
+        // `corners.xlsx`, whose dense range is 17.2 billion cells, so asking
+        // calamine for the ground truth is itself the thing that cannot be
+        // afforded. It has its own test, which asserts against the two cells
+        // in the file rather than against a range nobody can allocate.
     ];
     for file in files {
         let client = start_server().await;
@@ -735,8 +779,7 @@ async fn every_sheet_of_every_fixture_matches_calamine_counts() {
             assert!(
                 error.is_none(),
                 "{file}/{name}: calamine parses this sheet locally, but the \
-                 stream errored: {:?}",
-                error
+                 stream errored: {error:?}"
             );
             let header = header.expect("stream must start with a header");
             assert_eq!(header.sheet_name, *name, "{file}: wrong sheet resolved");
@@ -945,6 +988,9 @@ async fn a_reversed_declared_dimension_does_not_break_the_stream() {
                 pb::stream_worksheet_range_response::Event::Started(s) => header = Some(s),
                 pb::stream_worksheet_range_response::Event::Row(_) => rows += 1,
                 pb::stream_worksheet_range_response::Event::Rows(b) => rows += b.rows.len(),
+                pb::stream_worksheet_range_response::Event::RowGap(g) => {
+                    rows += g.row_count as usize
+                }
                 pb::stream_worksheet_range_response::Event::Error(e) => in_band = Some(e),
                 pb::stream_worksheet_range_response::Event::StringTable(_) => {}
             },
@@ -1084,6 +1130,229 @@ async fn out_of_order_beyond_repair_fails_in_band() {
     );
 }
 
+/// Every event of a range stream, in arrival order, with gaps left intact.
+///
+/// The other collectors expand a gap so their assertions can compare against
+/// calamine's dense output. These tests are about the gaps themselves, so they
+/// need to see them.
+#[derive(Debug, PartialEq)]
+enum Event {
+    Row(u32),
+    Gap(u32, u32),
+}
+
+async fn stream_range_events(
+    client: &CalamineServiceClient<tonic::transport::Channel>,
+    workbook_id: &str,
+    sheet_index: u32,
+) -> (Vec<Event>, Vec<(u32, u32, pb::cell_data::Value)>) {
+    let mut client = client.clone();
+    let mut stream = client
+        .stream_worksheet_range(pb::StreamWorksheetRangeRequest {
+            workbook_id: workbook_id.to_string(),
+            sheet: Some(pb::SheetSelector {
+                selector: Some(pb::sheet_selector::Selector::SheetIndex(sheet_index)),
+            }),
+            max_rows_per_message: 0,
+            use_string_table: false,
+        })
+        .await
+        .expect("stream worksheet range")
+        .into_inner();
+
+    let mut events = Vec::new();
+    let mut cells = Vec::new();
+    fn collect(
+        events: &mut Vec<Event>,
+        cells: &mut Vec<(u32, u32, pb::cell_data::Value)>,
+        row: pb::WorksheetRow,
+    ) {
+        for (col, cell) in row.values.iter().enumerate() {
+            match &cell.value {
+                Some(pb::cell_data::Value::Empty(())) | None => {}
+                Some(value) => cells.push((row.row_index, col as u32, value.clone())),
+            }
+        }
+        events.push(Event::Row(row.row_index));
+    }
+    while let Some(event) = stream.message().await.expect("stream event") {
+        match event.event.expect("event kind") {
+            pb::stream_worksheet_range_response::Event::Started(_) => {}
+            pb::stream_worksheet_range_response::Event::Row(row) => {
+                collect(&mut events, &mut cells, row)
+            }
+            pb::stream_worksheet_range_response::Event::Rows(batch) => {
+                for row in batch.rows {
+                    collect(&mut events, &mut cells, row);
+                }
+            }
+            pb::stream_worksheet_range_response::Event::RowGap(gap) => {
+                events.push(Event::Gap(gap.first_row_index, gap.row_count))
+            }
+            pb::stream_worksheet_range_response::Event::StringTable(_) => {}
+            pb::stream_worksheet_range_response::Event::Error(err) => {
+                panic!("unexpected in-band error: {:?}", err.error)
+            }
+        }
+    }
+    (events, cells)
+}
+
+/// A run of empty rows is one `row_gap`, whatever its length.
+///
+/// The fixture has a single blank row, a run of thirteen, two populated rows
+/// back to back, leading blanks and trailing blanks, which is every shape the
+/// rule has to cover.
+#[tokio::test]
+async fn interior_empty_rows_collapse_into_one_gap_each() {
+    let client = start_server().await;
+    let opened = upload(&client, "rows_with_gaps.xlsx").await;
+    let (events, cells) = stream_range_events(&client, &opened.workbook_id, 0).await;
+
+    // Rows are 0-based on the wire, so the file's rows 3, 4, 6 and 20 are 2, 3,
+    // 5 and 19 here.
+    assert_eq!(
+        events,
+        vec![
+            Event::Row(2),
+            Event::Row(3),
+            Event::Gap(4, 1),
+            Event::Row(5),
+            Event::Gap(6, 13),
+            Event::Row(19),
+        ],
+        "one gap per run, no gap between adjacent rows, and none before the \
+         first row or after the last"
+    );
+    assert_eq!(
+        cells,
+        vec![
+            (2, 0, pb::cell_data::Value::FloatValue(3.0)),
+            (3, 0, pb::cell_data::Value::FloatValue(4.0)),
+            (5, 0, pb::cell_data::Value::FloatValue(6.0)),
+            (19, 0, pb::cell_data::Value::FloatValue(20.0)),
+        ],
+        "collapsing empty rows must not move or lose a single value"
+    );
+}
+
+/// Two cells at opposite corners of the grid must cost two rows, not a million.
+///
+/// This is the file that OOM-killed a Node client. `corners.xlsx` is about
+/// 2 KB and declares `A1:XFD1048576`; the rows between its two cells hold
+/// nothing, and at the sheet's final width that dense grid is 17.2 billion
+/// cells. calamine itself allocates it, which is why the ground truth here is
+/// the two cells in the file rather than `worksheet_range`.
+///
+/// A gap is constant size however long the run, so the whole sheet is two rows
+/// and one gap. Without one this test does not merely fail, it never finishes.
+#[tokio::test]
+async fn a_sheet_of_two_far_apart_cells_streams_in_constant_space() {
+    let client = start_server().await;
+    let opened = upload(&client, "corners.xlsx").await;
+    let (events, cells) = stream_range_events(&client, &opened.workbook_id, 0).await;
+
+    assert_eq!(
+        events,
+        vec![
+            Event::Row(0),
+            Event::Gap(1, 1_048_574),
+            Event::Row(1_048_575)
+        ],
+        "1,048,574 empty rows must ride one gap"
+    );
+    assert_eq!(
+        cells,
+        vec![
+            (0, 0, pb::cell_data::Value::FloatValue(1.0)),
+            (1_048_575, 16_383, pb::cell_data::Value::FloatValue(2.0)),
+        ],
+        "both corners must arrive at their absolute positions"
+    );
+}
+
+/// A blank `header_row` selection starts the sheet there, and the gap says so.
+///
+/// `HeaderRow::Row(n)` makes `n` the start of the sheet whatever `n` holds:
+/// calamine inserts a synthetic empty cell there before building the extent,
+/// so `Row(2)` over a sheet populated from row 5 reports `start = (2, 0)` and
+/// height 5, not `start = (5, 0)` and height 2. The rows below the header are
+/// therefore interior blanks, not leading padding to trim, and this is the one
+/// case where a gap is the first row event of a stream.
+///
+/// Getting this wrong is silent: the values are all correct and only the
+/// sheet's reported extent shifts, which no cell-level assertion would catch.
+#[tokio::test]
+async fn a_blank_header_row_starts_the_sheet_and_leads_with_a_gap() {
+    let client = start_server().await;
+    let opened = upload_with_options(
+        &client,
+        "blank_header_row.xlsx",
+        pb::WorkbookOptions {
+            format_hint: pb::WorkbookFormat::Unspecified as i32,
+            header_row: Some(pb::HeaderRow {
+                selection: Some(pb::header_row::Selection::RowIndex(2)),
+            }),
+        },
+    )
+    .await;
+    let (events, cells) = stream_range_events(&client, &opened.workbook_id, 0).await;
+
+    assert_eq!(
+        events,
+        vec![Event::Gap(2, 3), Event::Row(5), Event::Row(6)],
+        "rows 2-4 are below the selected header row, so they are interior \
+         blanks the stream must announce rather than trim"
+    );
+    assert_eq!(
+        cells,
+        vec![
+            (5, 0, pb::cell_data::Value::FloatValue(6.0)),
+            (6, 0, pb::cell_data::Value::FloatValue(7.0)),
+        ]
+    );
+
+    // The same sheet with no selection starts at the first populated row, so
+    // there is nothing above it to describe and no gap leads.
+    let plain = upload(&client, "blank_header_row.xlsx").await;
+    let (events, _) = stream_range_events(&client, &plain.workbook_id, 0).await;
+    assert_eq!(
+        events,
+        vec![Event::Row(5), Event::Row(6)],
+        "without a header row selection, leading blanks are trimmed"
+    );
+}
+
+/// A gap changes the wire, never the content.
+///
+/// Expanding every gap back into blank rows has to reproduce exactly what a
+/// row-per-row stream of the same sheet produces, or the gap is not a lossless
+/// encoding of the rows it replaced. Both carriers are checked, because
+/// `max_rows_per_message = 1` sends gaps too.
+#[tokio::test]
+async fn expanding_gaps_reproduces_the_dense_stream() {
+    let client = start_server().await;
+    let opened = upload(&client, "rows_with_gaps.xlsx").await;
+
+    let (batched_header, batched) = stream_range_batched(&client, &opened.workbook_id, 0, 0).await;
+    let (single_header, single) = stream_range_batched(&client, &opened.workbook_id, 0, 1).await;
+
+    assert_eq!(batched_header, single_header);
+    assert_eq!(
+        batched, single,
+        "the carrier must not change what a gap means"
+    );
+    assert_eq!(
+        batched.iter().map(|r| r.row_index).collect::<Vec<_>>(),
+        (2..=19).collect::<Vec<_>>(),
+        "expanded, the sheet is rows 2 through 19 with nothing missing"
+    );
+    assert!(
+        batched.iter().all(|r| r.values.len() == 1),
+        "an expanded blank row is as wide as the rows around it"
+    );
+}
+
 /// The declared `<dimension>` must not size the server's row buffer.
 ///
 /// `emit_incremental` pre-sizes each row from the declaration
@@ -1201,6 +1470,7 @@ async fn stream_range_resolved(
             pb::stream_worksheet_range_response::Event::Row(row) => {
                 rows.push(resolve_row(row, &table));
             }
+            pb::stream_worksheet_range_response::Event::RowGap(gap) => expand_gap(&mut rows, gap),
             pb::stream_worksheet_range_response::Event::Error(err) => {
                 panic!("unexpected in-band error: {:?}", err.error)
             }

@@ -104,13 +104,6 @@ const MAX_STRING_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// cell is read.
 const MAX_DECLARED_COLUMNS: usize = 16_384;
 
-/// Rows between client-liveness checks while skipping an empty gap.
-///
-/// A gap costs no allocation and sends nothing, so without this a crafted
-/// `r="4000000000"` would spin the parse thread for hours after the caller
-/// had already hung up.
-const GAP_CHECK_EVERY: u32 = 4096;
-
 /// Rough encoded size of one row, used only to decide when to close a batch.
 ///
 /// Deliberately not `prost::Message::encoded_len`, which walks the same tree
@@ -499,6 +492,18 @@ fn range_rows(rows: Vec<pb::WorksheetRow>) -> pb::StreamWorksheetRangeResponse {
     }
 }
 
+/// Wrap a run of empty rows into a range-stream response.
+fn range_row_gap(first_row_index: u32, row_count: u32) -> pb::StreamWorksheetRangeResponse {
+    pb::StreamWorksheetRangeResponse {
+        event: Some(pb::stream_worksheet_range_response::Event::RowGap(
+            pb::WorksheetRowGap {
+                first_row_index,
+                row_count,
+            },
+        )),
+    }
+}
+
 fn range_string_table(chunk: pb::StringTableChunk) -> pb::StreamWorksheetRangeResponse {
     pb::StreamWorksheetRangeResponse {
         event: Some(pb::stream_worksheet_range_response::Event::StringTable(
@@ -594,14 +599,22 @@ struct RowBatcher {
     /// requires.
     ///
     /// It deliberately does *not* mean "do not queue". The queue is also the
-    /// window inside which a late, out-of-order row can still be repaired
-    /// ([`RowBatcher::place`]), and how far that repair reaches must not
-    /// depend on which carrier the caller happened to ask for.
+    /// window inside which a late, out-of-order row is still repairable, and
+    /// how far that reaches must not depend on which carrier was asked for.
     single: bool,
-    /// True once any event has reached the channel. gRPC offers no way to take
-    /// a message back, so this is the line past which an out-of-order row can
-    /// no longer be repaired.
-    sent: bool,
+    /// Row index the next emitted row is expected at. A row arriving above it
+    /// means every row in between holds nothing, which is what `row_gap` says.
+    ///
+    /// `None` until the first row goes out, so blank rows before the first
+    /// populated one are trimmed rather than announced, and so are trailing
+    /// ones. Nothing is lost by trimming: `row_index` is absolute, so a
+    /// leading gap would say nothing the first row does not already say.
+    ///
+    /// [`RowBatcher::open_at`] is the one exception, and it exists because
+    /// `HeaderRow::Row(n)` makes `n` the sheet's real start.
+    next_expected: Option<u32>,
+    /// Highest row index already on the wire, or `None` before the first send.
+    highest_sent: Option<u32>,
     /// The stream's shared-string table in `use_string_table` mode. Shared
     /// with the cell conversion that interns into it; the batcher's job is
     /// to put pending entries on the wire before the rows that need them.
@@ -628,7 +641,8 @@ impl RowBatcher {
             linger: DEFAULT_LINGER,
             opened_at: None,
             single,
-            sent: false,
+            next_expected: None,
+            highest_sent: None,
             strings,
         }
     }
@@ -656,8 +670,34 @@ impl RowBatcher {
         }
     }
 
+    /// Declare that the sheet starts at `row`, so blank rows between there and
+    /// the first populated row are a gap rather than trimmed padding.
+    ///
+    /// Only `HeaderRow::Row(n)` calls this. With that selection calamine
+    /// inserts a synthetic empty cell at `n` before building the extent
+    /// (xlsx/mod.rs:2702-2713), so its range genuinely begins at `n` even when
+    /// `n` is blank: `Row(2)` over a sheet populated from row 5 reports
+    /// `start = (2, 0)`, height 5. Announcing that as a gap is what keeps a
+    /// densifying client in step with `worksheet_range`.
+    fn open_at(&mut self, row: u32) {
+        self.next_expected = Some(row);
+    }
+
+    /// Whether a row at this index can still be delivered in order.
+    ///
+    /// False once a row at or past it has already gone out, which is the point
+    /// where an out-of-order sheet stops being repairable, because gRPC offers
+    /// no way to retract a message.
+    fn accepts(&self, row_index: u32) -> bool {
+        self.highest_sent.is_none_or(|sent| row_index > sent)
+    }
+
     /// Queue one row, flushing on the row cap or the linger deadline.
     /// Returns false once the client has gone away.
+    ///
+    /// Rows may be queued out of order; [`RowBatcher::flush`] sorts. A row
+    /// index already queued merges into it rather than being duplicated, which
+    /// an unsorted sheet reaches by revisiting a row it has passed.
     fn push(
         &mut self,
         tx: &mpsc::Sender<Result<pb::StreamWorksheetRangeResponse, Status>>,
@@ -667,8 +707,26 @@ impl RowBatcher {
         if self.rows.is_empty() {
             self.opened_at = Some(std::time::Instant::now());
         }
-        self.pending_bytes += approx_row_bytes(&values);
-        self.rows.push(pb::WorksheetRow { row_index, values });
+        // Ascending is the overwhelmingly common case and has to stay O(1);
+        // only an unsorted sheet pays for the scan.
+        if self
+            .rows
+            .last()
+            .is_none_or(|last| row_index > last.row_index)
+        {
+            self.pending_bytes += approx_row_bytes(&values);
+            self.rows.push(pb::WorksheetRow { row_index, values });
+        } else {
+            match self.rows.iter_mut().find(|r| r.row_index == row_index) {
+                Some(existing) => merge_row_values(&mut existing.values, values),
+                None => self.rows.push(pb::WorksheetRow { row_index, values }),
+            }
+            self.pending_bytes = self
+                .rows
+                .iter()
+                .map(|row| approx_row_bytes(&row.values))
+                .sum();
+        }
 
         // Either bound closes a batch. Bytes are the one that matters on a
         // wide sheet, where the row cap alone would build a message the
@@ -690,59 +748,13 @@ impl RowBatcher {
         true
     }
 
-    /// Place a late-arriving cell into a row that is queued but not yet sent.
-    ///
-    /// Returns false when the row is out of reach, which is exactly the point
-    /// at which the stream can no longer be repaired.
-    fn place(&mut self, row_index: u32, col: usize, value: pb::CellData, width: usize) -> bool {
-        if self.sent || self.rows.is_empty() {
-            return false;
-        }
-        debug_assert!(
-            self.rows
-                .windows(2)
-                .all(|w| w[0].row_index < w[1].row_index),
-            "the queue must stay ascending for the search below to be sound"
-        );
-        let front = self.rows[0].row_index;
-        let at = match self.rows.binary_search_by_key(&row_index, |r| r.row_index) {
-            Ok(at) => at,
-            Err(at) => {
-                // The queue is contiguous by construction, because every
-                // interior gap row is pushed as it is passed. So an interior
-                // row always exists already; only a row below the front is
-                // genuinely new, and it brings its own gap fill with it.
-                if row_index >= front {
-                    return false;
-                }
-                for (n, index) in (row_index..front).enumerate() {
-                    self.rows.insert(
-                        at + n,
-                        pb::WorksheetRow {
-                            row_index: index,
-                            values: vec![convert::empty_cell_data(); width],
-                        },
-                    );
-                }
-                at
-            }
-        };
-        let values = &mut self.rows[at].values;
-        if col >= values.len() {
-            values.resize(col + 1, convert::empty_cell_data());
-        }
-        values[col] = value;
-        // Only an unsorted sheet ever gets here, so the byte budget is simply
-        // recomputed rather than tracked through every insert and widen.
-        self.pending_bytes = self
-            .rows
-            .iter()
-            .map(|row| approx_row_bytes(&row.values))
-            .sum();
-        true
-    }
-
     /// Send whatever has accumulated. Returns false once the client is gone.
+    ///
+    /// Rows are sorted here rather than on the way in, which is what lets an
+    /// unsorted sheet be repaired for free as long as it stays inside the
+    /// window. The queue is then split into contiguous runs: each run rides one
+    /// `rows` batch, and the space between two runs is announced as a single
+    /// `row_gap` instead of as the rows it covers.
     fn flush(
         &mut self,
         tx: &mpsc::Sender<Result<pb::StreamWorksheetRangeResponse, Status>>,
@@ -755,17 +767,68 @@ impl RowBatcher {
         if !self.send_new_strings(tx) {
             return false;
         }
-        // Past this line nothing in the queue can be repaired any more.
-        self.sent = true;
+
+        let mut queued = std::mem::take(&mut self.rows);
+        queued.sort_unstable_by_key(|row| row.row_index);
+
+        let mut run: Vec<pb::WorksheetRow> = Vec::new();
+        for row in queued {
+            let breaks_run = run
+                .last()
+                .is_some_and(|last| row.row_index != last.row_index + 1);
+            if breaks_run && !self.send_run(tx, std::mem::take(&mut run)) {
+                return false;
+            }
+            run.push(row);
+        }
+        self.send_run(tx, run)
+    }
+
+    /// Announce any empty rows before `run`, then send the run itself.
+    fn send_run(
+        &mut self,
+        tx: &mpsc::Sender<Result<pb::StreamWorksheetRangeResponse, Status>>,
+        run: Vec<pb::WorksheetRow>,
+    ) -> bool {
+        let (Some(first), Some(last)) = (run.first(), run.last()) else {
+            return true;
+        };
+        let (first, last) = (first.row_index, last.row_index);
+
+        if let Some(expected) = self.next_expected
+            && first > expected
+            && !send_event(tx, range_row_gap(expected, first - expected))
+        {
+            return false;
+        }
+        self.next_expected = Some(last + 1);
+        self.highest_sent = Some(last);
+
         if self.single {
-            for row in std::mem::take(&mut self.rows) {
+            for row in run {
                 if !send_event(tx, range_row(row.row_index, row.values)) {
                     return false;
                 }
             }
             return true;
         }
-        send_event(tx, range_rows(std::mem::take(&mut self.rows)))
+        send_event(tx, range_rows(run))
+    }
+}
+
+/// Fold a second set of values for the same row into the first.
+///
+/// Only an unsorted sheet reaches this, by writing cells for a row it had
+/// already passed. Later values win only where they carry something, so a
+/// merge never blanks a cell that was already populated.
+fn merge_row_values(into: &mut Vec<pb::CellData>, from: Vec<pb::CellData>) {
+    if from.len() > into.len() {
+        into.resize(from.len(), convert::empty_cell_data());
+    }
+    for (slot, value) in into.iter_mut().zip(from) {
+        if !matches!(value.value, Some(pb::cell_data::Value::Empty(())) | None) {
+            *slot = value;
+        }
     }
 }
 
@@ -825,12 +888,19 @@ fn emit_range(
 /// Stream cells from an incremental calamine cell reader (XLSX and XLSB),
 /// densifying the sparse cell stream into full rows as they arrive.
 ///
-/// The emitted grid matches what calamine's own `worksheet_range` reports in
-/// row extent and populated cells: it spans the first to the last row holding
-/// a non-empty cell, interior gaps are filled with empty rows, and leading or
-/// trailing rows of blanks are not emitted even when the reader yields cells
-/// for them. Rows are dense from column 0, so a value's index is its absolute
-/// column.
+/// The emitted grid covers the same cells calamine's own `worksheet_range`
+/// reports: it spans the first to the last row holding a non-empty cell, and
+/// leading or trailing rows of blanks are not emitted even when the reader
+/// yields cells for them. Rows are dense from column 0, so a value's index is
+/// its absolute column.
+///
+/// Rows holding nothing are not emitted at all. An interior run of them
+/// becomes one `row_gap`, so the walk never spends a step per empty row: two
+/// cells at opposite corners of the grid cost one gap rather than 1,048,576
+/// rows, and a crafted `r="4000000000"` costs one step rather than four
+/// billion. `row_index` stays absolute throughout, so a client that ignores
+/// the gap entirely still places every populated row correctly.
+///
 /// `next_cell` yields `Ok(None)` at end of sheet.
 ///
 /// `header_row` carries a `HeaderRow::Row(n)` selection, which this path has
@@ -869,11 +939,6 @@ fn emit_incremental<E: Display>(
     // anchoring at zero makes a value's index its absolute column and the
     // problem impossible.
     //
-    // The declared end column is also clamped before it becomes an allocation
-    // length: it is attacker-controlled and calamine does not bound it, so
-    // only `MAX_DECLARED_COLUMNS` of hint is honored. Rows still grow to fit
-    // any cell that actually arrives, so this costs at most a few reallocs on
-    // a genuinely wide sheet and nothing at all on an honest one.
     // The declaration is a capacity hint and nothing more. `width` is the
     // emitted extent and grows only from cells that actually arrive, so the
     // declaration can never reach the wire or the allocator: `A1:ZZZZZZ1` in a
@@ -883,53 +948,26 @@ fn emit_incremental<E: Display>(
     let mut width = 0usize;
     let mut values: Vec<pb::CellData> = Vec::with_capacity(prealloc);
 
-    // With `HeaderRow::Row(n)` the range begins AT the header row even when
-    // that row is blank, because calamine inserts a synthetic empty cell there
-    // (xlsx/mod.rs:2702-2713) before building the extent. Opening the walk at
-    // `n` with `started` already true reproduces that: rows between the header
-    // row and the first row holding a value are held as an interior gap
-    // instead of being trimmed as leading padding.
-    //
-    // `values`/`current_row` describe a real row.
-    // `started`: a non-empty row has already been emitted (or the header row
-    // stands in for one).
-    let (mut current_row, mut open, mut started) = match header_row {
-        Some(n) => (n, true, true),
-        None => (dims.start.0, false, false),
-    };
-    // The row under construction holds at least one non-empty cell.
-    let mut row_has_value = false;
-    // Completed all-empty rows held back, waiting to learn whether they are an
-    // interior gap or the sheet's trailing padding.
-    let mut pending_empty: u32 = 0;
-
-    // A row is only real to calamine if it holds a non-empty cell:
-    // `Range::from_sparse` builds the extent from non-empty cells alone, so
-    // leading and trailing rows of blanks are not part of the sheet even when
-    // the reader emits cells for them. A worksheet can carry thousands of such
-    // rows (styled but blank), so they are held back rather than streamed: an
-    // interior gap is released once a later non-empty row proves it was a gap,
-    // and trailing padding is simply dropped at end of sheet.
-    macro_rules! complete_row {
-        ($index:expr, $row:expr) => {{
-            let index: u32 = $index;
-            if row_has_value {
-                for back in (1..=pending_empty).rev() {
-                    if !batcher.push(tx, index - back, vec![convert::empty_cell_data(); width]) {
-                        return;
-                    }
-                }
-                pending_empty = 0;
-                started = true;
-                if !batcher.push(tx, index, $row) {
-                    return;
-                }
-            } else if started {
-                pending_empty += 1;
-            }
-            row_has_value = false;
-        }};
+    // With `HeaderRow::Row(n)` the sheet starts at `n` whatever `n` holds, so
+    // blank rows below it are an interior gap rather than leading padding to
+    // trim. Without a selection the first cell fixes the start and there is
+    // nothing above it to describe.
+    if let Some(n) = header_row {
+        batcher.open_at(n);
     }
+
+    // `values`/`current_row` describe a row under construction. `open` says
+    // whether that row is real yet, which it is not until the first cell fixes
+    // where the walk starts.
+    //
+    // A row under construction is only ever opened *by* a cell, so `open` also
+    // means "this row holds at least one value". Nothing else can create one:
+    // rows holding nothing are never built and never sent, and the space they
+    // occupy leaves as a single `row_gap` instead. A sheet whose two cells sit
+    // at opposite corners of the grid therefore costs one extra message rather
+    // than a million rows.
+    let mut current_row = dims.start.0;
+    let mut open = false;
 
     loop {
         let cell = match next_cell() {
@@ -962,70 +1000,45 @@ fn emit_incremental<E: Display>(
         // stream cannot sort, so it repairs as far back as it has not yet
         // committed, and fails loudly past that rather than dropping the cell.
         if open && row < current_row {
-            // Rows in [band_lo, current_row) are completed, known all-empty
-            // and still held back as `pending_empty`, so a late cell can
-            // simply reopen one. While `!started` nothing has been pushed at
-            // all, so the floor is 0.
-            let band_lo = if started {
-                current_row - pending_empty
-            } else {
-                0
-            };
-            if row >= band_lo {
-                if idx >= width {
-                    width = idx + 1;
-                    values.resize(width, convert::empty_cell_data());
-                }
-                let mut reopened = vec![convert::empty_cell_data(); width];
-                reopened[idx] = convert::cell_data(value);
-                // Held-back rows below the reopened one are now a proven
-                // interior gap. Written out rather than routed through
-                // `complete_row!`, whose trailing `row_has_value = false`
-                // would clobber the row still under construction at
-                // `current_row` and silently drop it.
-                let below = if started { row - band_lo } else { 0 };
-                for back in (1..=below).rev() {
-                    if !batcher.push(tx, row - back, vec![convert::empty_cell_data(); width]) {
-                        return;
-                    }
-                }
-                started = true;
-                if !batcher.push(tx, row, reopened) {
-                    return;
-                }
-                pending_empty = current_row - row - 1;
-                continue;
+            // The row under construction is already past this cell, so the
+            // cell belongs to a row the walk has left behind. That is
+            // repairable exactly while the row is still in the batcher's
+            // unsent queue, which the batcher alone knows; a late row is
+            // queued like any other, and `push` merges it into the queued row
+            // of the same index when there is one. `flush` sorts, so the
+            // repaired row still leaves in ascending order.
+            if !batcher.accepts(row) {
+                return abort_unsorted(tx, kind, sheet_name, row, col);
             }
-            // Older than the held-back band, but perhaps still inside the
-            // batcher's unsent queue.
-            if batcher.place(row, idx, convert::cell_data(value), width) {
-                continue;
+            // Padded to the running width like any other row, so a repaired
+            // sheet streams the same shape a sorted one would.
+            let mut late = vec![convert::empty_cell_data(); width.max(idx + 1)];
+            late[idx] = convert::cell_data(value);
+            if !batcher.push(tx, row, late) {
+                return;
             }
-            return abort_unsorted(tx, kind, sheet_name, row, col);
+            continue;
         }
 
         if open {
-            while current_row < row {
-                if row_has_value {
-                    let flushed =
-                        std::mem::replace(&mut values, vec![convert::empty_cell_data(); width]);
-                    complete_row!(current_row, flushed);
-                } else {
-                    // Nothing was written into this row, so `values` is
-                    // already all-empty and the macro will not read the row
-                    // argument. Reusing the buffer keeps a gap free of
-                    // allocation, which matters because `r=` is not bounded by
-                    // calamine: `r="4000000000"` makes this loop run four
-                    // billion times.
-                    complete_row!(current_row, Vec::new());
+            if row != current_row {
+                // Close the row under construction and jump straight to the
+                // new one. There is nothing to walk: the rows in between hold
+                // no values, and rows holding no values are never sent
+                // individually. A crafted `r="4000000000"` therefore costs one
+                // step rather than four billion.
+                if !batcher.accepts(current_row) {
+                    return abort_unsorted(tx, kind, sheet_name, current_row, 0);
                 }
-                current_row += 1;
-                // A gap sends nothing, so `push` never reports the client
-                // leaving. Check for it directly, or a caller that hung up
-                // long ago still costs a parse thread for hours.
-                if current_row.is_multiple_of(GAP_CHECK_EVERY) && tx.is_closed() {
+                // `width` is the running maximum and is deliberately not reset,
+                // so the next row starts padded to it. Row *content* is then
+                // byte-identical to what a per-row walk produced, and the only
+                // thing this path changed is that empty rows became a gap.
+                let fresh = vec![convert::empty_cell_data(); width];
+                if !batcher.push(tx, current_row, std::mem::replace(&mut values, fresh)) {
                     return;
                 }
+                current_row = row;
             }
         } else {
             // Cells arrive in row-major order, so the first one fixes the
@@ -1039,22 +1052,15 @@ fn emit_incremental<E: Display>(
             width = idx + 1;
             values.resize(width, convert::empty_cell_data());
         }
-        row_has_value = true;
         values[idx] = convert::cell_data(value);
     }
 
-    // Complete the final row. Written out rather than reusing the macro
-    // because none of its bookkeeping is read again. Anything still pending is
-    // trailing padding and is deliberately not emitted.
-    if open && row_has_value {
-        for back in (1..=pending_empty).rev() {
-            if !batcher.push(
-                tx,
-                current_row - back,
-                vec![convert::empty_cell_data(); width],
-            ) {
-                return;
-            }
+    // Complete the final row. Rows after it hold nothing: that is trailing
+    // padding, and no gap announces it, because a gap is only ever the space
+    // between two populated runs.
+    if open {
+        if !batcher.accepts(current_row) {
+            return abort_unsorted(tx, kind, sheet_name, current_row, 0);
         }
         if !batcher.push(tx, current_row, values) {
             return;

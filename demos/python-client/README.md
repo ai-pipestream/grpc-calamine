@@ -155,6 +155,11 @@ with grpc.insecure_channel("127.0.0.1:50051") as channel:
                         print_row(row)
                 case "row":
                     print_row(event.row)
+                # A run of rows holding nothing, however long. Ignoring this
+                # arm loses no data -- row_index is absolute -- but a dense
+                # grid needs it expanded into that many blank rows.
+                case "row_gap":
+                    print(f"... {event.row_gap.row_count} empty rows")
                 case "error":
                     print("in-band error:", event.error.error.message, file=sys.stderr)
     finally:
@@ -168,15 +173,23 @@ python main.py book.xlsx
 
 ### Things that bite
 
-- **`WhichOneof("event")` has five arms**, not three: `started`, `rows`,
-  `row`, `string_table`, `error`. Missing `rows` is the failure that looks
-  like success. Pass `max_rows_per_message=1` on the request if you want
-  only the single-row carrier.
+- **`WhichOneof("event")` has six arms**, not three: `started`, `rows`,
+  `row`, `row_gap`, `string_table`, `error`. Missing `rows` is the failure
+  that looks like success. Pass `max_rows_per_message=1` on the request if
+  you want only the single-row carrier.
+- **Empty rows arrive as `row_gap`, not as rows.** A run of them is one small
+  message however long it is, so `corners.xlsx` is two rows and a gap rather
+  than 1,048,576 rows. Expand it if you are building a dense grid; ignore it
+  otherwise.
+- **Regenerate the stubs after a proto change.** An unknown oneof arm makes
+  `WhichOneof` return `None` and your `match` fall through in silence, which
+  is exactly how a stale `gen/` hides a new event from you.
 - **Chunk the upload.** The server's frame limit is 32 MiB. Yielding a
   100 MB workbook in one `chunk=` fails; 1 MiB chunks are what the demos use.
 - **Rows are anchored at column A.** A value's index in `row.values` is its
-  absolute zero-based column, so no header arithmetic is needed. Empty cells
-  are explicit, never a gap.
+  absolute zero-based column, so no header arithmetic is needed. Empty
+  *cells* within a row are always explicit; only whole empty *rows* collapse
+  into a `row_gap`.
 - **In-band errors are usually not fatal.** Check `event.error.terminal`;
   a non-terminal one means the stream continues with the remaining items.
 - **Close the handle.** The server holds the workbook bytes in memory until

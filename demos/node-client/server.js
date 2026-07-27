@@ -92,6 +92,14 @@ function pipeStream(stream, res, mapRow) {
       case "rows":
         message.rows.rows.forEach(pushRow);
         break;
+      // A run of rows holding no values, forwarded as its own SSE event so the
+      // page can draw one elided line instead of a million blank ones. It is
+      // queued through `pending` like a row so it cannot overtake the rows
+      // around it, but it does not count toward the flush batch, because it is
+      // one small frame however many rows it stands for.
+      case "rowGap":
+        pending.push(frame("row-gap", message.rowGap));
+        break;
       case "error":
         pending.push(frame("calamine-error", message.error));
         flush();

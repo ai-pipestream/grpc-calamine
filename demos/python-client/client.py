@@ -121,6 +121,20 @@ def stream_rows(stub: rpc.CalamineServiceStub, workbook_id: str, sheet: str) -> 
             case "rows":
                 for row in event.rows.rows:
                     print_row(row)
+            # A run of rows holding nothing. Only rows with values arrive as
+            # rows, so a run of empties is one small message however long it
+            # is: corners.xlsx is 2 KB and its two cells are 1,048,574 rows
+            # apart. Expand it into blank rows for a dense grid, or ignore it
+            # entirely -- row_index is absolute, so nothing shifts either way.
+            case "row_gap":
+                gap = event.row_gap
+                first = gap.first_row_index + 1
+                what = (
+                    f"empty row {first:,}"
+                    if gap.row_count == 1
+                    else f"{gap.row_count:,} empty rows, {first:,}-{first + gap.row_count - 1:,}"
+                )
+                print(f"{'⋮':>6} │ ({what})")
             case "error":
                 detail = event.error.error
                 print(f"in-band error: {detail.message}", file=sys.stderr)

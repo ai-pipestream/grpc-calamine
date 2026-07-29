@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tonic::transport::Server;
 
-use grpc_calamine::{CalamineGrpc, WorkbookStore};
+use grpc_calamine::{CalamineGrpc, WorkbookStore, proto};
 
 /// Default listen address when `GRPC_CALAMINE_ADDR` is not set.
 const DEFAULT_ADDR: &str = "0.0.0.0:50051";
@@ -72,6 +72,12 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     }
     let service = grpc.into_service();
 
+    // Reflection lets tooling such as grpcurl discover the service without a
+    // local copy of the protos.
+    let reflection = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
+        .build_v1()?;
+
     // HTTP/2 flow control is directional: this governs what the server
     // *receives*, so it sizes the `OpenWorkbook` upload, not the row stream.
     // A client that wants a wide download window has to set its own; hyper
@@ -94,6 +100,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .initial_connection_window_size(window)
         .max_concurrent_streams(1024)
         .add_service(service)
+        .add_service(reflection)
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
     eprintln!("grpc-calamine shut down");

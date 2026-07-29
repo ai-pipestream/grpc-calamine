@@ -16,3 +16,10 @@ pub mod v1 {
     // pulling in the client and server modules.
     include!("gen/calamine/v1/calamine.v1.rs");
 }
+
+/// Serialized `FileDescriptorSet` for the `calamine.v1` package, served by
+/// the gRPC reflection service.
+///
+/// Produced by `buf build -o src/gen/calamine/v1/calamine.v1.binpb`; refresh
+/// it whenever the protos under `proto/` change, alongside `buf generate`.
+pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!("gen/calamine/v1/calamine.v1.binpb");

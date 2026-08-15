@@ -177,7 +177,7 @@ stream.on("data", (message) => {
       printRow(message.row);
       break;
     // A run of rows holding nothing, however long. Ignoring this case loses
-    // no data — rowIndex is absolute — but a dense grid needs it expanded.
+    // no data (rowIndex is absolute), but a dense grid needs it expanded.
     case "rowGap":
       console.log(`... ${message.rowGap.rowCount} empty rows`);
       break;

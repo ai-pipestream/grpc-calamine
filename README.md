@@ -77,7 +77,7 @@ everything with one command.
   which exactly two hold anything: it streams as two rows and one gap, in
   8 ms. Spelling those rows out instead is 17.2 billion cells, and it is
   what used to OOM-kill the Node demo. Expand the gap if you want a dense
-  grid, skip it if you are collecting cells, or ignore it entirely —
+  grid, skip it if you are collecting cells, or ignore it entirely;
   `row_index` is absolute, so nothing moves either way.
 - **Reads don't block each other.** Each read builds its own calamine reader
   over the shared bytes, so many clients can stream one workbook at once.
@@ -166,7 +166,7 @@ flowchart LR
     server -->|parses from memory| calamine[calamine]
     server -->|workbook_id, format, metadata| client
     client -->|StreamWorksheetRange with workbook_id| server
-    server -->|RangeStarted, row batches| client
+    server -->|RangeStarted, row batches, row_gap| client
     client -->|CloseWorkbook| server
 ```
 

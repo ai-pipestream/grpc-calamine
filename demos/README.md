@@ -68,7 +68,7 @@ single-row carrier and can afford one message per row.
 ## Empty rows do not arrive as rows
 
 Only rows holding at least one value arrive as a row. A run of empty ones
-arrives as a single `row_gap` — a first index and a count — however long the
+arrives as a single `row_gap`, a first index and a count, however long the
 run is.
 
 This exists because a sheet's populated cells can sit arbitrarily far apart.

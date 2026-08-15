@@ -45,10 +45,10 @@ seconds; later runs are instant. Delete `.venv/` and `gen/` to start over.
 
 Worth reading in `client.py`:
 
-- `upload_frames` — the client-streaming upload as a plain generator.
-- `format_excel_datetime` — serial-to-datetime conversion honoring the
+- `upload_frames`: the client-streaming upload as a plain generator.
+- `format_excel_datetime`: serial-to-datetime conversion honoring the
   per-workbook 1904 epoch flag carried by the contract.
-- `stream_vba` — VBA modules arrive as raw MBCS bytes (exactly what
+- `stream_vba`: VBA modules arrive as raw MBCS bytes (exactly what
   calamine's `get_module_raw` returns); decoding is the client's choice.
 
 ## Tutorial: talk to it from your own Python project

@@ -124,36 +124,59 @@ its start reports zero cells rather than underflowing. A panic anywhere in
 the parse is delivered as a gRPC `INTERNAL` status, never as a stream that
 ends successfully having sent nothing.
 
-**One known hole, upstream.** `StreamWorksheetFormula` has no incremental
-API in calamine, so it goes through `Range::from_sparse`, which densifies to
-`rows * cols` cells (`calamine/src/lib.rs:961`). Two formula cells at
-opposite corners of a sheet are ~17 billion `Data` values, or about 549 GB;
-the allocation failure is `handle_alloc_error`, which aborts the process
-rather than unwinding, so the panic supervisor above cannot catch it. The
-value stream is not affected — it never calls `from_sparse`. Do not expose
-`StreamWorksheetFormula` to untrusted uploads until calamine bounds that
-allocation.
+**Formulas are the one path that still densifies.**
+`StreamWorksheetFormula` has no incremental API in calamine, so it goes
+through `Range::from_sparse`, which builds `rows * cols` cells. Two formula
+cells at opposite corners of a sheet are ~17 billion `String`s, about
+412 GB. On stock crates.io calamine that allocation fails through
+`handle_alloc_error`, which aborts the process without unwinding, so the
+panic supervisor above cannot catch it and the server dies. This build links
+[the fork](#building-against-patched-calamine), where the same case is a
+catchable panic and the caller gets `INTERNAL` naming the extent:
+
+```
+parser panicked: calamine: cannot densify a 1048576 x 16384 range
+(17179869184 cells of 24 bytes). This extent is derived from the positions
+of the cells in the file, not from its declared dimension, so a sheet with
+very few cells can still reach it.
+```
+
+The value stream is not affected either way: it streams cells and never
+calls `from_sparse`. If you build against unpatched calamine, do not expose
+`StreamWorksheetFormula` to untrusted uploads.
 
 ## API
 
 Handle-based: upload once, then run any number of concurrent reads against
 the returned `workbook_id`.
 
-- `OpenWorkbook` — client-streaming upload: one options frame, then file
-  bytes. Returns `workbook_id`, the detected format, and full metadata.
-- `StreamWorksheetRange` — a `RangeStarted` header, then dense rows anchored
-  at column A, so a value's index is its absolute column. Rows arrive
-  batched (`WorksheetRowBatch`, up to 256 rows, 5 ms linger); set
-  `max_rows_per_message = 1` for one row per message. Set
-  `use_string_table = true` for dictionary encoding: `string_table` events
-  define each distinct string once, cells carry `shared_string_id`, and
-  every id is defined before the first row that references it. XLSX/XLSB
-  only; other formats accept the flag unchanged.
-- `StreamWorksheetFormula` — same shape, formula strings instead of values.
-- `StreamVbaProject` — project info, then one event per module (raw MBCS
-  bytes; decoding is the client's choice, matching calamine).
-- `GetPictures` — one event per embedded image.
-- `GetMetadata`, `GetDefinedNames`, `CloseWorkbook`.
+```mermaid
+flowchart LR
+    client[gRPC client] -->|OpenWorkbook: options frame, then file bytes| server[grpc-calamine]
+    server -->|parses from memory| calamine[calamine]
+    server -->|workbook_id, format, metadata| client
+    client -->|StreamWorksheetRange with workbook_id| server
+    server -->|RangeStarted, row batches| client
+    client -->|CloseWorkbook| server
+```
+
+`OpenWorkbook` is a client-streaming upload: one options frame, then file
+bytes. It returns `workbook_id`, the detected format, and full metadata.
+
+`StreamWorksheetRange` sends a `RangeStarted` header, then dense rows
+anchored at column A, so a value's index is its absolute column. Rows
+arrive batched (`WorksheetRowBatch`, up to 256 rows, 5 ms linger); set
+`max_rows_per_message = 1` for one row per message. Setting
+`use_string_table = true` switches to dictionary encoding: `string_table`
+events define each distinct string once, cells carry `shared_string_id`,
+and every id is defined before the first row that references it. The
+dictionary is XLSX/XLSB only; other formats accept the flag unchanged.
+
+`StreamWorksheetFormula` has the same shape with formula strings instead of
+values. `StreamVbaProject` sends project info, then one event per module
+(raw MBCS bytes; decoding is the client's choice, matching calamine).
+`GetPictures` sends one event per embedded image. `GetMetadata`,
+`GetDefinedNames`, and `CloseWorkbook` are the remaining unary calls.
 
 Terminal failures use gRPC status codes (`NOT_FOUND`, `INVALID_ARGUMENT`,
 `RESOURCE_EXHAUSTED`). Recoverable per-item failures arrive as in-band
@@ -191,14 +214,46 @@ client.close_workbook(CloseWorkbookRequest {
 ## Building from source
 
 Rust stable, the [buf](https://buf.build/docs/installation) CLI, and the
-codegen plugins (`cargo install protoc-gen-prost protoc-gen-tonic`). Stock
-calamine 0.36 from crates.io; no fork, no patches.
+codegen plugins (`cargo install protoc-gen-prost protoc-gen-tonic`).
 
 ```bash
 buf lint && buf generate   # after editing anything under proto/
 cargo build
 cargo test                 # unit + end-to-end streaming tests
 ```
+
+### Building against patched calamine
+
+The API used is calamine 0.36, but `Cargo.toml` carries a
+`[patch.crates-io]` pointing at [`ai-pipestream/calamine`][fork]
+`pipestream-main`, which is upstream `master` with three fix branches
+merged:
+
+| upstream defect | issue | fix |
+|---|---|---|
+| reversed `<dimension ref>` underflows the extent | [#692][i692] | [#695][p695] |
+| `from_sparse` densifies without a bound | [#693][i693] | [#697][p697] |
+| cell-ref column arithmetic overflows `u32` | [#694][i694] | [#696][p696] |
+
+`bench/` carries the same patch, because it is a separate crate and does not
+inherit one. Without it the harness would link crates.io calamine while the
+server links the fork, quietly falsifying its own claim to measure the same
+build. Both lock files pin the same commit.
+
+Nothing here depends on an API those fixes introduce, so remove both
+`[patch]` sections once the fixes are released. Until then, building against
+stock crates.io calamine still works and still passes the suite; you just
+lose the three guarantees above, of which the `from_sparse` bound is the one
+that can take the process down, as the formula note under [Run](#run)
+explains.
+
+[fork]: https://github.com/ai-pipestream/calamine
+[i692]: https://github.com/tafia/calamine/issues/692
+[i693]: https://github.com/tafia/calamine/issues/693
+[i694]: https://github.com/tafia/calamine/issues/694
+[p695]: https://github.com/tafia/calamine/pull/695
+[p696]: https://github.com/tafia/calamine/pull/696
+[p697]: https://github.com/tafia/calamine/pull/697
 
 ```
 proto/calamine/v1/     protobuf contract (source of truth)

@@ -95,8 +95,8 @@ others. It is reported as a floor, never as a peer.
   real network is what makes the expansion matter. Use `BENCH_ADDR` for that.
 - **No core pinning.** Results move a few percent between runs, more on CPUs
   with asymmetric cache domains.
-- **One workbook, one machine per run.** The shape of the file — above all
-  how much of it is shared strings — moves the results more than its size
+- **One workbook, one machine per run.** The shape of the file, above all
+  how much of it is shared strings, moves the results more than its size
   does.
 - **The digest costs real time**, and every arm pays it. It compresses the
   ratios slightly toward each other.
@@ -106,10 +106,10 @@ others. It is reported as a floor, never as a peer.
 | Variable | Default | Meaning |
 |---|---|---|
 | `WINDOW_BYTES` | 50 MiB | Client HTTP/2 stream and connection window. `0` keeps hyper's 1 MiB default, so the two can be compared. |
-| `BATCH` | `0` (server default) | `max_rows_per_message` for arm 3. `1` disables batching — one row per message — which is how the batching decision in the contract was measured. |
+| `BATCH` | `0` (server default) | `max_rows_per_message` for arm 3. `1` disables batching (one row per message), which is how the batching decision in the contract was measured. |
 | `BENCH_COMPRESSION` | `none` | `grpc-encoding` the client requests for the row stream: `none`, `gzip` or `zstd`. The upload stays uncompressed either way; a workbook is already deflated. |
 | `BENCH_DICT` | off | `1` opts arm 3 into the contract's `use_string_table` mode: shared strings arrive once in table chunks and as ids per cell, resolved by the client. The digest gate holds the resolved stream to the same canonical cells as every other arm. Composes with `BENCH_COMPRESSION`. |
-| `BENCH_ADDR` | unset | `host:port` of an already-running server. Arms 0–2 stay local, arm 3 crosses the real network. |
+| `BENCH_ADDR` | unset | `host:port` of an already-running server. Arms 0-2 stay local, arm 3 crosses the real network. |
 
 Compression and the dictionary attack the same expansion from different
 levels: generic compression captures string repetition without touching the
@@ -121,10 +121,10 @@ together before concluding anything.
 ### Over a real network
 
 Loopback is the weakest part of the default setup. `BENCH_ADDR=host:port`
-points arm 3 at a remote server while arms 0–2 stay local, so the comparison
+points arm 3 at a remote server while arms 0-2 stay local, so the comparison
 becomes "parse it here versus have that machine parse it". In remote mode the
-CPU column for arm 3 counts the client process only — the server's `/proc` is
-not readable from another machine — so do not compare it against local runs,
+CPU column for arm 3 counts the client process only (the server's `/proc` is
+not readable from another machine), so do not compare it against local runs,
 where that column is client plus server.
 
 To find where the wire overtakes the parse as the bottleneck, shape the
@@ -138,7 +138,7 @@ sudo tc qdisc del dev <nic> root
 ```
 
 Below the crossover, wall clock is simply bytes divided by bandwidth, which is
-what makes the wire expansion — and anything that reduces it — matter.
+what makes the wire expansion, and anything that reduces it, matter.
 
 ## The packed-buffer experiment
 
@@ -152,10 +152,10 @@ identical cell stream three ways and requires all three to decode back to a
 digest matching the in-memory grid, so no format can post a number by quietly
 dropping something.
 
-- **A. contract** — `WorksheetRowBatch` exactly as the server sends it.
-- **B. packed** — the same cells as flat little-endian arrays in one `bytes`
+- **A. contract**: `WorksheetRowBatch` exactly as the server sends it.
+- **B. packed**: the same cells as flat little-endian arrays in one `bytes`
   blob. No per-cell submessage, no per-cell length prefix.
-- **C. packed + dictionary** — B, except shared strings become `u32` indices
+- **C. packed + dictionary**: B, except shared strings become `u32` indices
   into a table sent once per stream. This is the deduplication XLSX itself
   performs and the wire format currently undoes.
 
@@ -167,7 +167,7 @@ by pointer identity and by content hashing, next to what would make it free:
 calamine already holds the resolved table in memory and exposes no accessor
 for it.
 
-B and C are hand-rolled buffers and stop being self-describing — protobuf can
+B and C are hand-rolled buffers and stop being self-describing: protobuf can
 no longer evolve them field by field, byte order becomes part of the
 specification, and every client needs a hand-written decoder. That price is
 the reason this is an experiment and not the contract.
@@ -179,15 +179,15 @@ over gRPC, pull it as JSON, or just parse the file myself?" These reproduce
 the comparison from the consumer's side, each feeding a digest compatible with
 the harness so cross-implementation agreement is checkable:
 
-- **Python** — `demos/python-client/pybench.py` runs openpyxl and
+- **Python**: `demos/python-client/pybench.py` runs openpyxl and
   python-calamine on a local file, grpc-calamine over the wire, and the same
   rows as NDJSON over HTTP. One hard-won caveat is written into it: the
   verification digest must be cheaper than the parsers under test, or it
   becomes the thing being measured.
-- **Rust NDJSON** — `cargo run --release --bin jsonclient` pulls the NDJSON
+- **Rust NDJSON**: `cargo run --release --bin jsonclient` pulls the NDJSON
   arm with a fast client, for when the interpreter is no longer the
   bottleneck and the format difference can show.
-- **Java** — `demos/java-client`'s `demo.Timing` measures client-side
+- **Java**: `demos/java-client`'s `demo.Timing` measures client-side
   dispatch configurations (blocking vs async stub, executor choice, batched
   vs row-per-message), which is where grpc-java clients win or lose the most.
 

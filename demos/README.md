@@ -28,7 +28,7 @@ cargo run --release
 ## Quick start
 
 ```bash
-# Node web viewer (the visual one) — then open http://127.0.0.1:8080
+# Node web viewer (the visual one), then open http://127.0.0.1:8080
 cd node-client && npm install && npm start
 
 # Node CLI
@@ -50,7 +50,7 @@ same rows for the same file; that agreement is the point.
 Rows arrive **batched**. The default `StreamWorksheetRange` carrier is
 `rows` (a `WorksheetRowBatch`, up to 256 rows), not `row`. A client that
 switches on the response `oneof` and handles only `row` connects, gets its
-`RangeStarted` header, prints nothing, and exits 0 — which looks like an
+`RangeStarted` header, prints nothing, and exits 0, which looks like an
 empty sheet rather than a bug. Handle both:
 
 ```
@@ -104,11 +104,11 @@ Other reads follow the same streaming shape: `StreamVbaProject`
 `GetPictures` (one `Picture` per embedded image).
 
 The one value worth understanding is `CellData`: a `oneof` mirroring
-calamine's `Data`/`DataRef` exactly — `int`, `float`, `string`,
+calamine's `Data`/`DataRef` exactly: `int`, `float`, `string`,
 `shared_string`, `bool`, `date_time` (an Excel serial + the workbook's
 1904 flag), `date_time_iso`, `duration_iso`, `error` (a typed enum), and an
 explicit `empty`. Each demo has a `renderCell` / `render_cell` function
-that turns one `CellData` into display text — that's the whole client-side
+that turns one `CellData` into display text. That is the whole client-side
 mapping you need.
 
 The contract itself is the source of truth: see
@@ -122,14 +122,14 @@ sheet**, never buffered whole. The small fixtures here finish in about a
 millisecond, so to actually watch it stream, feed it a big workbook.
 
 A good one is the ~100 MB sample (≈1M rows) from
-<https://examplefile.com/document/xlsx/100-mb-xlsx> — download it from that
+<https://examplefile.com/document/xlsx/100-mb-xlsx>. Download it from that
 page in your browser (the site gates direct `curl`), then:
 
-- **Web viewer** — drop the file onto the page and watch rows fill the grid
+- **Web viewer**: drop the file onto the page and watch rows fill the grid
   live while the progress bar advances. The bridge forwards each row the
   instant the Rust server parses it and never holds the whole file (see
   `openWorkbookStream` in `node-client/lib/calamine.js`).
-- **CLI** — `node cli.js path/to/100mb.xlsx | head` prints the first rows
+- **CLI**: `node cli.js path/to/100mb.xlsx | head` prints the first rows
   before the sheet has finished parsing.
 
 Nothing in the pipeline touches disk: the browser upload streams straight

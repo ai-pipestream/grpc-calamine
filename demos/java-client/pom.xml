@@ -16,8 +16,8 @@
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>17</maven.compiler.release>
-    <grpc.version>1.68.1</grpc.version>
-    <protobuf.version>4.28.3</protobuf.version>
+    <grpc.version>1.83.1</grpc.version>
+    <protobuf.version>4.35.1</protobuf.version>
   </properties>
 
   <dependencies>
@@ -84,7 +84,7 @@
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>exec-maven-plugin</artifactId>
-        <version>3.5.0</version>
+        <version>3.6.3</version>
         <configuration>
           <mainClass>demo.CalamineDemo</mainClass>
         </configuration>

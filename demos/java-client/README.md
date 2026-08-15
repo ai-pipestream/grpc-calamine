@@ -41,12 +41,12 @@ grpc-java codegen plugin, so it takes a minute; later runs are instant.
 
 Worth reading in `CalamineDemo.java`:
 
-- `openWorkbook` — the client-streaming upload with an async
+- `openWorkbook`: the client-streaming upload with an async
   `StreamObserver`, bridged to a `CompletableFuture` (the request stream
   and the single response are independent in gRPC Java).
-- `streamRows` — the server stream consumed as a plain blocking
+- `streamRows`: the server stream consumed as a plain blocking
   `Iterator`, switching on the response `oneof`.
-- `formatExcelDateTime` — serial-to-datetime conversion honoring the
+- `formatExcelDateTime`: serial-to-datetime conversion honoring the
   per-workbook 1904 epoch flag.
 
 ## Tutorial: talk to it from your own Java project

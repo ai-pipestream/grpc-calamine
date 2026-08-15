@@ -77,7 +77,7 @@ everything with one command.
   which exactly two hold anything: it streams as two rows and one gap, in
   8 ms. Spelling those rows out instead is 17.2 billion cells, and it is
   what used to OOM-kill the Node demo. Expand the gap if you want a dense
-  grid, skip it if you are collecting cells, or ignore it entirely —
+  grid, skip it if you are collecting cells, or ignore it entirely;
   `row_index` is absolute, so nothing moves either way.
 - **Reads don't block each other.** Each read builds its own calamine reader
   over the shared bytes, so many clients can stream one workbook at once.
@@ -150,7 +150,7 @@ of the cells in the file, not from its declared dimension, so a sheet with
 very few cells can still reach it.
 ```
 
-The value stream is not affected either way — it streams cells and never
+The value stream is not affected either way: it streams cells and never
 calls `from_sparse`, which is what makes a `row_gap` possible there and not
 here. If you build against unpatched calamine, do not expose
 `StreamWorksheetFormula` to untrusted uploads.
@@ -160,21 +160,33 @@ here. If you build against unpatched calamine, do not expose
 Handle-based: upload once, then run any number of concurrent reads against
 the returned `workbook_id`.
 
-- `OpenWorkbook` — client-streaming upload: one options frame, then file
-  bytes. Returns `workbook_id`, the detected format, and full metadata.
-- `StreamWorksheetRange` — a `RangeStarted` header, then dense rows anchored
-  at column A, so a value's index is its absolute column. Rows arrive
-  batched (`WorksheetRowBatch`, up to 256 rows, 5 ms linger); set
-  `max_rows_per_message = 1` for one row per message. Set
-  `use_string_table = true` for dictionary encoding: `string_table` events
-  define each distinct string once, cells carry `shared_string_id`, and
-  every id is defined before the first row that references it. XLSX/XLSB
-  only; other formats accept the flag unchanged.
-- `StreamWorksheetFormula` — same shape, formula strings instead of values.
-- `StreamVbaProject` — project info, then one event per module (raw MBCS
-  bytes; decoding is the client's choice, matching calamine).
-- `GetPictures` — one event per embedded image.
-- `GetMetadata`, `GetDefinedNames`, `CloseWorkbook`.
+```mermaid
+flowchart LR
+    client[gRPC client] -->|OpenWorkbook: options frame, then file bytes| server[grpc-calamine]
+    server -->|parses from memory| calamine[calamine]
+    server -->|workbook_id, format, metadata| client
+    client -->|StreamWorksheetRange with workbook_id| server
+    server -->|RangeStarted, row batches, row_gap| client
+    client -->|CloseWorkbook| server
+```
+
+`OpenWorkbook` is a client-streaming upload: one options frame, then file
+bytes. It returns `workbook_id`, the detected format, and full metadata.
+
+`StreamWorksheetRange` sends a `RangeStarted` header, then dense rows
+anchored at column A, so a value's index is its absolute column. Rows
+arrive batched (`WorksheetRowBatch`, up to 256 rows, 5 ms linger); set
+`max_rows_per_message = 1` for one row per message. Setting
+`use_string_table = true` switches to dictionary encoding: `string_table`
+events define each distinct string once, cells carry `shared_string_id`,
+and every id is defined before the first row that references it. The
+dictionary is XLSX/XLSB only; other formats accept the flag unchanged.
+
+`StreamWorksheetFormula` has the same shape with formula strings instead of
+values. `StreamVbaProject` sends project info, then one event per module
+(raw MBCS bytes; decoding is the client's choice, matching calamine).
+`GetPictures` sends one event per embedded image. `GetMetadata`,
+`GetDefinedNames`, and `CloseWorkbook` are the remaining unary calls.
 
 Terminal failures use gRPC status codes (`NOT_FOUND`, `INVALID_ARGUMENT`,
 `RESOURCE_EXHAUSTED`). Recoverable per-item failures arrive as in-band
@@ -240,7 +252,7 @@ build. Both lock files pin the same commit.
 
 Nothing here depends on an API those fixes introduce, so remove both
 `[patch]` sections once the fixes are released. Until then, building against
-stock crates.io calamine still works and still passes the suite — you just
+stock crates.io calamine still works and still passes the suite; you just
 lose the three guarantees above, of which the `from_sparse` bound is the one
 that can take the process down, as the formula note under [Run](#run)
 explains.

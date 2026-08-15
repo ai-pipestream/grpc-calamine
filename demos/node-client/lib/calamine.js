@@ -125,11 +125,19 @@ export class CalamineClient {
   /**
    * Server-streaming worksheet data. Returns the raw gRPC stream; each
    * message is a StreamWorksheetRangeResponse with `event` naming the set
-   * oneof field ("started" | "rows" | "row" | "stringTable" | "error").
+   * oneof field ("started" | "rows" | "row" | "rowGap" | "stringTable" |
+   * "error").
    *
    * Rows arrive in `rows` batches by default. Pass
    * `{ maxRowsPerMessage: 1 }` for one row per message, or
    * `{ useStringTable: true }` for dictionary-encoded shared strings.
+   *
+   * Only rows holding at least one value arrive as rows. A run of rows holding
+   * nothing arrives as a single `rowGap` instead, however long the run is, so
+   * a 2 KB file whose two cells sit at opposite corners of the grid does not
+   * cost you a million objects. Expand it into blank rows if you are building
+   * a dense grid, skip it if you are collecting cells, and ignore it entirely
+   * if you only care about values: `rowIndex` is absolute, so nothing moves.
    *
    * @param {string} workbookId handle from openWorkbook.
    * @param {object} sheet SheetSelector ({ sheetIndex } or { sheetName }).

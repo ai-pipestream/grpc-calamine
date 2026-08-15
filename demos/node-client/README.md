@@ -22,7 +22,7 @@ PORT=8081 CALAMINE_ADDR=127.0.0.1:50055 npm start    # both are overridable
 
 Drop any workbook onto the page (or click to choose one). The bridge
 (`server.js`, dependency-free Node `http`) streams the upload straight into
-the gRPC call — the file is never buffered whole in the bridge — then
+the gRPC call (the file is never buffered whole in the bridge), then
 forwards every response event to the browser as Server-Sent Events. The
 table fills in row by row exactly as the Rust server parses the sheet, with
 a live progress bar fed by the `RangeStarted` header's `total_cells`.
@@ -31,7 +31,7 @@ What each contract feature looks like in the UI:
 
 - **Sheet tabs** come from the workbook metadata; hidden and very-hidden
   sheets are labeled.
-- **Cell types** are colored — numbers, dates (rendered from the Excel
+- **Cell types** are colored: numbers, dates (rendered from the Excel
   serial + the workbook's 1904 flag), booleans, and `#DIV/0!`-style errors.
 - **"Show formulas"** re-streams the same sheet through
   `StreamWorksheetFormula`. A sheet with no formulas shows an explicit
@@ -40,7 +40,7 @@ What each contract feature looks like in the UI:
   stream.
 
 To actually see it stream (rather than finish instantly), use a large
-workbook — see [../README.md](../README.md#see-the-streaming-not-just-the-result).
+workbook; see [../README.md](../README.md#see-the-streaming-not-just-the-result).
 
 The SSE bridge batches rows into frames of 32 before writing to the browser
 and respects `res.write` backpressure; both matter a great deal on a
@@ -84,7 +84,7 @@ npm install @grpc/grpc-js @grpc/proto-loader
 cp -r path/to/grpc-calamine/proto ./proto
 ```
 
-The loader options are not cosmetic — they decide what your code looks like:
+The loader options are not cosmetic; they decide what your code looks like:
 
 ```js
 import grpc from "@grpc/grpc-js";
@@ -162,6 +162,11 @@ stream.on("data", (message) => {
     case "row":
       printRow(message.row);
       break;
+    // A run of rows holding nothing, however long. Ignoring this case loses
+    // no data (rowIndex is absolute), but a dense grid needs it expanded.
+    case "rowGap":
+      console.log(`... ${message.rowGap.rowCount} empty rows`);
+      break;
     case "error":
       console.error("in-band error:", message.error.error.message);
       break;
@@ -198,10 +203,14 @@ node main.js book.xlsx
 
 ### Things that bite
 
-- **`message.event` has five values**, not three: `started`, `rows`, `row`,
-  `stringTable`, `error`. Missing `rows` is the failure that looks like
-  success. Pass `maxRowsPerMessage: 1` on the request if you want only the
-  single-row carrier.
+- **`message.event` has six values**, not three: `started`, `rows`, `row`,
+  `rowGap`, `stringTable`, `error`. Missing `rows` is the failure that looks
+  like success. Pass `maxRowsPerMessage: 1` on the request if you want only
+  the single-row carrier.
+- **Empty rows arrive as `rowGap`, not as rows.** A run of them is one small
+  message however long it is, so `corners.xlsx` is two rows and a gap rather
+  than 1,048,576 rows. Expand it if you are building a dense grid; ignore it
+  otherwise.
 - **Raise `grpc.max_receive_message_length`.** The default is 4 MB and a
   256-row batch of a wide sheet can exceed it. The server's own frame limit
   is 32 MiB, so match it.
@@ -209,8 +218,8 @@ node main.js book.xlsx
   Without it, a 100 MB workbook is buffered in the Node process, which is
   exactly what streaming was supposed to avoid.
 - **Rows are anchored at column A.** `row.values[i]` is column `i`, absolute
-  and zero-based, so no header arithmetic is needed. Empty cells are
-  explicit, never a gap.
+  and zero-based, so no header arithmetic is needed. Empty *cells* within a
+  row are always explicit; only whole empty *rows* collapse into a `rowGap`.
 - **In-band errors are usually not fatal.** Check `message.error.terminal`;
   a non-terminal one means the stream continues with the remaining items.
 - **Close the handle.** The server holds the workbook bytes in memory until

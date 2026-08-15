@@ -91,6 +91,7 @@
   td.formula { color: var(--formula); font-family: ui-monospace, monospace; font-size: 12px; }
   td.empty { color: var(--muted); }
   tbody tr.fresh { animation: fresh .6s ease-out; }
+  tbody tr.gap td { color: var(--muted); font-style: italic; text-align: center; }
   @keyframes fresh { from { background: var(--accent-soft); } to { background: transparent; } }
 
   #error-banner {
@@ -259,6 +260,22 @@ function selectSheet(index) {
     if (totalCells > 0) $("progress").style.width = `${(100 * seenCells / totalCells).toFixed(1)}%`;
     const ms = performance.now() - startedAt;
     $("stats").textContent = `${seenCells} / ${totalCells} cells · ${rows} rows · ${ms.toFixed(0)} ms`;
+  });
+
+  // A run of rows holding nothing. Drawing them would mean a million empty
+  // <tr>s for a 2 KB file, which is what the server sends this instead of.
+  // One elided line says the same thing, and because `rowIndex` is absolute
+  // the rows after it still carry their own numbers.
+  source.addEventListener("row-gap", (e) => {
+    const gap = JSON.parse(e.data);
+    const n = Number(gap.rowCount);
+    const first = Number(gap.firstRowIndex);
+    const tr = document.createElement("tr");
+    tr.className = "gap";
+    tr.innerHTML = `<td class="rowno">⋮</td>` +
+      `<td colspan="${Math.max(width, 1)}">${n.toLocaleString()} empty rows ` +
+      `(${(first + 1).toLocaleString()}–${(first + n).toLocaleString()})</td>`;
+    $("grid-body").appendChild(tr);
   });
 
   source.addEventListener("calamine-error", (e) => {

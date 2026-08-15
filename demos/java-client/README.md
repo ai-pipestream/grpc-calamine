@@ -41,12 +41,12 @@ grpc-java codegen plugin, so it takes a minute; later runs are instant.
 
 Worth reading in `CalamineDemo.java`:
 
-- `openWorkbook` — the client-streaming upload with an async
+- `openWorkbook`: the client-streaming upload with an async
   `StreamObserver`, bridged to a `CompletableFuture` (the request stream
   and the single response are independent in gRPC Java).
-- `streamRows` — the server stream consumed as a plain blocking
+- `streamRows`: the server stream consumed as a plain blocking
   `Iterator`, switching on the response `oneof`.
-- `formatExcelDateTime` — serial-to-datetime conversion honoring the
+- `formatExcelDateTime`: serial-to-datetime conversion honoring the
   per-workbook 1904 epoch flag.
 
 ## Tutorial: talk to it from your own Java project
@@ -169,6 +169,10 @@ public final class Main {
                 // print nothing at all, and exit successfully.
                 case ROWS -> event.getRows().getRowsList().forEach(Main::print);
                 case ROW  -> print(event.getRow());
+                // A run of rows holding nothing, however long. Ignoring this
+                // arm loses no data (getRowIndex() is absolute), but a dense
+                // grid needs it expanded into that many blank rows.
+                case ROW_GAP -> System.out.println("... " + event.getRowGap().getRowCount() + " empty rows");
                 case ERROR -> System.err.println(event.getError().getError().getMessage());
                 default -> { }
             }
@@ -215,12 +219,19 @@ wins. Either drop it from the POM or run the class directly with `java -cp`.
 
 - **Chunk the upload.** The server's frame limit is 32 MiB. A single
   `setChunk` of a 100 MB workbook fails; 1 MiB chunks are what the demos use.
-- **`getEventCase()` has five arms**, not three: `STARTED`, `ROWS`, `ROW`,
-  `STRING_TABLE`, `ERROR`. Missing `ROWS` is the failure that looks like
-  success.
+- **`getEventCase()` has six arms**, not three: `STARTED`, `ROWS`, `ROW`,
+  `ROW_GAP`, `STRING_TABLE`, `ERROR`. Missing `ROWS` is the failure that
+  looks like success.
+- **Empty rows arrive as `ROW_GAP`, not as rows.** A run of them is one small
+  message however long it is, so `corners.xlsx` is two rows and a gap rather
+  than 1,048,576 rows. Expand it if you are building a dense grid; ignore it
+  otherwise. Note `getRowCount()` and `getFirstRowIndex()` are proto
+  `uint32`, which Java surfaces as a signed `int`: past 2^31 they read
+  negative, so run them through `Integer.toUnsignedLong` before arithmetic.
 - **Rows are anchored at column A.** A value's index in `getValuesList()`
   is its absolute zero-based column, so no header arithmetic is needed.
-  Empty cells are explicit, never a gap.
+  Empty *cells* within a row are always explicit; only whole empty *rows*
+  collapse into a `ROW_GAP`.
 - **`ERROR` events are usually not fatal.** Check
   `event.getError().getTerminal()`; a non-terminal one means the stream
   continues with the remaining items.

@@ -787,14 +787,21 @@ pub struct RangeStarted {
     pub total_cells: u64,
 }
 /// WorksheetRow is one streamed row of cell values.
+///
+/// Only rows holding at least one value arrive as a `WorksheetRow`. A run of
+/// rows that hold nothing arrives as a single `WorksheetRowGap` instead, so the
+/// row events a caller sees are never padding.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WorksheetRow {
-    /// Absolute zero-based row index within the worksheet.
+    /// Absolute zero-based row index within the worksheet. Rows arrive in
+    /// strictly ascending order, and their indices need not be contiguous: any
+    /// jump is covered by a preceding `WorksheetRowGap`.
     #[prost(uint32, tag="1")]
     pub row_index: u32,
     /// Dense values for this row, in column order anchored at column A: a
     /// value's index is its absolute zero-based column. Cells without content
-    /// appear as `CellData.empty`, and trailing empty cells may be omitted.
+    /// within the row appear as `CellData.empty`, and trailing empty cells may
+    /// be omitted.
     #[prost(message, repeated, tag="2")]
     pub values: ::prost::alloc::vec::Vec<CellData>,
 }
@@ -811,6 +818,40 @@ pub struct WorksheetRowBatch {
     /// carry on its own. Never empty.
     #[prost(message, repeated, tag="1")]
     pub rows: ::prost::alloc::vec::Vec<WorksheetRow>,
+}
+/// WorksheetRowGap stands in for a run of consecutive rows that hold no values.
+///
+/// A worksheet's populated cells can sit arbitrarily far apart, and spelling
+/// out the rows between them costs a message and a client-side object each: two
+/// cells at opposite corners of the grid describe 1,048,576 rows of which
+/// exactly two hold anything. A gap says the same thing in constant space,
+/// however long the run is.
+///
+/// A client building a dense grid expands it into blank rows; a client
+/// collecting populated cells skips it. No value can be lost, because a gap
+/// covers none by definition, and a client that ignores the event entirely
+/// still receives every populated row at its correct absolute index.
+///
+/// A gap normally describes the space *between* two populated rows: blank rows
+/// before the first populated one and after the last are trimmed rather than
+/// announced, matching what the range itself reports, so a gap is never the
+/// last row event of a stream.
+///
+/// The one case where a gap leads is a `HeaderRow.row_index` selection whose
+/// header row is blank. That selection makes the chosen row the start of the
+/// sheet whatever it holds, so the blank rows below it are interior, not
+/// leading, and the gap is what says so.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WorksheetRowGap {
+    /// Absolute zero-based index of the first empty row in the run.
+    #[prost(uint32, tag="1")]
+    pub first_row_index: u32,
+    /// How many consecutive empty rows the run covers. Never zero.
+    ///
+    /// `first_row_index + row_count` is the index of the next row that arrives,
+    /// so a client can expand or skip the run without tracking anything else.
+    #[prost(uint32, tag="2")]
+    pub row_count: u32,
 }
 /// StringTableChunk defines a run of shared-string table entries for a
 /// stream in `use_string_table` mode.
@@ -848,7 +889,7 @@ pub struct StreamError {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StreamWorksheetRangeResponse {
     /// Exactly one event kind is set per message.
-    #[prost(oneof="stream_worksheet_range_response::Event", tags="1, 2, 3, 4, 5")]
+    #[prost(oneof="stream_worksheet_range_response::Event", tags="1, 2, 3, 4, 5, 6")]
     pub event: ::core::option::Option<stream_worksheet_range_response::Event>,
 }
 /// Nested message and enum types in `StreamWorksheetRangeResponse`.
@@ -876,6 +917,12 @@ pub mod stream_worksheet_range_response {
         /// any id it defines.
         #[prost(message, tag="5")]
         StringTable(super::StringTableChunk),
+        /// A run of consecutive rows holding no values, in place of sending each
+        /// one. Not opt-in, because the run it replaces can be millions of rows
+        /// long and the caller who most needs that collapsed is the one who would
+        /// not have known to ask.
+        #[prost(message, tag="6")]
+        RowGap(super::WorksheetRowGap),
     }
 }
 /// StreamWorksheetFormulaRequest selects the workbook and worksheet whose

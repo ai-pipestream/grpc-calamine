@@ -66,7 +66,7 @@ public final class CalamineDemo {
         }
         Path file = Path.of(args[0]);
         String sheetArg = args.length > 1 ? args[1] : "0";
-        String addr = System.getenv().getOrDefault("CALAMINE_ADDR", "127.0.0.1:50051");
+        String addr = System.getenv().getOrDefault("CALAMINE_ADDR", "127.0.0.1:50062");
 
         ManagedChannel channel =
                 Grpc.newChannelBuilder(addr, InsecureChannelCredentials.create()).build();

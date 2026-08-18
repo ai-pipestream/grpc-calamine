@@ -3,7 +3,7 @@
 //! Binary entry point for the calamine gRPC server.
 //!
 //! Runtime sizing (all optional environment overrides):
-//! - `GRPC_CALAMINE_ADDR` — listen address (default `0.0.0.0:50051`).
+//! - `GRPC_CALAMINE_ADDR` — listen address (default `0.0.0.0:50062`).
 //! - `GRPC_CALAMINE_WORKERS` — tokio worker threads (default: CPU count).
 //! - `GRPC_CALAMINE_BLOCKING_THREADS` — cap of the blocking pool that runs
 //!   calamine parsing (default: 512, tokio's own default).
@@ -20,7 +20,7 @@ use tonic::transport::Server;
 use grpc_calamine::{CalamineGrpc, WorkbookStore, proto};
 
 /// Default listen address when `GRPC_CALAMINE_ADDR` is not set.
-const DEFAULT_ADDR: &str = "0.0.0.0:50051";
+const DEFAULT_ADDR: &str = "0.0.0.0:50062";
 
 /// Default HTTP/2 initial window, for both the stream and the connection.
 ///

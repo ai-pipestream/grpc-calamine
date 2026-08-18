@@ -10,7 +10,7 @@
 //
 //   node server.js            # http://127.0.0.1:8080
 //
-// Environment: CALAMINE_ADDR (default 127.0.0.1:50051), PORT (default 8080).
+// Environment: CALAMINE_ADDR (default 127.0.0.1:50062), PORT (default 8080).
 
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
@@ -19,7 +19,7 @@ import path from "node:path";
 import { CalamineClient, renderCell } from "./lib/calamine.js";
 
 const PORT = Number(process.env.PORT ?? 8080);
-const client = new CalamineClient(process.env.CALAMINE_ADDR ?? "127.0.0.1:50051");
+const client = new CalamineClient(process.env.CALAMINE_ADDR ?? "127.0.0.1:50062");
 const publicDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "public");
 
 function sendJson(res, status, body) {
@@ -180,5 +180,5 @@ server.on("error", (err) => {
 
 server.listen(PORT, () => {
   console.log(`calamine web demo on http://127.0.0.1:${PORT}`);
-  console.log(`forwarding to grpc-calamine at ${process.env.CALAMINE_ADDR ?? "127.0.0.1:50051"}`);
+  console.log(`forwarding to grpc-calamine at ${process.env.CALAMINE_ADDR ?? "127.0.0.1:50062"}`);
 });

@@ -9,7 +9,7 @@ them.
 Needs Node 20+. Start the server first, from the repository root:
 
 ```bash
-cargo run --release          # listening on 0.0.0.0:50051
+cargo run --release          # listening on 0.0.0.0:50062
 ```
 
 ## Web viewer
@@ -116,7 +116,7 @@ the returned `workbookId`.
 import { createReadStream } from "node:fs";
 
 const client = new calamine.v1.CalamineService(
-  "127.0.0.1:50051",
+  "127.0.0.1:50062",
   grpc.credentials.createInsecure(),
   { "grpc.max_receive_message_length": 32 * 1024 * 1024 },
 );

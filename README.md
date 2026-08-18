@@ -82,7 +82,7 @@ everything with one command.
 
 ```bash
 cargo run --release
-# grpc-calamine listening on 0.0.0.0:50051
+# grpc-calamine listening on 0.0.0.0:50062
 ```
 
 Use `--release`; a debug build parses more than an order of magnitude
@@ -90,7 +90,7 @@ slower.
 
 | Variable                         | Default        | Meaning                                     |
 |----------------------------------|----------------|---------------------------------------------|
-| `GRPC_CALAMINE_ADDR`             | `0.0.0.0:50051`| Listen address                              |
+| `GRPC_CALAMINE_ADDR`             | `0.0.0.0:50062`| Listen address                              |
 | `GRPC_CALAMINE_WORKERS`          | CPU count      | tokio worker threads                        |
 | `GRPC_CALAMINE_BLOCKING_THREADS` | `512`          | max threads for calamine parsing tasks      |
 | `GRPC_CALAMINE_WINDOW_BYTES`     | `52428800`     | HTTP/2 initial stream and connection window |

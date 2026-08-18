@@ -16,7 +16,7 @@ Start the server first, from the repository root:
 
 ```bash
 cargo run --release
-# grpc-calamine listening on 0.0.0.0:50051
+# grpc-calamine listening on 0.0.0.0:50062
 ```
 
 | Demo | Stack | What it shows |
@@ -42,7 +42,7 @@ cd java-client && mvn -q compile exec:java -Dexec.args="../sample-data/date.xlsx
 ```
 
 All demos accept a sheet name or zero-based index as the second argument
-and honor `CALAMINE_ADDR` (default `127.0.0.1:50051`). All three print the
+and honor `CALAMINE_ADDR` (default `127.0.0.1:50062`). All three print the
 same rows for the same file; that agreement is the point.
 
 ## The one thing every client gets wrong first

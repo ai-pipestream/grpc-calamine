@@ -134,7 +134,9 @@ message CloseWorkbookResponse {
 
 // GetMetadataRequest selects the workbook whose metadata is requested.
 message GetMetadataRequest {
-  // Handle returned by `OpenWorkbook`.
+  // Handle returned by `OpenWorkbook`. Leave empty for the service-level
+  // probe: the response then carries only the UiInfo block, so hosts can
+  // discover the web UI without opening a workbook.
   string workbook_id = 1;
 }
 

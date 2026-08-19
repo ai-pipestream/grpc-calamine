@@ -347,6 +347,20 @@ async fn open_workbook_reports_format_and_metadata() {
 }
 
 #[tokio::test]
+async fn empty_workbook_id_is_the_service_probe() {
+    let mut client = start_server().await;
+    let probe = client
+        .get_metadata(pb::GetMetadataRequest::default())
+        .await
+        .expect("service probe")
+        .into_inner();
+    assert!(probe.metadata.is_none());
+    let ui = probe.ui.expect("ui info on the probe response");
+    assert_eq!(ui.title, "Calamine");
+    assert_eq!(ui.path, "/ui/calamine");
+}
+
+#[tokio::test]
 async fn unknown_workbook_id_is_not_found() {
     let mut client = start_server().await;
     let err = client

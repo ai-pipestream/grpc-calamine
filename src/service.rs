@@ -1439,7 +1439,17 @@ impl CalamineService for CalamineGrpc {
         &self,
         request: Request<pb::GetMetadataRequest>,
     ) -> Result<Response<pb::GetMetadataResponse>, Status> {
-        let entry = get_entry(&self.store, &request.into_inner().workbook_id)?;
+        let workbook_id = request.into_inner().workbook_id;
+        // An empty workbook_id is the service-level probe: answer with the
+        // UiInfo block alone so hosts can discover the web UI without
+        // opening a workbook first.
+        if workbook_id.is_empty() {
+            return Ok(Response::new(pb::GetMetadataResponse {
+                ui: Some(ui_info()),
+                ..Default::default()
+            }));
+        }
+        let entry = get_entry(&self.store, &workbook_id)?;
         Ok(Response::new(pb::GetMetadataResponse {
             detected_format: entry.format as i32,
             metadata: Some(entry.metadata.clone()),

@@ -140,6 +140,10 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 
+// Injected by the bridge when it serves under a UI_BASE prefix (see
+// server.js); empty when the page is at the root. Prefixes every /api call.
+const UI_BASE = window.__UI_BASE__ ?? "";
+
 const state = { workbookId: null, sheets: [], activeSheet: 0, source: null, startCol: 0 };
 
 function columnLabel(index) {
@@ -181,10 +185,10 @@ async function upload(file) {
   if (!file) return;
   showError("");
   if (state.workbookId) {
-    fetch(`/api/workbooks/${state.workbookId}`, { method: "DELETE" });
+    fetch(`${UI_BASE}/api/workbooks/${state.workbookId}`, { method: "DELETE" });
     state.workbookId = null;
   }
-  const response = await fetch("/api/workbooks", { method: "POST", body: file });
+  const response = await fetch(`${UI_BASE}/api/workbooks`, { method: "POST", body: file });
   const opened = await response.json();
   if (!response.ok) return showError(`open failed: ${opened.error}`);
 
@@ -227,7 +231,7 @@ function selectSheet(index) {
 
   const formulas = $("formulas").checked;
   const kind = formulas ? "formulas" : "rows";
-  const source = new EventSource(`/api/workbooks/${state.workbookId}/sheets/${index}/${kind}`);
+  const source = new EventSource(`${UI_BASE}/api/workbooks/${state.workbookId}/sheets/${index}/${kind}`);
   state.source = source;
 
   let totalCells = 0, seenCells = 0, rows = 0, width = 0;
@@ -286,7 +290,7 @@ window.addEventListener("pagehide", () => {
   // Best-effort handle release on navigation/close. sendBeacon can only POST,
   // so a keepalive DELETE is the right tool for our REST-style endpoint.
   if (state.workbookId) {
-    fetch(`/api/workbooks/${state.workbookId}`, { method: "DELETE", keepalive: true });
+    fetch(`${UI_BASE}/api/workbooks/${state.workbookId}`, { method: "DELETE", keepalive: true });
   }
 });
 </script>

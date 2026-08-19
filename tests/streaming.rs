@@ -318,6 +318,15 @@ async fn open_workbook_reports_format_and_metadata() {
         .into_inner();
     assert_eq!(again.metadata, opened.metadata);
 
+    // The response carries the shared-shell frontend advertisement.
+    let ui = again.ui.expect("ui info");
+    assert_eq!(ui.title, "Calamine");
+    assert_eq!(ui.path, "/ui/calamine");
+    assert_eq!(
+        ui.description,
+        "Spreadsheet parsing via calamine (xls, xlsx, xlsb, ods)"
+    );
+
     // Close is idempotent-safe: first close true, second false.
     let closed = client
         .close_workbook(pb::CloseWorkbookRequest {

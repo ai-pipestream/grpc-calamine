@@ -177,6 +177,8 @@ values. `StreamVbaProject` sends project info, then one event per module
 (raw MBCS bytes; decoding is the client's choice, matching calamine).
 `GetPictures` sends one event per embedded image. `GetMetadata`,
 `GetDefinedNames`, and `CloseWorkbook` are the remaining unary calls.
+`GetMetadata` also returns the `UiInfo` frontend advertisement shared by
+every ai-pipestream service; the demo shell reads it to build its tab bar.
 
 Terminal failures use gRPC status codes (`NOT_FOUND`, `INVALID_ARGUMENT`,
 `RESOURCE_EXHAUSTED`). Recoverable per-item failures arrive as in-band

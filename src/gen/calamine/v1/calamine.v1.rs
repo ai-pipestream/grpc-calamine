@@ -696,6 +696,24 @@ pub struct GetMetadataResponse {
     /// Workbook metadata: sheets (in workbook order) and defined names.
     #[prost(message, optional, tag="2")]
     pub metadata: ::core::option::Option<Metadata>,
+    /// Frontend advertisement, same on every response.
+    #[prost(message, optional, tag="3")]
+    pub ui: ::core::option::Option<UiInfo>,
+}
+/// UiInfo is the frontend advertisement block. It has the same shape in
+/// every ai-pipestream gRPC service: the demo shell reads it to build its
+/// tab bar.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UiInfo {
+    /// Tab title, e.g. "Calamine".
+    #[prost(string, tag="1")]
+    pub title: ::prost::alloc::string::String,
+    /// Shell mount path, e.g. "/ui/calamine".
+    #[prost(string, tag="2")]
+    pub path: ::prost::alloc::string::String,
+    /// One-line description, used as the tab tooltip.
+    #[prost(string, tag="3")]
+    pub description: ::prost::alloc::string::String,
 }
 /// SheetSelector picks a worksheet either by name or by position, mirroring
 /// the pair `Reader::worksheet_range(name)` / `Reader::worksheet_range_at(n)`.

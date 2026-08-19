@@ -145,6 +145,23 @@ message GetMetadataResponse {
 
   // Workbook metadata: sheets (in workbook order) and defined names.
   Metadata metadata = 2;
+
+  // Frontend advertisement, same on every response.
+  UiInfo ui = 3;
+}
+
+// UiInfo is the frontend advertisement block. It has the same shape in
+// every ai-pipestream gRPC service: the demo shell reads it to build its
+// tab bar.
+message UiInfo {
+  // Tab title, e.g. "Calamine".
+  string title = 1;
+
+  // Shell mount path, e.g. "/ui/calamine".
+  string path = 2;
+
+  // One-line description, used as the tab tooltip.
+  string description = 3;
 }
 
 // SheetSelector picks a worksheet either by name or by position, mirroring

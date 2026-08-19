@@ -296,6 +296,18 @@ fn get_entry(store: &WorkbookStore, id: &str) -> Result<Arc<WorkbookEntry>, Stat
         .ok_or_else(|| Status::not_found(format!("unknown workbook_id: {id}")))
 }
 
+/// The frontend advertisement block served on `GetMetadata`.
+///
+/// Same shape in every ai-pipestream gRPC service; the shared demo shell
+/// reads it to build its tab bar.
+fn ui_info() -> pb::UiInfo {
+    pb::UiInfo {
+        title: "Calamine".to_owned(),
+        path: "/ui/calamine".to_owned(),
+        description: "Spreadsheet parsing via calamine (xls, xlsx, xlsb, ods)".to_owned(),
+    }
+}
+
 /// Spawn `body` on the blocking pool and return its receiving stream.
 ///
 /// The bounded channel is the backpressure boundary: when the client reads
@@ -1431,6 +1443,7 @@ impl CalamineService for CalamineGrpc {
         Ok(Response::new(pb::GetMetadataResponse {
             detected_format: entry.format as i32,
             metadata: Some(entry.metadata.clone()),
+            ui: Some(ui_info()),
         }))
     }
 

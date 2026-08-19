@@ -298,8 +298,8 @@ fn get_entry(store: &WorkbookStore, id: &str) -> Result<Arc<WorkbookEntry>, Stat
 
 /// The frontend advertisement block served on `GetMetadata`.
 ///
-/// Same shape in every ai-pipestream gRPC service; the shared demo shell
-/// reads it to build its tab bar.
+/// Same shape in every ai-pipestream gRPC service, so dashboards and
+/// embedding hosts can discover and link this service's web UI.
 fn ui_info() -> pb::UiInfo {
     pb::UiInfo {
         title: "Calamine".to_owned(),

@@ -701,17 +701,17 @@ pub struct GetMetadataResponse {
     pub ui: ::core::option::Option<UiInfo>,
 }
 /// UiInfo is the frontend advertisement block. It has the same shape in
-/// every ai-pipestream gRPC service: the demo shell reads it to build its
-/// tab bar.
+/// every ai-pipestream gRPC service, so dashboards and embedding hosts can
+/// discover and link this service's web UI from the contract alone.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UiInfo {
-    /// Tab title, e.g. "Calamine".
+    /// Display title for the service's web UI, e.g. "Calamine".
     #[prost(string, tag="1")]
     pub title: ::prost::alloc::string::String,
-    /// Shell mount path, e.g. "/ui/calamine".
+    /// Suggested mount path when embedded, e.g. "/ui/calamine".
     #[prost(string, tag="2")]
     pub path: ::prost::alloc::string::String,
-    /// One-line description, used as the tab tooltip.
+    /// One-line description of what the UI demonstrates.
     #[prost(string, tag="3")]
     pub description: ::prost::alloc::string::String,
 }

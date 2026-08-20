@@ -149,16 +149,16 @@ ROWS_LATE_BACKWARDS = (
     + '<row r="1"><c r="B1"><v>999</v></c></row>\n',
 )
 
-# A declared width of 200,000 columns over a single cell at A1. calamine
-# ignores the declaration and reports a 1x1 range. The declared end column is
-# a file-controlled number used directly as an allocation length, and calamine
-# only warns past its 16,384 column limit rather than clamping, so the real
-# ceiling is the base-26 parse: `A1:ZZZZZZ1` is column 321,272,405, which is
-# ~10 GB of CellData before a single cell is read. 200,000 is the largest
-# value that demonstrates the same code path without making the test suite
-# allocate anything alarming.
+# A declared width covering the full grid (16,384 columns, A1:XFD1) over a
+# single cell at A1. calamine ignores the declaration and reports a 1x1
+# range. The declared end column is a file-controlled number used directly
+# as an allocation length, so the declaration must never size the row
+# buffer. XFD1 is the widest declaration that stays inside the grid: since
+# tafia/calamine#696, a reference past the grid is a hard
+# `ColumnNumberOverflow` rather than a warn-and-continue, so anything wider
+# would now be refused before the streaming path was asked anything.
 WIDE = (
-    "A1:KIVI1",
+    "A1:XFD1",
     """<row r="1"><c r="A1"><v>1</v></c></row>
 """,
 )

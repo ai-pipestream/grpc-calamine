@@ -12,7 +12,7 @@ The `protobuf-maven-plugin` generates `grpc-java` stubs from
 Needs a JDK 17+ and Maven. Start the server first, from the repository root:
 
 ```bash
-cargo run --release          # listening on 0.0.0.0:50051
+cargo run --release          # listening on 0.0.0.0:50062
 ```
 
 Then, in this directory:
@@ -124,7 +124,7 @@ import java.util.concurrent.CompletableFuture;
 public final class Main {
     public static void main(String[] args) throws Exception {
         ManagedChannel channel = Grpc.newChannelBuilder(
-                "127.0.0.1:50051", InsecureChannelCredentials.create()).build();
+                "127.0.0.1:50062", InsecureChannelCredentials.create()).build();
 
         // 1. Upload. Client-streaming: an options frame, then the file bytes.
         //    The single response arrives on its own observer, so bridge it.

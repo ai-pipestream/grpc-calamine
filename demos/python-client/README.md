@@ -14,7 +14,7 @@ generated is checked in.
 Needs Python 3.11+. Start the server first, from the repository root:
 
 ```bash
-cargo run --release          # listening on 0.0.0.0:50051
+cargo run --release          # listening on 0.0.0.0:50062
 ```
 
 Then, in this directory:
@@ -130,7 +130,7 @@ def print_row(row: svc.WorksheetRow) -> None:
     print(f"{row.row_index + 1:>6} │ " + " │ ".join(render(c) for c in row.values))
 
 
-with grpc.insecure_channel("127.0.0.1:50051") as channel:
+with grpc.insecure_channel("127.0.0.1:50062") as channel:
     stub = rpc.CalamineServiceStub(channel)
 
     # 1. Upload. The generator IS the client-streaming request.

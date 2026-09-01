@@ -35,7 +35,7 @@ const CHUNK_BYTES = 1024 * 1024;
 /** A connected calamine client with promise-friendly helpers. */
 export class CalamineClient {
   /** @param {string} address host:port of the grpc-calamine server. */
-  constructor(address = "127.0.0.1:50051") {
+  constructor(address = "127.0.0.1:50062") {
     this.stub = new calamine.v1.CalamineService(
       address,
       grpc.credentials.createInsecure(),

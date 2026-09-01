@@ -7,7 +7,7 @@
 //   node cli.js <workbook-file> [sheet-name-or-index]
 //
 // Environment: CALAMINE_ADDR overrides the server address (default
-// 127.0.0.1:50051).
+// 127.0.0.1:50062).
 
 import { createReadStream } from "node:fs";
 import { CalamineClient, renderCell, columnLabel } from "./lib/calamine.js";
@@ -24,7 +24,7 @@ const sheet = sheetArg === undefined
     ? { sheetIndex: Number(sheetArg) }
     : { sheetName: sheetArg };
 
-const client = new CalamineClient(process.env.CALAMINE_ADDR ?? "127.0.0.1:50051");
+const client = new CalamineClient(process.env.CALAMINE_ADDR ?? "127.0.0.1:50062");
 
 // Piped from disk chunk by chunk; the file is never whole in this process.
 const opened = await client.openWorkbookStream(createReadStream(file));

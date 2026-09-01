@@ -9,7 +9,7 @@ them.
 Needs Node 20+. Start the server first, from the repository root:
 
 ```bash
-cargo run --release          # listening on 0.0.0.0:50051
+cargo run --release          # listening on 0.0.0.0:50062
 ```
 
 ## Web viewer
@@ -45,6 +45,20 @@ workbook; see [../README.md](../README.md#see-the-streaming-not-just-the-result)
 The SSE bridge batches rows into frames of 32 before writing to the browser
 and respects `res.write` backpressure; both matter a great deal on a
 million-row sheet. See the comment at the top of `server.js`.
+
+### Serving under a base path (`UI_BASE`)
+
+Set `UI_BASE` to mount the whole bridge, page and API, under a prefix, e.g.
+behind a reverse proxy that forwards `/ui/calamine/*` unchanged:
+
+```bash
+UI_BASE=/ui/calamine npm start    # page at http://127.0.0.1:8080/ui/calamine/
+```
+
+Every route (`/api/*`, `/favicon.ico`, the page itself) is served under the
+prefix, and the bridge injects the base into the served page so the browser
+script prefixes its own `fetch`/`EventSource` calls. Unset, behavior is
+exactly as before.
 
 ## CLI
 
@@ -116,7 +130,7 @@ the returned `workbookId`.
 import { createReadStream } from "node:fs";
 
 const client = new calamine.v1.CalamineService(
-  "127.0.0.1:50051",
+  "127.0.0.1:50062",
   grpc.credentials.createInsecure(),
   { "grpc.max_receive_message_length": 32 * 1024 * 1024 },
 );

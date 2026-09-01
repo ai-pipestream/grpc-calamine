@@ -1,16 +1,18 @@
 name: Publish Images
 
 # Builds the service and viewer images and pushes them to
-# docker.io/pipestreamai. Every push to main republishes :latest; a manual
-# dispatch with a version input also tags that version. Docker Hub
-# credentials come from the DOCKER_USER / DOCKER_TOKEN org secrets.
+# docker.io/pipestreamai. Every push to main or development republishes
+# :latest; a manual dispatch with a version input also tags that version.
+# Docker Hub credentials come from the DOCKER_USER / DOCKER_TOKEN org
+# secrets.
 #
-# Multi-arch (amd64 + arm64): the runtime base (dhi.io/debian-base) and the
-# viewer base (dhi.io/node) are both published for the two platforms, and
-# the Rust build runs under QEMU for the arm64 leg.
+# Multi-arch (amd64 + arm64): the service image is hardened end to end
+# (builder dhi.io/rust:1, runtime dhi.io/debian-base:trixie-debian13, see
+# Dockerfile) and the viewer base (dhi.io/node) is published for the two
+# platforms too; the Rust build runs under QEMU for the arm64 leg.
 on:
   push:
-    branches: [main]
+    branches: [main, development]
   workflow_dispatch:
     inputs:
       version:

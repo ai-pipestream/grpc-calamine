@@ -4,15 +4,22 @@
 # ---------------------------------------------------------------------------
 # Build stage.
 #
-# The tests run here, against the release profile the image ships, before the
-# binary is built, so a red suite fails the image rather than shipping.
+# The tests run here, before the binary is built, so a red suite fails the
+# image rather than shipping. That is the whole reason this is a multi-stage
+# build and not a `COPY` of something built on a laptop: the artifact and the
+# evidence for it come out of the same command. The suite streams real
+# workbook fixtures (demos/sample-data) and compares every cell against
+# calamine itself, so `.dockerignore` keeps that directory in the context.
 #
 # No protoc and no buf. Code generation happens at development time (see
-# buf.gen.yaml) and the generated Rust is checked in under src/gen, so the
-# image build needs a Rust toolchain and nothing else.
+# buf.gen.yaml) and the generated Rust plus the descriptor set are checked in
+# under src/gen/, so the image build needs a Rust toolchain and nothing else.
 # ---------------------------------------------------------------------------
-FROM rust:1-slim-bookworm AS builder
+FROM dhi.io/rust:1 AS builder
 
+# The hardened toolchain image runs as a nonroot user; the build needs to
+# write only under /src and the cargo home, so give it a writable workspace.
+USER root
 WORKDIR /src
 COPY . .
 
@@ -24,18 +31,24 @@ RUN cargo build --release --locked
 # ---------------------------------------------------------------------------
 # Runtime stage.
 #
-# distroless/cc: glibc and libgcc, no shell, no package manager, nothing else.
-# The service never writes to disk, so the container can and should run with
+# Docker Hardened Images debian-base: glibc and libgcc, no package manager,
+# pulls from the docker.io ecosystem (dhi.io) with signed provenance, and
+# runs as uid 65532 out of the box. Uploaded workbooks live in memory and
+# nothing is written to disk, so the container can and should run with
 # `--read-only`.
 #
 #   docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
 #     -p 50062:50062 grpc-calamine
 #
-# `:nonroot` runs as uid 65532. Health checking is the orchestrator's job over
-# gRPC rather than a Dockerfile HEALTHCHECK, because there is no shell here to
-# run one with.
+# The in-code default listen address predates the fleet port registry and is
+# still 50051; the image pins the registered port (50062, see the workspace
+# AGENTS.md) through the same env var the binary reads.
+#
+# There is no health service registered, so checking is the orchestrator's
+# job over gRPC reflection or a real RPC rather than a Dockerfile
+# HEALTHCHECK, because there is no shell here to run one with.
 # ---------------------------------------------------------------------------
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM dhi.io/debian-base:trixie-debian13
 
 COPY --from=builder /src/target/release/grpc-calamine /usr/local/bin/grpc-calamine
 

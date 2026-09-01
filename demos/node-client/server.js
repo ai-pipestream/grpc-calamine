@@ -10,7 +10,9 @@
 //
 //   node server.js            # http://127.0.0.1:8080
 //
-// Environment: CALAMINE_ADDR (default 127.0.0.1:50051), PORT (default 8080).
+// Environment: CALAMINE_ADDR (default 127.0.0.1:50062), PORT (default 8080),
+// UI_BASE (default empty; set to e.g. /ui/calamine to serve the whole bridge,
+// page and API, under that prefix behind a path-preserving reverse proxy).
 
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
@@ -19,7 +21,9 @@ import path from "node:path";
 import { CalamineClient, renderCell } from "./lib/calamine.js";
 
 const PORT = Number(process.env.PORT ?? 8080);
-const client = new CalamineClient(process.env.CALAMINE_ADDR ?? "127.0.0.1:50051");
+// Normalized to a leading-slash, no-trailing-slash prefix, or "" when unset.
+const UI_BASE = (process.env.UI_BASE ?? "").replace(/\/+$/, "").replace(/^(?!\/)(.+)/, "/$1");
+const client = new CalamineClient(process.env.CALAMINE_ADDR ?? "127.0.0.1:50062");
 const publicDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "public");
 
 function sendJson(res, status, body) {
@@ -113,10 +117,20 @@ function pipeStream(stream, res, mapRow) {
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
+  // When UI_BASE is set every route lives under it; strip the prefix here so
+  // the matching below stays identical either way. Requests outside the base
+  // are not ours.
+  let pathname = url.pathname;
+  if (UI_BASE) {
+    if (pathname !== UI_BASE && !pathname.startsWith(UI_BASE + "/")) {
+      return sendJson(res, 404, { error: "not found" });
+    }
+    pathname = pathname.slice(UI_BASE.length) || "/";
+  }
   try {
     // POST /api/workbooks — body is the raw workbook bytes, piped straight
     // into the gRPC upload as it arrives (never buffered in the bridge).
-    if (req.method === "POST" && url.pathname === "/api/workbooks") {
+    if (req.method === "POST" && pathname === "/api/workbooks") {
       const opened = await client.openWorkbookStream(req);
       return sendJson(res, 200, opened);
     }
@@ -128,7 +142,7 @@ const server = createServer(async (req, res) => {
     }
 
     // GET /api/workbooks/:id/sheets/:index/rows — SSE of parsed rows.
-    m = url.pathname.match(/^\/api\/workbooks\/([^/]+)\/sheets\/(\d+)\/rows$/);
+    m = pathname.match(/^\/api\/workbooks\/([^/]+)\/sheets\/(\d+)\/rows$/);
     if (req.method === "GET" && m) {
       const stream = client.streamWorksheetRange(m[1], { sheetIndex: Number(m[2]) });
       return pipeStream(stream, res, (row) => ({
@@ -138,7 +152,7 @@ const server = createServer(async (req, res) => {
     }
 
     // GET /api/workbooks/:id/sheets/:index/formulas — SSE of formula rows.
-    m = url.pathname.match(/^\/api\/workbooks\/([^/]+)\/sheets\/(\d+)\/formulas$/);
+    m = pathname.match(/^\/api\/workbooks\/([^/]+)\/sheets\/(\d+)\/formulas$/);
     if (req.method === "GET" && m) {
       const stream = client.streamWorksheetFormula(m[1], { sheetIndex: Number(m[2]) });
       return pipeStream(stream, res, (row) => ({
@@ -148,16 +162,24 @@ const server = createServer(async (req, res) => {
     }
 
     // Static front end. no-store: this is a live demo page, never let the
-    // browser run a stale copy of it.
-    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
-      const html = await readFile(path.join(publicDir, "index.html"));
+    // browser run a stale copy of it. With UI_BASE set, inject it so the
+    // page's script can prefix its /api calls; unset, the file is served
+    // byte-for-byte as it sits on disk.
+    if (req.method === "GET" && (pathname === "/" || pathname === "/index.html")) {
+      const html = await readFile(path.join(publicDir, "index.html"), UI_BASE ? "utf8" : null);
+      const served = UI_BASE
+        ? html.replace(
+            "<title>",
+            `<script>window.__UI_BASE__ = ${JSON.stringify(UI_BASE).replace(/</g, "\\u003c")};</script>\n<title>`,
+          )
+        : html;
       res.writeHead(200, {
         "content-type": "text/html; charset=utf-8",
         "cache-control": "no-store",
       });
-      return res.end(html);
+      return res.end(served);
     }
-    if (req.method === "GET" && url.pathname === "/favicon.ico") {
+    if (req.method === "GET" && pathname === "/favicon.ico") {
       res.writeHead(204);
       return res.end();
     }
@@ -179,6 +201,6 @@ server.on("error", (err) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`calamine web demo on http://127.0.0.1:${PORT}`);
-  console.log(`forwarding to grpc-calamine at ${process.env.CALAMINE_ADDR ?? "127.0.0.1:50051"}`);
+  console.log(`calamine web demo on http://127.0.0.1:${PORT}${UI_BASE || "/"}`);
+  console.log(`forwarding to grpc-calamine at ${process.env.CALAMINE_ADDR ?? "127.0.0.1:50062"}`);
 });

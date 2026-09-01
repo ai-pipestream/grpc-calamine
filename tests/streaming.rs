@@ -318,6 +318,15 @@ async fn open_workbook_reports_format_and_metadata() {
         .into_inner();
     assert_eq!(again.metadata, opened.metadata);
 
+    // The response carries the shared-shell frontend advertisement.
+    let ui = again.ui.expect("ui info");
+    assert_eq!(ui.title, "Calamine");
+    assert_eq!(ui.path, "/ui/calamine");
+    assert_eq!(
+        ui.description,
+        "Spreadsheet parsing via calamine (xls, xlsx, xlsb, ods)"
+    );
+
     // Close is idempotent-safe: first close true, second false.
     let closed = client
         .close_workbook(pb::CloseWorkbookRequest {
@@ -335,6 +344,20 @@ async fn open_workbook_reports_format_and_metadata() {
         .expect("close again")
         .into_inner();
     assert!(!closed_again.closed);
+}
+
+#[tokio::test]
+async fn empty_workbook_id_is_the_service_probe() {
+    let mut client = start_server().await;
+    let probe = client
+        .get_metadata(pb::GetMetadataRequest::default())
+        .await
+        .expect("service probe")
+        .into_inner();
+    assert!(probe.metadata.is_none());
+    let ui = probe.ui.expect("ui info on the probe response");
+    assert_eq!(ui.title, "Calamine");
+    assert_eq!(ui.path, "/ui/calamine");
 }
 
 #[tokio::test]
@@ -1089,15 +1112,16 @@ async fn out_of_order_beyond_repair_fails_in_band() {
 /// `emit_incremental` pre-sizes each row from the declaration
 /// (`width = dims.end.1 as usize + 1`, service.rs:532) and then allocates
 /// `vec![empty_cell_data(); width]` (service.rs:534) before reading a single
-/// cell. That end column comes straight out of the uploaded file, and calamine
-/// does not clamp it: `get_dimension` only logs a warning past its 16,384
-/// column limit (xlsx/mod.rs:2794). The base-26 parse accepts far more, so
-/// `<dimension ref="A1:ZZZZZZ1"/>` in a 2 KB upload is column 321,272,405 and
-/// commits roughly 10 GB before any work happens.
+/// cell. That end column comes straight out of the uploaded file. calamine
+/// once only warned past the 16,384 column grid limit, so a declared
+/// `A1:ZZZZZZ1` (column 321,272,405) committed roughly 10 GB of buffer
+/// before any work happened; since tafia/calamine#696 a reference past the
+/// grid is a hard `ColumnNumberOverflow`, which closes that route upstream.
 ///
-/// This fixture uses 200,000 columns over a single cell at A1: enough to
-/// demonstrate the same path, small enough that the suite stays safe. calamine
-/// reports a 1x1 range for it, so the emitted row should be one cell wide.
+/// This fixture declares the widest in-grid extent, `A1:XFD1` (16,384
+/// columns), over a single cell at A1. calamine reports a 1x1 range for it,
+/// so the emitted row should be one cell wide: the declaration still must
+/// not control how much the server allocates.
 #[tokio::test]
 async fn a_wide_declared_dimension_does_not_size_the_row_buffer() {
     let client = start_server().await;
@@ -1108,7 +1132,7 @@ async fn a_wide_declared_dimension_does_not_size_the_row_buffer() {
     assert_eq!(
         rows[0].values.len(),
         1,
-        "the row is sized from the declared 200,000 column extent rather than \
+        "the row is sized from the declared full-grid extent rather than \
          from the single cell present, so the declaration controls how much \
          the server allocates"
     );

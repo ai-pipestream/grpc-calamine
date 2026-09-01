@@ -173,7 +173,7 @@ def main() -> None:
     parser.add_argument("--sheet", default="0", help="sheet name or zero-based index")
     parser.add_argument("--formulas", action="store_true", help="stream formulas too")
     parser.add_argument("--vba", action="store_true", help="stream the VBA project too")
-    parser.add_argument("--addr", default="127.0.0.1:50051", help="server address")
+    parser.add_argument("--addr", default="127.0.0.1:50062", help="server address")
     args = parser.parse_args()
 
     with grpc.insecure_channel(args.addr) as channel:

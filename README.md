@@ -102,6 +102,7 @@ slower.
 | `GRPC_CALAMINE_MAX_PICTURE_BYTES` | `67108864`    | largest embedded picture, inflated (64 MiB) |
 | `GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES` | `268435456` | one workbook's pictures together, inflated (256 MiB) |
 | `GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES` | `1073741824` | largest shared-string table, inflated (1 GiB) |
+| `GRPC_CALAMINE_MAX_DENSE_CELLS`  | `33554432`     | cells one formula, XLS or ODS stream may densify |
 
 The window default is 50 MiB because window size over round-trip time caps
 upload throughput; hyper's 1 MiB default holds a 10 ms link near 100 MB/s.
@@ -162,26 +163,23 @@ its start reports zero cells rather than underflowing. A panic anywhere in
 the parse is delivered as a gRPC `INTERNAL` status, never as a stream that
 ends successfully having sent nothing.
 
-**Formulas are the one path that still densifies.**
-`StreamWorksheetFormula` has no incremental API in calamine, so it goes
-through `Range::from_sparse`, which builds `rows * cols` cells. Two formula
-cells at opposite corners of a sheet are ~17 billion `String`s, about
-412 GB. On stock crates.io calamine that allocation fails through
-`handle_alloc_error`, which aborts the process without unwinding, so the
-panic supervisor above cannot catch it and the server dies. This build links
-[the fork](#building-against-patched-calamine), where the same case is a
-catchable panic and the caller gets `INTERNAL` naming the extent:
+**Some streams send a dense range, and those are budgeted.** The value
+stream of an xlsx or xlsb sheet goes cell by cell and never builds one. A
+formula stream, and any XLS or ODS stream, sends every row of its range
+from column A, and a range is as large as the two cells furthest apart make
+it: two formulas at opposite corners of a sheet are about 17 billion cells.
+calamine's own `worksheet_formula` densifies that extent before the first
+row, about 412 GB of `String`s, so for xlsx and xlsb the server collects the
+formula cells itself and builds one row at a time. Either way a range of
+more than `GRPC_CALAMINE_MAX_DENSE_CELLS` cells, counted from column A, is
+refused with `RESOURCE_EXHAUSTED` before its first event. The default covers
+a whole .xls sheet (65,536 x 256) twice over.
 
-```
-parser panicked: calamine: cannot densify a 1048576 x 16384 range
-(17179869184 cells of 24 bytes). This extent is derived from the positions
-of the cells in the file, not from its declared dimension, so a sheet with
-very few cells can still reach it.
-```
-
-The value stream is not affected either way: it streams cells and never
-calls `from_sparse`. If you build against unpatched calamine, do not expose
-`StreamWorksheetFormula` to untrusted uploads.
+One cost stays outside that budget: calamine parses an XLS or ODS workbook
+into dense ranges while opening it, before the server sees a sheet. ODS is
+capped there by calamine itself at 100 million cells per sheet, past which
+`OpenWorkbook` is refused; XLS ranges are allocated fallibly by the fork's
+`Range::from_sparse`, but one that merely fits is still allocated in full.
 
 ## API
 
@@ -295,8 +293,8 @@ Nothing here depends on an API those fixes introduce, so remove both
 `[patch]` sections once the fixes are released. Until then, building against
 stock crates.io calamine still works and still passes the suite; you just
 lose the three guarantees above, of which the `from_sparse` bound is the one
-that can take the process down, as the formula note under [Run](#run)
-explains.
+that can take the process down: calamine builds every XLS sheet with it when
+the workbook is opened, as the dense-range note under [Run](#run) explains.
 
 [fork]: https://github.com/ai-pipestream/calamine
 [i692]: https://github.com/tafia/calamine/issues/692

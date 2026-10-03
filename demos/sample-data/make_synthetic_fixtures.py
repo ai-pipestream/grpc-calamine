@@ -178,6 +178,16 @@ CORNERS = (
 """,
 )
 
+# The same two corners holding formulas. calamine has no incremental formula
+# API, and `worksheet_formula` densifies the extent: 17.2 billion strings of
+# 24 bytes. The server has to refuse it from the cell positions alone.
+CORNERS_FORMULA = (
+    "A1:XFD1048576",
+    """<row r="1"><c r="A1"><f>1+1</f><v>2</v></c></row>
+<row r="1048576"><c r="XFD1048576"><f>2+2</f><v>4</v></c></row>
+""",
+)
+
 ODS_MIMETYPE = "application/vnd.oasis.opendocument.spreadsheet"
 
 ODS_MANIFEST = """<?xml version="1.0" encoding="UTF-8"?>
@@ -214,6 +224,17 @@ ODS_GAP = (
     f"{ods_value(9)}</table:table-row>\n"
 )
 
+# The corners again, as ODS. Repeat counts make the file tiny, and calamine
+# expands them into a dense range while the workbook is still being opened:
+# past its own 100,000,000-cell cap it refuses the file instead, which is the
+# only bound on this path, since it runs before the server sees a sheet.
+ODS_CORNERS = (
+    f"<table:table-row>{ods_value(1)}</table:table-row>\n"
+    '<table:table-row table:number-rows-repeated="1048574"><table:table-cell/></table:table-row>\n'
+    '<table:table-row><table:table-cell table:number-columns-repeated="16383"/>'
+    f"{ods_value(2)}</table:table-row>\n"
+)
+
 
 def write(name: str, dimension: str, sheet_data: str) -> None:
     with zipfile.ZipFile(name, "w", zipfile.ZIP_STORED) as z:
@@ -247,10 +268,13 @@ if __name__ == "__main__":
     write("rows_descending.xlsx", *ROWS_DESCENDING)
     write("rows_late_backwards.xlsx", *ROWS_LATE_BACKWARDS)
     write("corners.xlsx", *CORNERS)
+    write("corners_formula.xlsx", *CORNERS_FORMULA)
     write_ods("gap.ods", ODS_GAP)
+    write_ods("corners.ods", ODS_CORNERS)
     print(
         "wrote dimension_inflated.xlsx dimension_underdeclared.xlsx "
         "dimension_shifted.xlsx dimension_offset.xlsx dimension_reversed.xlsx "
         "dimension_wide.xlsx rows_out_of_order.xlsx rows_descending.xlsx "
-        "rows_late_backwards.xlsx corners.xlsx gap.ods"
+        "rows_late_backwards.xlsx corners.xlsx corners_formula.xlsx gap.ods "
+        "corners.ods"
     )

@@ -10,10 +10,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::io::{Read, Seek};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use calamine::{CellType, Data, HeaderRow, Range, Reader, Sheets};
+use calamine::{CellType, Data, HeaderRow, Range, Reader, Sheets, Xlsb, Xlsx};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -53,6 +54,15 @@ const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 128;
 /// store until then, so without a cap the number of uploads alone decides how
 /// much memory is committed.
 const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 16;
+
+/// Default cap on the cells one stream may densify: 32 Mi.
+///
+/// Formula streams, and every XLS and ODS stream, send each row of their range
+/// densely from column A, and the range is as large as the two cells furthest
+/// apart make it: A1 and XFD1048576 are 17.2 billion cells. This bounds the
+/// grid a single stream will produce. The default covers the whole of an .xls
+/// sheet (65,536 x 256) twice over.
+const DEFAULT_MAX_DENSE_CELLS: u64 = 32 * 1024 * 1024;
 
 /// How long an upload may go without a frame before it is abandoned.
 ///
@@ -171,6 +181,39 @@ fn declared_total_cells(dims: calamine::Dimensions) -> u64 {
     rows * cols
 }
 
+/// Refuse a range that, streamed densely from column A, is more than `max`
+/// cells: `rows` by `columns`, where `columns` runs from A to the range's last
+/// column.
+fn check_dense(sheet_name: &str, rows: u64, columns: u64, max: u64) -> Result<(), Status> {
+    let cells = rows.saturating_mul(columns);
+    if cells <= max {
+        return Ok(());
+    }
+    Err(Status::resource_exhausted(format!(
+        "sheet {sheet_name:?} spans {rows} rows by {columns} columns counted from \
+         column A, {cells} cells, more than the {max} one stream may densify \
+         (GRPC_CALAMINE_MAX_DENSE_CELLS)"
+    )))
+}
+
+/// [`check_dense`] for a range calamine has already built.
+fn check_dense_range<T: CellType>(
+    sheet_name: &str,
+    range: &Range<T>,
+    max: u64,
+) -> Result<(), Status> {
+    let Some(start) = range.start() else {
+        return Ok(());
+    };
+    let (height, width) = range.get_size();
+    check_dense(
+        sheet_name,
+        height as u64,
+        u64::from(start.1) + width as u64,
+        max,
+    )
+}
+
 /// gRPC implementation of `calamine.v1.CalamineService`.
 pub struct CalamineGrpc {
     store: Arc<WorkbookStore>,
@@ -185,6 +228,8 @@ pub struct CalamineGrpc {
     upload_slots: Arc<tokio::sync::Semaphore>,
     /// How long an upload may go without a frame.
     upload_stall: std::time::Duration,
+    /// Most cells one stream may densify, counted from column A.
+    max_dense_cells: u64,
 }
 
 impl CalamineGrpc {
@@ -197,6 +242,7 @@ impl CalamineGrpc {
             stream_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONCURRENT_STREAMS)),
             upload_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONCURRENT_UPLOADS)),
             upload_stall: UPLOAD_STALL,
+            max_dense_cells: DEFAULT_MAX_DENSE_CELLS,
         }
     }
 
@@ -225,6 +271,16 @@ impl CalamineGrpc {
     #[must_use]
     pub fn with_max_concurrent_uploads(mut self, max: usize) -> Self {
         self.upload_slots = Arc::new(tokio::sync::Semaphore::new(max));
+        self
+    }
+
+    /// Override how many cells one stream may densify, counted from column A.
+    ///
+    /// A formula stream, or an XLS or ODS stream, whose range is larger is
+    /// refused with `RESOURCE_EXHAUSTED` before its first event.
+    #[must_use]
+    pub fn with_max_dense_cells(mut self, max: u64) -> Self {
+        self.max_dense_cells = max;
         self
     }
 
@@ -882,13 +938,22 @@ fn formula_row(row_index: u32, formulas: Vec<String>) -> pb::StreamWorksheetForm
 
 /// Emit the rows of a dense `Range<Data>` (buffered path for XLS and ODS,
 /// whose calamine readers do not expose an incremental cell iterator).
+///
+/// calamine has already built the range by now, when it opened the workbook,
+/// so the budget cannot spare that. It bounds what the stream copies out and
+/// sends, and how long it holds a parser thread doing so.
 fn emit_range(
     sheet_name: &str,
     range: &Range<Data>,
     is_1904: bool,
+    max_dense_cells: u64,
     batcher: &mut RowBatcher,
     tx: &mpsc::Sender<Result<pb::StreamWorksheetRangeResponse, Status>>,
 ) {
+    if let Err(status) = check_dense_range(sheet_name, range, max_dense_cells) {
+        let _ = tx.blocking_send(Err(status));
+        return;
+    }
     if !send_event(tx, range_started(range_header(sheet_name, range))) {
         return;
     }
@@ -1191,6 +1256,7 @@ fn run_stream_worksheet_range(
     selector: Option<&pb::SheetSelector>,
     max_rows_per_message: u32,
     use_string_table: bool,
+    max_dense_cells: u64,
     tx: &mpsc::Sender<Result<pb::StreamWorksheetRangeResponse, Status>>,
 ) {
     // Only the incremental readers produce shared strings, so only they can
@@ -1251,7 +1317,14 @@ fn run_stream_worksheet_range(
             };
             if !streamed {
                 match xlsx.worksheet_range(&sheet_name) {
-                    Ok(range) => emit_range(&sheet_name, &range, is_1904, &mut batcher, tx),
+                    Ok(range) => emit_range(
+                        &sheet_name,
+                        &range,
+                        is_1904,
+                        max_dense_cells,
+                        &mut batcher,
+                        tx,
+                    ),
                     Err(e) => abort_with(tx, kind, e),
                 }
             }
@@ -1280,7 +1353,14 @@ fn run_stream_worksheet_range(
             };
             if !streamed {
                 match xlsb.worksheet_range(&sheet_name) {
-                    Ok(range) => emit_range(&sheet_name, &range, is_1904, &mut batcher, tx),
+                    Ok(range) => emit_range(
+                        &sheet_name,
+                        &range,
+                        is_1904,
+                        max_dense_cells,
+                        &mut batcher,
+                        tx,
+                    ),
                     Err(e) => abort_with(tx, kind, e),
                 }
             }
@@ -1290,18 +1370,132 @@ fn run_stream_worksheet_range(
                 Ok(range) => range,
                 Err(e) => return abort_with(tx, kind, e),
             };
-            emit_range(&sheet_name, &range, is_1904, &mut batcher, tx);
+            emit_range(
+                &sheet_name,
+                &range,
+                is_1904,
+                max_dense_cells,
+                &mut batcher,
+                tx,
+            );
+        }
+    }
+}
+
+/// One formula, at its absolute (row, column).
+type FormulaCell = (u32, u32, String);
+
+/// An xlsx sheet's formulas, cell by cell: what calamine's
+/// `worksheet_formula` collects before it densifies them
+/// (xlsx/mod.rs:2607-2626), including its answer of nothing for a sheet that
+/// is not a worksheet.
+fn xlsx_formulas<RS: Read + Seek>(
+    xlsx: &mut Xlsx<RS>,
+    name: &str,
+) -> Result<Vec<FormulaCell>, calamine::Error> {
+    let mut reader = match xlsx.worksheet_cells_reader(name) {
+        Ok(reader) => reader,
+        Err(calamine::XlsxError::NotAWorksheet(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut cells = Vec::new();
+    while let Some(cell) = reader.next_formula()? {
+        if !cell.get_value().is_empty() {
+            let (row, col) = cell.get_position();
+            cells.push((row, col, cell.get_value().clone()));
+        }
+    }
+    Ok(cells)
+}
+
+/// An xlsb sheet's formulas, cell by cell, as [`xlsx_formulas`] does for xlsx
+/// (xlsb/mod.rs:538-547).
+fn xlsb_formulas<RS: Read + Seek>(
+    xlsb: &mut Xlsb<RS>,
+    name: &str,
+) -> Result<Vec<FormulaCell>, calamine::Error> {
+    let mut reader = xlsb.worksheet_cells_reader(name)?;
+    let mut cells = Vec::new();
+    while let Some(cell) = reader.next_formula()? {
+        if !cell.get_value().is_empty() {
+            let (row, col) = cell.get_position();
+            cells.push((row, col, cell.get_value().clone()));
+        }
+    }
+    Ok(cells)
+}
+
+/// Stream formula cells as the rows `Range::from_sparse` would give them,
+/// building one row at a time instead of the whole range.
+fn emit_sparse_formulas(
+    sheet_name: &str,
+    mut cells: Vec<FormulaCell>,
+    max_dense_cells: u64,
+    tx: &mpsc::Sender<Result<pb::StreamWorksheetFormulaResponse, Status>>,
+) {
+    // Stable, so of two cells at one position the later still wins, as it
+    // does in `from_sparse`.
+    cells.sort_by_key(|&(row, col, _)| (row, col));
+    let rows_spanned = cells.first().zip(cells.last());
+    let Some(((first_row, _, _), (last_row, _, _))) = rows_spanned else {
+        // No formulas: the header is the whole stream.
+        let _ = send_event(
+            tx,
+            formula_started(pb::RangeStarted {
+                sheet_name: sheet_name.to_string(),
+                dimensions: None,
+                total_cells: 0,
+            }),
+        );
+        return;
+    };
+    let (first_row, last_row) = (*first_row, *last_row);
+    let columns = cells.iter().map(|&(_, col, _)| col);
+    let first_col = columns.clone().min().unwrap_or_default();
+    let last_col = columns.max().unwrap_or_default();
+    let rows = u64::from(last_row - first_row) + 1;
+    if let Err(status) = check_dense(sheet_name, rows, u64::from(last_col) + 1, max_dense_cells) {
+        let _ = tx.blocking_send(Err(status));
+        return;
+    }
+    let header = pb::RangeStarted {
+        sheet_name: sheet_name.to_string(),
+        dimensions: Some(pb::Dimensions {
+            start: Some(convert::cell_position((first_row, first_col))),
+            end: Some(convert::cell_position((last_row, last_col))),
+        }),
+        total_cells: rows * (u64::from(last_col - first_col) + 1),
+    };
+    if !send_event(tx, formula_started(header)) {
+        return;
+    }
+    // Anchored at column 0 like every other row: a formula's index is its
+    // absolute column, and cells without one are empty strings.
+    let width = last_col as usize + 1;
+    let mut cells = cells.into_iter().peekable();
+    for row in first_row..=last_row {
+        let mut formulas = vec![String::new(); width];
+        while let Some((_, col, formula)) = cells.next_if(|(at, _, _)| *at == row) {
+            formulas[col as usize] = formula;
+        }
+        if !send_event(tx, formula_row(row, formulas)) {
+            return;
         }
     }
 }
 
 /// The blocking body of `StreamWorksheetFormula`.
 ///
-/// Calamine only exposes formulas as a whole `Range<String>`, so the range
-/// is parsed first and then streamed row by row.
+/// calamine only offers formulas as a whole `Range<String>`, built densely
+/// over the extent of the cells, so two formulas at opposite corners of a
+/// sheet are 17 billion strings. For xlsx and xlsb the server collects the
+/// formulas cell by cell instead and builds one row at a time; for XLS and
+/// ODS the range already exists, built when the workbook was opened. Either
+/// way a range past the dense-cell budget is refused before its first event.
 fn run_stream_worksheet_formula(
     entry: &WorkbookEntry,
     selector: Option<&pb::SheetSelector>,
+    max_dense_cells: u64,
     tx: &mpsc::Sender<Result<pb::StreamWorksheetFormulaResponse, Status>>,
 ) {
     let sheet_name = match resolve_sheet_name(entry, selector) {
@@ -1316,12 +1510,28 @@ fn run_stream_worksheet_formula(
         Ok(workbook) => workbook,
         Err(e) => return abort_with(tx, kind, e),
     };
+    let sparse = match &mut *workbook {
+        Sheets::Xlsx(xlsx) => Some(xlsx_formulas(xlsx, &sheet_name)),
+        Sheets::Xlsb(xlsb) => Some(xlsb_formulas(xlsb, &sheet_name)),
+        _ => None,
+    };
+    if let Some(sparse) = sparse {
+        drop(workbook);
+        return match sparse {
+            Ok(cells) => emit_sparse_formulas(&sheet_name, cells, max_dense_cells, tx),
+            Err(e) => abort_with(tx, kind, e),
+        };
+    }
     let range = match workbook.worksheet_formula(&sheet_name) {
         Ok(range) => range,
         Err(e) => return abort_with(tx, kind, e),
     };
     drop(workbook);
 
+    if let Err(status) = check_dense_range(&sheet_name, &range, max_dense_cells) {
+        let _ = tx.blocking_send(Err(status));
+        return;
+    }
     if !send_event(tx, formula_started(range_header(&sheet_name, &range))) {
         return;
     }
@@ -1583,12 +1793,14 @@ impl CalamineService for CalamineGrpc {
         let req = request.into_inner();
         let entry = get_entry(&self.store, &req.workbook_id)?;
         let permit = self.admit()?;
+        let max_dense_cells = self.max_dense_cells;
         Ok(spawn_blocking_stream(permit, move |tx| {
             run_stream_worksheet_range(
                 &entry,
                 req.sheet.as_ref(),
                 req.max_rows_per_message,
                 req.use_string_table,
+                max_dense_cells,
                 &tx,
             );
         }))
@@ -1604,8 +1816,9 @@ impl CalamineService for CalamineGrpc {
         let req = request.into_inner();
         let entry = get_entry(&self.store, &req.workbook_id)?;
         let permit = self.admit()?;
+        let max_dense_cells = self.max_dense_cells;
         Ok(spawn_blocking_stream(permit, move |tx| {
-            run_stream_worksheet_formula(&entry, req.sheet.as_ref(), &tx);
+            run_stream_worksheet_formula(&entry, req.sheet.as_ref(), max_dense_cells, &tx);
         }))
     }
 

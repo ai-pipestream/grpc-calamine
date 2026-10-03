@@ -6,8 +6,8 @@
 //! calamine's xlsx, xlsb and ods readers read some parts of the package whole
 //! while they are being constructed, before any sheet is asked for. With the
 //! `picture` feature this server is built with, that is every embedded image,
-//! each one a `read_to_end` (xlsx/mod.rs:711-733, xlsb/mod.rs:449-471,
-//! ods.rs:811-835), and for xlsx and xlsb it is the shared-string table,
+//! each one a `read_to_end` (xlsx/mod.rs:711-733, xlsb/mod.rs:449-474,
+//! ods.rs:811-840), and for xlsx and xlsb it is the shared-string table,
 //! parsed into owned strings (xlsx/mod.rs:346, xlsb/mod.rs:269). Nothing
 //! bounds either. Deflate reaches about 1,000:1, and the zip reader does not
 //! hold a deflated entry to the size the archive records for it, so a 5 MB

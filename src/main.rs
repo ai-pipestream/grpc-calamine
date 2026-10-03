@@ -27,6 +27,10 @@
 //! - `GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES`: largest shared-string table,
 //!   inflated (default: 1 GiB). A workbook past any of the three is refused
 //!   at `OpenWorkbook` with `RESOURCE_EXHAUSTED`.
+//! - `GRPC_CALAMINE_MAX_DENSE_CELLS`: most cells, counted from column A, that
+//!   one formula stream or XLS/ODS stream may densify (default: 33554432).
+//!   A larger range is refused with `RESOURCE_EXHAUSTED` before its first
+//!   event.
 
 use std::time::Duration;
 
@@ -127,6 +131,12 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
     {
         grpc = grpc.with_max_concurrent_uploads(max);
+    }
+    if let Some(max) = std::env::var("GRPC_CALAMINE_MAX_DENSE_CELLS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        grpc = grpc.with_max_dense_cells(max);
     }
     // Detached on purpose: it ends by itself once the service is dropped.
     let _reaper = grpc.spawn_reaper();

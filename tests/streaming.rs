@@ -1938,3 +1938,199 @@ async fn pictures_within_the_limits_are_served() {
     assert_eq!(pictures[0].extension, "png");
     assert_eq!(pictures[0].data, image);
 }
+
+// ---------------------------------------------------------------------------
+// Ranges the server densifies.
+//
+// Formula streams, and every XLS and ODS stream, send each row of their range
+// densely from column A, and the range is as large as its two furthest cells
+// make it. A server-wide budget bounds the grid one stream produces.
+// ---------------------------------------------------------------------------
+
+/// Stream a sheet's formulas and return the header, the dense rows (each
+/// anchored at column A) and the terminal status if the stream ended with one.
+async fn stream_formulas(
+    client: &CalamineServiceClient<tonic::transport::Channel>,
+    workbook_id: &str,
+    sheet_index: u32,
+) -> (
+    Option<pb::RangeStarted>,
+    Vec<pb::FormulaRow>,
+    Option<Status>,
+) {
+    let mut client = client.clone();
+    let mut stream = client
+        .stream_worksheet_formula(pb::StreamWorksheetFormulaRequest {
+            workbook_id: workbook_id.to_string(),
+            sheet: Some(pb::SheetSelector {
+                selector: Some(pb::sheet_selector::Selector::SheetIndex(sheet_index)),
+            }),
+        })
+        .await
+        .expect("stream formulas")
+        .into_inner();
+    let mut header = None;
+    let mut rows = Vec::new();
+    loop {
+        match stream.message().await {
+            Ok(None) => return (header, rows, None),
+            Ok(Some(event)) => match event.event.expect("event kind") {
+                pb::stream_worksheet_formula_response::Event::Started(h) => header = Some(h),
+                pb::stream_worksheet_formula_response::Event::Row(row) => rows.push(row),
+                pb::stream_worksheet_formula_response::Event::Error(err) => {
+                    panic!("unexpected in-band error: {:?}", err.error)
+                }
+            },
+            Err(status) => return (header, rows, Some(status)),
+        }
+    }
+}
+
+/// The status a value stream ends with, or `None` if it ends cleanly.
+async fn range_stream_status(
+    client: &CalamineServiceClient<tonic::transport::Channel>,
+    workbook_id: &str,
+) -> Option<Status> {
+    let mut client = client.clone();
+    let mut stream = client
+        .stream_worksheet_range(pb::StreamWorksheetRangeRequest {
+            workbook_id: workbook_id.to_string(),
+            sheet: Some(pb::SheetSelector {
+                selector: Some(pb::sheet_selector::Selector::SheetIndex(0)),
+            }),
+            max_rows_per_message: 0,
+            use_string_table: false,
+        })
+        .await
+        .expect("stream worksheet range")
+        .into_inner();
+    loop {
+        match stream.message().await {
+            Ok(None) => return None,
+            Ok(Some(_)) => {}
+            Err(status) => return Some(status),
+        }
+    }
+}
+
+/// xlsx and xlsb formulas are collected cell by cell rather than through
+/// calamine's dense `worksheet_formula`, and must come out exactly as it
+/// would give them, on every format, chartsheets and formula-free sheets
+/// included.
+#[tokio::test]
+async fn formula_streams_match_calamine_on_every_format() {
+    for file in [
+        "formula.issue.xlsx",
+        "any_sheets.xlsx",
+        "date.xlsx",
+        "date.xlsb",
+        "date.xls",
+        "date.ods",
+    ] {
+        let client = start_server().await;
+        let opened = upload(&client, file).await;
+        let mut workbook: Sheets<_> =
+            open_workbook_auto(fixtures().join(file)).expect("open fixture");
+        let names = workbook.sheet_names().to_vec();
+        for (index, name) in names.iter().enumerate() {
+            let range = workbook.worksheet_formula(name).expect("formulas");
+            let (header, rows, status) =
+                stream_formulas(&client, &opened.workbook_id, index as u32).await;
+            assert!(status.is_none(), "{file}/{name}: {status:?}");
+            let header = header.expect("a header first");
+            assert_eq!(header.sheet_name, *name);
+
+            let expected_dims = range
+                .start()
+                .zip(range.end())
+                .map(|(start, end)| pb::Dimensions {
+                    start: Some(convert::cell_position(start)),
+                    end: Some(convert::cell_position(end)),
+                });
+            assert_eq!(header.dimensions, expected_dims, "{file}/{name}");
+            let (height, width) = range.get_size();
+            assert_eq!(header.total_cells, (height * width) as u64, "{file}/{name}");
+
+            let start = range.start().unwrap_or_default();
+            let expected: Vec<(u32, Vec<String>)> = range
+                .rows()
+                .enumerate()
+                .map(|(offset, row)| {
+                    let mut formulas = vec![String::new(); start.1 as usize];
+                    formulas.extend_from_slice(row);
+                    (start.0 + offset as u32, formulas)
+                })
+                .collect();
+            let got: Vec<(u32, Vec<String>)> = rows
+                .into_iter()
+                .map(|row| (row.row_index, row.formulas))
+                .collect();
+            assert_eq!(got, expected, "{file}/{name}");
+        }
+    }
+}
+
+/// Two formulas at opposite corners make a 1,048,576 x 16,384 range. calamine
+/// would densify it into 17 billion strings before the first row; the server
+/// refuses it from the cells' positions alone, before any event.
+#[tokio::test]
+async fn formulas_at_opposite_corners_are_refused() {
+    let client = start_server().await;
+    let opened = upload(&client, "corners_formula.xlsx").await;
+    let (header, rows, status) = stream_formulas(&client, &opened.workbook_id, 0).await;
+
+    assert!(
+        header.is_none() && rows.is_empty(),
+        "refused before any event"
+    );
+    let status = status.expect("a terminal status");
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert!(
+        status.message().contains("GRPC_CALAMINE_MAX_DENSE_CELLS"),
+        "{}",
+        status.message()
+    );
+}
+
+/// The budget holds on every path that streams a dense range: XLS and ODS
+/// values, and formulas.
+#[tokio::test]
+async fn ranges_past_the_dense_budget_are_refused() {
+    let client =
+        start_server_with(CalamineGrpc::new(WorkbookStore::new()).with_max_dense_cells(5)).await;
+    for file in ["date.xls", "date.ods"] {
+        let opened = upload(&client, file).await;
+        let status = range_stream_status(&client, &opened.workbook_id)
+            .await
+            .unwrap_or_else(|| panic!("{file}: a range of more than 5 cells streamed"));
+        assert_eq!(status.code(), Code::ResourceExhausted, "{file}");
+    }
+    let opened = upload(&client, "formula.issue.xlsx").await;
+    let (_, _, status) = stream_formulas(&client, &opened.workbook_id, 0).await;
+    assert_eq!(
+        status.expect("a 14 x 10 formula range").code(),
+        Code::ResourceExhausted
+    );
+
+    // The value stream of an xlsx sheet never densifies, so it is not held to
+    // the budget at all.
+    let opened = upload(&client, "date.xlsx").await;
+    assert!(
+        range_stream_status(&client, &opened.workbook_id)
+            .await
+            .is_none()
+    );
+}
+
+/// ODS is densified by calamine while the workbook is opened, before the
+/// server sees a sheet, so its only bound there is calamine's own cell cap:
+/// the corners as ODS are refused at OpenWorkbook, and the server goes on.
+#[tokio::test]
+async fn ods_corners_are_refused_when_opened() {
+    let client = start_server().await;
+    let refused = try_upload(&client, "corners.ods")
+        .await
+        .expect_err("past calamine's cell cap");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    upload(&client, "date.ods").await;
+}

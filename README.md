@@ -210,11 +210,20 @@ first row. So the collected formulas are budgeted in bytes as well, text plus
 the slot that holds it, and a sheet past `GRPC_CALAMINE_MAX_FORMULA_BYTES` is
 refused with `RESOURCE_EXHAUSTED` before its first event.
 
-One cost stays outside that budget: calamine parses an XLS or ODS workbook
-into dense ranges while opening it, before the server sees a sheet. ODS is
-capped there by calamine itself at 100 million cells per sheet, past which
-`OpenWorkbook` is refused; XLS ranges are allocated fallibly by the fork's
-`Range::from_sparse`, but one that merely fits is still allocated in full.
+One cost stays outside that budget, and outside every other limit here:
+calamine parses an XLS or ODS workbook into dense ranges while opening it,
+before the server sees a sheet. XLS ranges are allocated fallibly by the
+fork's `Range::from_sparse`, but one that merely fits is still allocated in
+full. ODS is capped by calamine at 100 million cells per sheet, past which
+`OpenWorkbook` is refused, but nothing caps its bytes: a repeated cell or row
+(`table:number-columns-repeated`, `table:number-rows-repeated`) is a copy of
+the cell's value per repetition, so one long string repeated is that string
+many times over. An 823-byte .ods of one 4 KiB string repeated across 1,024
+columns and 16 rows opens as 64 MiB of strings, and the same recipe with
+larger counts goes as far as the cell cap times the string. That memory is
+held by the workbook's parked reader and is not charged against
+`GRPC_CALAMINE_MAX_STORE_BYTES`. Do not accept ODS uploads from untrusted
+clients until this is bounded.
 
 ## API
 

@@ -124,8 +124,13 @@ def p3_grpc(path, sheet, addr, use_dict=False):
         # contract guarantees every id is defined before its first use.
         table = []
 
+        # Width of the last row taken, so an expanded gap is as wide as the
+        # rows around it and the digest stays comparable with the other arms.
+        width = [0]
+
         def take(r):
             d.row()
+            width[0] = len(r.values)
             for c in r.values:
                 which = c.WhichOneof("value")
                 if which in ("string_value", "shared_string_value"):
@@ -161,6 +166,16 @@ def p3_grpc(path, sheet, addr, use_dict=False):
             elif k == "row":
                 msgs += 1
                 take(ev.row)
+            elif k == "row_gap":
+                # The other arms densify, so this one has to as well or the
+                # digests stop being comparable. That the expansion happens
+                # here rather than on the wire is the saving being measured:
+                # the gap is one message however many rows it stands for.
+                msgs += 1
+                for _ in range(ev.row_gap.row_count):
+                    d.row()
+                    for _ in range(width[0]):
+                        d.cell(None)
             elif k == "string_table":
                 assert ev.string_table.first_id == len(table), "chunks arrive in id order"
                 table.extend(ev.string_table.entries)

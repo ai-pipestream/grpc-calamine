@@ -165,12 +165,15 @@ WIDE = (
 """,
 )
 
-# Two cells at opposite corners of Excel's grid, A1 and XFD1048576, in a file
-# of about 2 KB. The 1,048,574 rows between them hold nothing. Spelled out at
-# the sheet's final width of 16,384 columns they are 17.2 billion empty cells,
-# which is what OOM-killed a densifying client, so each must arrive as a row
-# with no cells. calamine's own `worksheet_range` allocates the whole
-# rectangle, so the test compares against the two cells, not against it.
+# Two cells at opposite corners of Excel's grid, in a file of about 2 KB. The
+# rows between them hold nothing, and there are 1,048,574 of them. Spelling
+# each one out costs a message and a client-side object apiece: at the sheet's
+# final width of 16,384 that is 17.2 billion cells, which is what OOM-killed a
+# Node client. The whole run is one `row_gap` instead.
+#
+# calamine itself reports a 1,048,576 x 16,384 dense range for this file and
+# has to allocate it; the streaming path never does, which is why this fixture
+# is compared against calamine's *cells* rather than its rows.
 CORNERS = (
     "A1:XFD1048576",
     """<row r="1"><c r="A1"><v>1</v></c></row>
@@ -216,7 +219,7 @@ def ods_value(value: int) -> str:
 
 # A1 and D5 with rows 2-4 empty. ODS is parsed into a dense range, where every
 # row is as wide as the widest, so the three gap rows come out of calamine as
-# four empty cells apiece; they must still stream as rows with no cells.
+# four empty cells apiece; they must still stream as one `row_gap`.
 ODS_GAP = (
     f"<table:table-row>{ods_value(1)}</table:table-row>\n"
     '<table:table-row table:number-rows-repeated="3"><table:table-cell/></table:table-row>\n'
@@ -233,6 +236,38 @@ ODS_CORNERS = (
     '<table:table-row table:number-rows-repeated="1048574"><table:table-cell/></table:table-row>\n'
     '<table:table-row><table:table-cell table:number-columns-repeated="16383"/>'
     f"{ods_value(2)}</table:table-row>\n"
+)
+
+# Interior gaps of every awkward shape in one sheet: a single blank row, a run
+# of blanks, and a populated row immediately after another. Leading blanks
+# (rows 1-2) and trailing blanks (rows 21-30, declared but never written) are
+# trimmed rather than announced, so this pins both halves of the rule that a
+# gap only ever covers the space *between* two populated runs.
+GAPS = (
+    "A1:A30",
+    """<row r="3"><c r="A3"><v>3</v></c></row>
+<row r="4"><c r="A4"><v>4</v></c></row>
+<row r="6"><c r="A6"><v>6</v></c></row>
+<row r="20"><c r="A20"><v>20</v></c></row>
+""",
+)
+
+
+# Populated only from row 6 down, so a `HeaderRow::Row(2)` selection lands on a
+# blank row. calamine inserts a synthetic empty cell at the chosen row before
+# building the extent (xlsx/mod.rs:2702-2713), so its range then starts AT row 2
+# and is 5 rows tall, rather than snapping to the first populated row:
+#
+#   FirstNonEmptyRow -> start=(5,0) end=(6,0) height=2
+#   Row(2)           -> start=(2,0) end=(6,0) height=5
+#
+# The streaming path has to say the same thing, which it does by announcing
+# rows 2-4 as a gap. This is the one case where a gap leads a stream.
+BLANK_HEADER = (
+    "A1:A10",
+    """<row r="6"><c r="A6"><v>6</v></c></row>
+<row r="7"><c r="A7"><v>7</v></c></row>
+""",
 )
 
 
@@ -271,10 +306,12 @@ if __name__ == "__main__":
     write("corners_formula.xlsx", *CORNERS_FORMULA)
     write_ods("gap.ods", ODS_GAP)
     write_ods("corners.ods", ODS_CORNERS)
+    write("rows_with_gaps.xlsx", *GAPS)
+    write("blank_header_row.xlsx", *BLANK_HEADER)
     print(
         "wrote dimension_inflated.xlsx dimension_underdeclared.xlsx "
         "dimension_shifted.xlsx dimension_offset.xlsx dimension_reversed.xlsx "
         "dimension_wide.xlsx rows_out_of_order.xlsx rows_descending.xlsx "
         "rows_late_backwards.xlsx corners.xlsx corners_formula.xlsx gap.ods "
-        "corners.ods"
+        "corners.ods rows_with_gaps.xlsx blank_header_row.xlsx"
     )

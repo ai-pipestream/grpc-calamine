@@ -64,6 +64,23 @@ stream.on("data", (message) => {
     case "rows":
       message.rows.rows.forEach(printRow);
       break;
+    // A run of rows holding nothing. Only rows with values arrive as rows, so
+    // ignoring this case loses no data: `rowIndex` is absolute, so every row
+    // still prints against the right number. A viewer building a dense grid
+    // expands it into blank rows; this one just says how many it skipped,
+    // which is the whole point of the event. Try it on corners.xlsx, where
+    // one line stands in for 1,048,574 rows.
+    case "rowGap": {
+      const { firstRowIndex, rowCount: n } = message.rowGap;
+      const first = firstRowIndex + 1;
+      const num = (v) => v.toLocaleString("en-US");
+      const what =
+        n === 1
+          ? `empty row ${num(first)}`
+          : `${num(n)} empty rows, ${num(first)}-${num(first + n - 1)}`;
+      console.log(`${"⋮".padStart(6)} │ (${what})`);
+      break;
+    }
     case "error":
       console.error("in-band error:", message.error.error?.kind, message.error.error?.message);
       if (message.error.terminal) process.exitCode = 1;

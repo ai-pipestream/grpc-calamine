@@ -14,8 +14,11 @@
 # No protoc and no buf. Code generation happens at development time (see
 # buf.gen.yaml) and the generated Rust plus the descriptor set are checked in
 # under src/gen/, so the image build needs a Rust toolchain and nothing else.
+#
+# Both base images are pinned by digest (the multi-arch index) as well as by
+# tag, so a rebuild gets the bytes that were tested; bump them on purpose.
 # ---------------------------------------------------------------------------
-FROM dhi.io/rust:1 AS builder
+FROM dhi.io/rust:1@sha256:7752378607f81d7eb26672a51ed859710f30dfc15c78f8d69d583b3044f43e9e AS builder
 
 # The hardened toolchain image runs as a nonroot user; the build needs to
 # write only under /src and the cargo home, so give it a writable workspace.
@@ -48,7 +51,7 @@ RUN cargo build --release --locked
 # job over gRPC reflection or a real RPC rather than a Dockerfile
 # HEALTHCHECK, because there is no shell here to run one with.
 # ---------------------------------------------------------------------------
-FROM dhi.io/debian-base:trixie-debian13
+FROM dhi.io/debian-base:trixie-debian13@sha256:37c729a9adb353a03b6b51fa020f1c935e078197c476f132d7aeb3449b336d94
 
 COPY --from=builder /src/target/release/grpc-calamine /usr/local/bin/grpc-calamine
 

@@ -276,7 +276,7 @@ contract.
 ### Building against patched calamine
 
 The API used is calamine 0.36, but `Cargo.toml` carries a
-`[patch.crates-io]` pointing at [`ai-pipestream/calamine`][fork]
+`[patch.crates-io]` pinned to a commit of [`ai-pipestream/calamine`][fork]
 `pipestream-main`, which is upstream `master` with three fix branches
 merged:
 

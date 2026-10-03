@@ -217,13 +217,19 @@ client.close_workbook(CloseWorkbookRequest {
 ## Building from source
 
 Rust stable, the [buf](https://buf.build/docs/installation) CLI, and the
-codegen plugins (`cargo install protoc-gen-prost protoc-gen-tonic`).
+codegen plugins at the versions that produced `src/gen`
+(`cargo install --locked protoc-gen-prost@0.5.0 protoc-gen-tonic@0.5.0`).
 
 ```bash
 buf lint && buf generate   # after editing anything under proto/
+buf build -o src/gen/calamine/v1/calamine.v1.binpb   # the reflection descriptor
 cargo build
 cargo test                 # unit + end-to-end streaming tests
 ```
+
+CI regenerates both and fails if `src/gen` differs from what is checked in,
+so the code and the descriptor that reflection serves cannot drift from the
+contract.
 
 ### Building against patched calamine
 

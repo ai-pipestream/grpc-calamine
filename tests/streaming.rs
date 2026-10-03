@@ -318,7 +318,7 @@ async fn open_workbook_reports_format_and_metadata() {
         .into_inner();
     assert_eq!(again.metadata, opened.metadata);
 
-    // The response carries the shared-shell frontend advertisement.
+    // The response carries the frontend advertisement.
     let ui = again.ui.expect("ui info");
     assert_eq!(ui.title, "Calamine");
     assert_eq!(ui.path, "/ui/calamine");

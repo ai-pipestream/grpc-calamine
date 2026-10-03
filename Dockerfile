@@ -40,9 +40,9 @@ RUN cargo build --release --locked
 #   docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
 #     -p 50062:50062 grpc-calamine
 #
-# The in-code default listen address predates the fleet port registry and is
-# still 50051; the image pins the registered port (50062, see the workspace
-# AGENTS.md) through the same env var the binary reads.
+# The image sets the listen address explicitly, through the same env var the
+# binary reads, so it stays on 50062 (the in-code default as well) even if
+# that default ever moves.
 #
 # There is no health service registered, so checking is the orchestrator's
 # job over gRPC reflection or a real RPC rather than a Dockerfile

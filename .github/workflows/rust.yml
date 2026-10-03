@@ -49,7 +49,19 @@ jobs:
     - uses: bufbuild/buf-action@v1
       with:
         setup_only: true
+        # Pinned so the descriptor comparison below is against one encoder.
+        version: 1.71.0
     - name: Lint the protobuf contract
       run: |
         buf lint
         buf build
+    # src/gen is checked in, so nothing else notices when it falls behind the
+    # contract: reflection once served comments the protos no longer had.
+    - name: Install the codegen plugins
+      run: cargo install --locked protoc-gen-prost@0.5.0 protoc-gen-tonic@0.5.0
+    - name: Generated code and descriptor match the contract
+      run: |
+        buf generate
+        buf build -o src/gen/calamine/v1/calamine.v1.binpb
+        git status --short -- src/gen
+        test -z "$(git status --porcelain -- src/gen)"

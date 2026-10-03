@@ -683,7 +683,9 @@ pub struct CloseWorkbookResponse {
 /// GetMetadataRequest selects the workbook whose metadata is requested.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetMetadataRequest {
-    /// Handle returned by `OpenWorkbook`.
+    /// Handle returned by `OpenWorkbook`. Leave empty for the service-level
+    /// probe: the response then carries only the UiInfo block, so hosts can
+    /// discover the web UI without opening a workbook.
     #[prost(string, tag="1")]
     pub workbook_id: ::prost::alloc::string::String,
 }

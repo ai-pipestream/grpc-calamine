@@ -76,6 +76,11 @@ const MAX_DRAWING_BYTES: usize = 16 * 1024 * 1024;
 /// Largest relationships part read to resolve its image targets.
 const MAX_RELS_BYTES: usize = 4 * 1024 * 1024;
 
+/// Most bytes of drawing and relationships parts the anchor scan will read in
+/// one workbook, so a crafted archive of many structural parts cannot make the
+/// scan itself do unbounded work. Real workbooks stay far under this.
+const MAX_TOTAL_STRUCTURAL_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Bounds on what opening one workbook may inflate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InflateLimits {
@@ -198,8 +203,15 @@ pub fn inspect(bytes: &[u8], limits: &InflateLimits) -> Result<Inflated, Rejecte
     // Pass 1: measure each distinct media entry once, validate the
     // shared-string table, and index the archive so pass 2 can read the
     // drawing parts by name.
+    //
+    // Each media is inflated only as far as the picture total still has room
+    // for, so the work here is bounded by that total however many media the
+    // archive holds: a media calamine clones even once already counts against
+    // the total, so distinct media summing past it are refused now rather than
+    // inflated in full first.
     let mut media: HashMap<String, u64> = HashMap::new();
     let mut by_lc: HashMap<String, usize> = HashMap::new();
+    let mut media_total = 0u64;
     for index in 0..zip.len() {
         let Ok(mut entry) = zip.by_index(index) else {
             continue;
@@ -208,12 +220,23 @@ pub fn inspect(bytes: &[u8], limits: &InflateLimits) -> Result<Inflated, Rejecte
         match classify(entry.name()) {
             Some(Part::Picture) => {
                 let name = quoted(entry.name());
-                let size = inflated_size(&mut entry, limits.max_picture_bytes).ok_or(
-                    Rejected::Limit(LimitExceeded::Picture {
-                        name,
-                        max: limits.max_picture_bytes,
-                    }),
-                )?;
+                let room = limits.max_picture_total_bytes.saturating_sub(media_total);
+                let limit = limits.max_picture_bytes.min(room);
+                let size = match inflated_size(&mut entry, limit) {
+                    Some(size) => size,
+                    None if limit == limits.max_picture_bytes => {
+                        return Err(Rejected::Limit(LimitExceeded::Picture {
+                            name,
+                            max: limits.max_picture_bytes,
+                        }));
+                    }
+                    None => {
+                        return Err(Rejected::Limit(LimitExceeded::PictureTotal {
+                            max: limits.max_picture_total_bytes,
+                        }));
+                    }
+                };
+                media_total = media_total.saturating_add(size);
                 media.insert(lc.clone(), size);
             }
             Some(Part::SharedStrings) => {
@@ -386,12 +409,22 @@ fn charge_pictures<R: Read + Seek>(
         return Ok(0);
     }
     let mut total = 0u64;
+    let mut scanned = 0u64;
     let mut seen: HashSet<&str> = HashSet::new();
     let mut drawings: Vec<&String> = by_lc.keys().filter(|p| is_drawing(p)).collect();
     drawings.sort(); // deterministic refusal on crafted archives
     for drawing in drawings {
         let rid_to_media = match rels_sibling(drawing).and_then(|r| Some((by_lc.get(&r)?, r))) {
-            Some((&idx, name)) => rels_image_map(zip, idx, parent(drawing), &name)?,
+            Some((&idx, name)) => {
+                let Some(bytes) = read_capped(zip, idx, MAX_RELS_BYTES) else {
+                    return Err(Rejected::Malformed {
+                        part: quoted(&name),
+                        detail: format!("relationships part exceeds {MAX_RELS_BYTES} bytes"),
+                    });
+                };
+                scanned = scanned.saturating_add(bytes.len() as u64);
+                rels_image_map(&bytes, parent(drawing))
+            }
             None => HashMap::new(),
         };
         let &idx = by_lc.get(drawing).expect("drawing key came from by_lc");
@@ -403,6 +436,16 @@ fn charge_pictures<R: Read + Seek>(
                 ),
             });
         };
+        scanned = scanned.saturating_add(xml.len() as u64);
+        if scanned > MAX_TOTAL_STRUCTURAL_BYTES {
+            return Err(Rejected::Malformed {
+                part: quoted(drawing),
+                detail: format!(
+                    "drawing and relationship parts exceed {MAX_TOTAL_STRUCTURAL_BYTES} bytes \
+                     together, too much to validate"
+                ),
+            });
+        }
         for rid in blip_embeds(&xml) {
             // `key` borrows `media`, which outlives the per-drawing maps, so a
             // charged media stays recorded in `seen` across drawings.
@@ -467,20 +510,9 @@ fn read_capped<R: Read + Seek>(
 
 /// Map relationship id -> resolved media path for every image relationship in
 /// a `.rels` part, resolving each `Target` against `base`.
-fn rels_image_map<R: Read + Seek>(
-    zip: &mut zip::ZipArchive<R>,
-    index: usize,
-    base: &str,
-    name: &str,
-) -> Result<HashMap<String, String>, Rejected> {
-    let Some(bytes) = read_capped(zip, index, MAX_RELS_BYTES) else {
-        return Err(Rejected::Malformed {
-            part: quoted(name),
-            detail: format!("relationships part exceeds {MAX_RELS_BYTES} bytes"),
-        });
-    };
+fn rels_image_map(bytes: &[u8], base: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    let mut reader = Reader::from_reader(bytes.as_slice());
+    let mut reader = Reader::from_reader(bytes);
     reader.config_mut().check_end_names = false;
     let mut buf = Vec::new();
     loop {
@@ -509,7 +541,7 @@ fn rels_image_map<R: Read + Seek>(
         }
         buf.clear();
     }
-    Ok(map)
+    map
 }
 
 /// The `r:embed` relationship id of every DrawingML `blip` element, in order,

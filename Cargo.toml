@@ -22,6 +22,10 @@ tonic = { version = "0.14.6", features = ["gzip", "zstd"] }
 tonic-prost = "0.14.6"
 tonic-reflection = "0.14.6"
 uuid = { version = "1.24.0", features = ["v4"] }
+# Already in the tree through calamine, with the same features, so this adds
+# no crate: the server reads the package itself first, to bound what calamine
+# inflates when it opens one (src/archive.rs).
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tokio-stream = { version = "0.1.19", features = ["net"] }

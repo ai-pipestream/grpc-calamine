@@ -15,6 +15,7 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::{Endpoint, Server};
 use tonic::{Code, Status};
 
+use grpc_calamine::archive::InflateLimits;
 use grpc_calamine::proto::v1 as pb;
 use grpc_calamine::proto::v1::calamine_service_client::CalamineServiceClient;
 use grpc_calamine::store::StoreLimits;
@@ -1703,4 +1704,237 @@ async fn a_stalled_upload_is_abandoned_and_frees_its_slot() {
     drop(frames);
 
     upload(&client, "date.xlsx").await;
+}
+
+// ---------------------------------------------------------------------------
+// What calamine inflates at open time.
+//
+// calamine reads every embedded picture, and the shared-string table, whole
+// while it opens a package, before any sheet is asked for. A few KB of
+// deflated zeros can claim gigabytes there, so the server inflates those
+// parts into nothing first and refuses the workbook past its limits. The
+// packages below are built here rather than checked in, because what they
+// test is their recipe: how far each part inflates.
+// ---------------------------------------------------------------------------
+
+/// The parts of the smallest package calamine opens as xlsx: one sheet
+/// holding A1 = 1.
+const MINIMAL_XLSX: [(&str, &str); 5] = [
+    (
+        "[Content_Types].xml",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Default Extension="png" ContentType="image/png"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"#,
+    ),
+    (
+        "_rels/.rels",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#,
+    ),
+    (
+        "xl/workbook.xml",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#,
+    ),
+    (
+        "xl/_rels/workbook.xml.rels",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#,
+    ),
+    (
+        "xl/worksheets/sheet1.xml",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+</worksheet>"#,
+    ),
+];
+
+/// The minimal xlsx plus `extra` parts, every part deflated.
+fn xlsx_with_parts(extra: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let base = MINIMAL_XLSX
+        .iter()
+        .map(|(name, body)| (*name, body.as_bytes()));
+    let extra = extra.iter().map(|(name, body)| (*name, body.as_slice()));
+    for (name, body) in base.chain(extra) {
+        zip.start_file(name, deflated).expect("start part");
+        zip.write_all(body).expect("write part");
+    }
+    zip.finish().expect("finish package").into_inner()
+}
+
+/// A server whose inflation limits are `inflate` and nothing else changed.
+async fn start_server_inflating(
+    inflate: InflateLimits,
+) -> CalamineServiceClient<tonic::transport::Channel> {
+    let store = WorkbookStore::with_limits(StoreLimits {
+        inflate,
+        ..StoreLimits::default()
+    });
+    start_server_with(CalamineGrpc::new(store)).await
+}
+
+const MIB: usize = 1024 * 1024;
+
+/// One picture of 4 MiB of zeros deflates to a few KB, and calamine would
+/// `read_to_end` it while opening the workbook, for every reader. Past the
+/// per-picture limit it is refused before calamine sees it, and the server
+/// goes on serving.
+#[tokio::test]
+async fn a_picture_bomb_is_refused_before_calamine_inflates_it() {
+    let client = start_server_inflating(InflateLimits {
+        max_picture_bytes: MIB as u64,
+        ..InflateLimits::default()
+    })
+    .await;
+    let bomb = xlsx_with_parts(&[("xl/media/image1.png", vec![0; 4 * MIB])]);
+    assert!(bomb.len() < 64 * 1024, "the upload itself is small");
+
+    let refused = try_upload_bytes(&client, bomb, default_options())
+        .await
+        .expect_err("the picture inflates past its limit");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    assert!(
+        refused.message().contains("xl/media/image1.png")
+            && refused
+                .message()
+                .contains("GRPC_CALAMINE_MAX_PICTURE_BYTES"),
+        "{}",
+        refused.message()
+    );
+
+    upload(&client, "date.xlsx").await;
+}
+
+/// Pictures each under the per-picture limit can still add up past the
+/// per-workbook one.
+#[tokio::test]
+async fn pictures_past_the_workbook_total_are_refused() {
+    let client = start_server_inflating(InflateLimits {
+        max_picture_bytes: MIB as u64,
+        max_picture_total_bytes: MIB as u64,
+        ..InflateLimits::default()
+    })
+    .await;
+    let pictures: Vec<(&str, Vec<u8>)> = ["xl/media/image1.png", "xl/media/image2.png"]
+        .into_iter()
+        .map(|name| (name, vec![0; 3 * MIB / 4]))
+        .collect();
+
+    let refused = try_upload_bytes(&client, xlsx_with_parts(&pictures), default_options())
+        .await
+        .expect_err("two pictures of 0.75 MiB pass a 1 MiB total");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    assert!(
+        refused
+            .message()
+            .contains("GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES"),
+        "{}",
+        refused.message()
+    );
+}
+
+/// The shared-string table is read whole at open as well, into owned
+/// strings, so it is held to its own limit.
+#[tokio::test]
+async fn a_shared_string_bomb_is_refused() {
+    let client = start_server_inflating(InflateLimits {
+        max_shared_strings_bytes: MIB as u64,
+        ..InflateLimits::default()
+    })
+    .await;
+    let mut table =
+        br#"<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>"#
+            .to_vec();
+    table.resize(table.len() + 4 * MIB, b'A');
+    table.extend_from_slice(b"</t></si></sst>");
+
+    let refused = try_upload_bytes(
+        &client,
+        xlsx_with_parts(&[("xl/sharedStrings.xml", table)]),
+        default_options(),
+    )
+    .await
+    .expect_err("the table inflates past its limit");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    assert!(
+        refused
+            .message()
+            .contains("GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES"),
+        "{}",
+        refused.message()
+    );
+}
+
+/// Pictures stay in memory with every reader, so the store charges them to
+/// the workbook along with its upload: a few KB on the wire can be most of
+/// a budget once inflated.
+#[tokio::test]
+async fn inflated_pictures_count_against_the_store_budget() {
+    let store = WorkbookStore::with_limits(StoreLimits {
+        max_store_bytes: (MIB / 2) as u64,
+        ..StoreLimits::default()
+    });
+    let client = start_server_with(CalamineGrpc::new(store)).await;
+    let package = xlsx_with_parts(&[("xl/media/image1.png", vec![0; MIB])]);
+    assert!(package.len() < MIB / 2, "the upload alone fits");
+
+    let refused = try_upload_bytes(&client, package, default_options())
+        .await
+        .expect_err("the inflated picture does not");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    assert!(
+        refused.message().contains("GRPC_CALAMINE_MAX_STORE_BYTES"),
+        "{}",
+        refused.message()
+    );
+}
+
+/// Pictures within the limits open and come back intact from GetPictures.
+#[tokio::test]
+async fn pictures_within_the_limits_are_served() {
+    let mut client = start_server().await;
+    let image: Vec<u8> = (0..=255u8).cycle().take(64 * 1024).collect();
+    let opened = try_upload_bytes(
+        &client,
+        xlsx_with_parts(&[("xl/media/image1.png", image.clone())]),
+        default_options(),
+    )
+    .await
+    .expect("open");
+
+    let mut stream = client
+        .get_pictures(pb::GetPicturesRequest {
+            workbook_id: opened.workbook_id,
+        })
+        .await
+        .expect("get pictures")
+        .into_inner();
+    let mut pictures = Vec::new();
+    while let Some(event) = stream.message().await.expect("stream event") {
+        match event.event.expect("event kind") {
+            pb::get_pictures_response::Event::Picture(picture) => pictures.push(picture),
+            pb::get_pictures_response::Event::Error(err) => {
+                panic!("unexpected in-band error: {:?}", err.error)
+            }
+        }
+    }
+    assert_eq!(pictures.len(), 1);
+    assert_eq!(pictures[0].extension, "png");
+    assert_eq!(pictures[0].data, image);
 }

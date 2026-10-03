@@ -32,6 +32,9 @@
 //! many workbooks are open and how many bytes they hold, refusing an open past
 //! either, and closes a workbook nobody has used for the idle TTL. A workbook
 //! an RPC is still reading is never idle, however long the read takes.
+//!
+//! What calamine inflates while opening a workbook is bounded too, before
+//! calamine is asked to: see [`crate::archive`].
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -43,6 +46,7 @@ use calamine::{
     open_workbook_from_rs,
 };
 
+use crate::archive::{self, InflateLimits};
 use crate::convert;
 use crate::proto::v1 as pb;
 
@@ -135,11 +139,14 @@ pub struct StoreLimits {
     /// Most workbooks open at once. Opening one more is refused.
     pub max_open_workbooks: usize,
     /// Most bytes the open workbooks may hold together, counting each one's
-    /// uploaded bytes. Opening a workbook that would pass it is refused.
+    /// uploaded bytes and the pictures inflated from them, which its parked
+    /// reader keeps. Opening a workbook that would pass it is refused.
     pub max_store_bytes: u64,
     /// How long a workbook may go unused before it is closed on its client's
     /// behalf. Zero keeps every workbook until it is closed.
     pub idle_ttl: Duration,
+    /// What opening one workbook may inflate.
+    pub inflate: InflateLimits,
 }
 
 impl Default for StoreLimits {
@@ -148,6 +155,7 @@ impl Default for StoreLimits {
             max_open_workbooks: DEFAULT_MAX_OPEN_WORKBOOKS,
             max_store_bytes: DEFAULT_MAX_STORE_BYTES,
             idle_ttl: DEFAULT_IDLE_TTL,
+            inflate: InflateLimits::default(),
         }
     }
 }
@@ -172,6 +180,25 @@ pub enum LimitExceeded {
         /// [`StoreLimits::max_store_bytes`].
         max: u64,
     },
+    /// One embedded picture inflates past the per-picture limit.
+    Picture {
+        /// The picture's entry in the package.
+        name: String,
+        /// [`InflateLimits::max_picture_bytes`].
+        max: u64,
+    },
+    /// The embedded pictures together inflate past the per-workbook limit.
+    PictureTotal {
+        /// [`InflateLimits::max_picture_total_bytes`].
+        max: u64,
+    },
+    /// The shared-string table inflates past its limit.
+    SharedStrings {
+        /// The table's entry in the package.
+        name: String,
+        /// [`InflateLimits::max_shared_strings_bytes`].
+        max: u64,
+    },
 }
 
 impl std::fmt::Display for LimitExceeded {
@@ -188,6 +215,21 @@ impl std::fmt::Display for LimitExceeded {
                 "this workbook needs {needed} bytes and open workbooks already hold \
                  {held} of the {max} this server keeps; close handles that are no \
                  longer needed, retry shortly, or raise GRPC_CALAMINE_MAX_STORE_BYTES"
+            ),
+            Self::Picture { name, max } => write!(
+                f,
+                "embedded picture {name:?} inflates past {max} bytes, the most one \
+                 picture may (GRPC_CALAMINE_MAX_PICTURE_BYTES)"
+            ),
+            Self::PictureTotal { max } => write!(
+                f,
+                "the embedded pictures inflate past {max} bytes together, the most \
+                 one workbook's pictures may (GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES)"
+            ),
+            Self::SharedStrings { name, max } => write!(
+                f,
+                "shared-string table {name:?} inflates past {max} bytes, the most \
+                 this server reads (GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES)"
             ),
         }
     }
@@ -492,10 +534,11 @@ impl WorkbookStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Limit`] when the store has no room for the workbook,
-    /// checked before anything is parsed, and [`StoreError::Unreadable`] when
-    /// the bytes cannot be parsed as a workbook (or as the specific format
-    /// given by `format_hint`).
+    /// [`StoreError::Limit`] when the workbook would inflate too much or the
+    /// store has no room for it, both checked before calamine parses
+    /// anything, and [`StoreError::Unreadable`] when the bytes cannot be
+    /// parsed as a workbook (or as the specific format given by
+    /// `format_hint`).
     ///
     /// # Panics
     ///
@@ -506,7 +549,10 @@ impl WorkbookStore {
         format_hint: pb::WorkbookFormat,
         header_row: Option<HeaderRow>,
     ) -> Result<(String, Arc<WorkbookEntry>), StoreError> {
-        let held_bytes = bytes.len() as u64;
+        // What calamine would inflate is measured before calamine is allowed
+        // to, and the pictures every reader keeps are charged to the workbook.
+        let inflated = archive::inspect(&bytes, &self.limits.inflate)?;
+        let held_bytes = (bytes.len() as u64).saturating_add(inflated.picture_bytes);
         let reservation = self.reserve(held_bytes)?;
         let bytes: WorkbookBytes = bytes.into();
 
@@ -703,6 +749,7 @@ mod tests {
             max_open_workbooks,
             max_store_bytes,
             idle_ttl,
+            inflate: InflateLimits::default(),
         }
     }
 

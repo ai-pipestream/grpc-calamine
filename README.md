@@ -99,6 +99,9 @@ slower.
 | `GRPC_CALAMINE_MAX_OPEN_WORKBOOKS` | `256`        | workbooks open at once                      |
 | `GRPC_CALAMINE_MAX_STORE_BYTES`  | `2147483648`   | bytes the open workbooks hold together (2 GiB) |
 | `GRPC_CALAMINE_HANDLE_TTL_SECS`  | `300`          | idle seconds before a workbook is closed; `0` never |
+| `GRPC_CALAMINE_MAX_PICTURE_BYTES` | `67108864`    | largest embedded picture, inflated (64 MiB) |
+| `GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES` | `268435456` | one workbook's pictures together, inflated (256 MiB) |
+| `GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES` | `1073741824` | largest shared-string table, inflated (1 GiB) |
 
 The window default is 50 MiB because window size over round-trip time caps
 upload throughput; hyper's 1 MiB default holds a 10 ms link near 100 MB/s.
@@ -125,6 +128,20 @@ slots, since each buffers its workbook in memory until it is parsed, and an
 upload that sends nothing for 30 s is abandoned with `DEADLINE_EXCEEDED` so
 it cannot hold a slot forever. The server logs each time it closes idle
 workbooks, with how many remain open and what they hold.
+
+Some parts of a workbook are read whole while calamine opens it, before any
+sheet is asked for: every embedded picture (the server is built with
+calamine's `picture` feature) and the shared-string table. Deflate reaches
+about 1,000:1 and the zip format's recorded sizes come from the uploader,
+so a 5 MB upload could claim 5 GB there, and an allocation that size aborts
+the process rather than failing the request. So the server inflates those
+parts first, into nothing, counting, and refuses the workbook with
+`RESOURCE_EXHAUSTED` past `GRPC_CALAMINE_MAX_PICTURE_BYTES` for one picture,
+`GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES` for all of them, or
+`GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES` for the table. That costs one extra
+inflation of those parts per open. The pictures that pass are charged
+against `GRPC_CALAMINE_MAX_STORE_BYTES` along with the upload, since the
+workbook's parked reader keeps them.
 
 Hard limits (compile-time, `src/service.rs`): 512 MiB max workbook upload,
 32 MiB max gRPC frame, 64-event stream backpressure channel, 8 MiB per row

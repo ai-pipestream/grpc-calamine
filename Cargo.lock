@@ -294,6 +294,7 @@ dependencies = [
  "tonic-prost",
  "tonic-reflection",
  "uuid",
+ "zip",
 ]
 
 [[package]]

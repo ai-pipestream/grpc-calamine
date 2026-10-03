@@ -20,11 +20,19 @@
 //!   together (default: 2 GiB), refused past it the same way.
 //! - `GRPC_CALAMINE_HANDLE_TTL_SECS`: seconds a workbook may go unused
 //!   before it is closed for its client (default: 300; 0 never expires).
+//! - `GRPC_CALAMINE_MAX_PICTURE_BYTES`: largest embedded picture, inflated,
+//!   that opening a workbook may read (default: 64 MiB).
+//! - `GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES`: most inflated bytes of one
+//!   workbook's pictures together (default: 256 MiB).
+//! - `GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES`: largest shared-string table,
+//!   inflated (default: 1 GiB). A workbook past any of the three is refused
+//!   at `OpenWorkbook` with `RESOURCE_EXHAUSTED`.
 
 use std::time::Duration;
 
 use tonic::transport::Server;
 
+use grpc_calamine::archive::InflateLimits;
 use grpc_calamine::store::StoreLimits;
 use grpc_calamine::{CalamineGrpc, WorkbookStore, proto};
 
@@ -89,6 +97,20 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             "GRPC_CALAMINE_HANDLE_TTL_SECS",
             defaults.idle_ttl.as_secs(),
         )),
+        inflate: InflateLimits {
+            max_picture_bytes: env_u64(
+                "GRPC_CALAMINE_MAX_PICTURE_BYTES",
+                defaults.inflate.max_picture_bytes,
+            ),
+            max_picture_total_bytes: env_u64(
+                "GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES",
+                defaults.inflate.max_picture_total_bytes,
+            ),
+            max_shared_strings_bytes: env_u64(
+                "GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES",
+                defaults.inflate.max_shared_strings_bytes,
+            ),
+        },
     };
 
     // Streaming reads are capped well below the blocking pool so they can

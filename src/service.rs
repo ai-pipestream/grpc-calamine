@@ -21,7 +21,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::convert;
 use crate::proto::v1 as pb;
 use crate::proto::v1::calamine_service_server::{CalamineService, CalamineServiceServer};
-use crate::store::{WorkbookEntry, WorkbookStore};
+use crate::store::{StoreError, WorkbookEntry, WorkbookStore};
 
 /// Default upper bound on the uploaded workbook size: 512 MiB.
 const DEFAULT_MAX_WORKBOOK_BYTES: usize = 512 * 1024 * 1024;
@@ -45,6 +45,22 @@ const CONSUMER_STALL: std::time::Duration = std::time::Duration::from_secs(30);
 /// each other, but they can never take the whole blocking pool and with it the
 /// unary RPCs.
 const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 128;
+
+/// Default cap on uploads in progress at once.
+///
+/// Every upload buffers its workbook in memory until it is parsed, up to
+/// [`DEFAULT_MAX_WORKBOOK_BYTES`] each, and none of it is counted against the
+/// store until then, so without a cap the number of uploads alone decides how
+/// much memory is committed.
+const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 16;
+
+/// How long an upload may go without a frame before it is abandoned.
+///
+/// The upload cap makes a stalled upload expensive: it holds a slot, and a
+/// handful of clients that open uploads and never finish them would otherwise
+/// lock every other client out. Same reasoning, and same bound, as
+/// [`CONSUMER_STALL`] on the read side.
+const UPLOAD_STALL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Rows the server will pack into one `rows` event when the caller does not
 /// choose. Only reached while the consumer is behind; a consumer that keeps up
@@ -163,6 +179,12 @@ pub struct CalamineGrpc {
     /// its whole life, so the number of blocking-pool threads this service can
     /// occupy is bounded and the unary RPCs always have threads left.
     stream_slots: Arc<tokio::sync::Semaphore>,
+    /// Admission control for uploads. An upload holds a permit from its first
+    /// frame until its workbook is parsed, so the memory buffered by uploads
+    /// in flight is bounded by the cap times the upload size limit.
+    upload_slots: Arc<tokio::sync::Semaphore>,
+    /// How long an upload may go without a frame.
+    upload_stall: std::time::Duration,
 }
 
 impl CalamineGrpc {
@@ -173,6 +195,8 @@ impl CalamineGrpc {
             store: Arc::new(store),
             max_workbook_bytes: DEFAULT_MAX_WORKBOOK_BYTES,
             stream_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONCURRENT_STREAMS)),
+            upload_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONCURRENT_UPLOADS)),
+            upload_stall: UPLOAD_STALL,
         }
     }
 
@@ -192,6 +216,43 @@ impl CalamineGrpc {
     pub fn with_max_concurrent_streams(mut self, max: usize) -> Self {
         self.stream_slots = Arc::new(tokio::sync::Semaphore::new(max));
         self
+    }
+
+    /// Override how many uploads may be in progress at once.
+    ///
+    /// An upload past the cap is refused immediately with
+    /// `RESOURCE_EXHAUSTED`, before it has buffered anything.
+    #[must_use]
+    pub fn with_max_concurrent_uploads(mut self, max: usize) -> Self {
+        self.upload_slots = Arc::new(tokio::sync::Semaphore::new(max));
+        self
+    }
+
+    /// Override how long an upload may go without a frame before it is
+    /// abandoned with `DEADLINE_EXCEEDED` and its slot released.
+    #[must_use]
+    pub fn with_upload_stall(mut self, stall: std::time::Duration) -> Self {
+        self.upload_stall = stall;
+        self
+    }
+
+    /// Start the task that closes workbooks left idle past the store's TTL;
+    /// see [`WorkbookStore::spawn_reaper`]. Call it from inside the tokio
+    /// runtime that serves the service.
+    pub fn spawn_reaper(&self) -> Option<tokio::task::JoinHandle<()>> {
+        WorkbookStore::spawn_reaper(&self.store)
+    }
+
+    /// Take an upload slot, or refuse the upload.
+    fn admit_upload(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
+        Arc::clone(&self.upload_slots)
+            .try_acquire_owned()
+            .map_err(|_| {
+                Status::resource_exhausted(
+                    "too many uploads in progress; retry shortly or raise \
+                     GRPC_CALAMINE_MAX_CONCURRENT_UPLOADS",
+                )
+            })
     }
 
     /// Take a streaming slot, or refuse the request.
@@ -286,6 +347,21 @@ fn resolve_sheet_name(
             .map(|s| s.name.clone())
             .ok_or_else(|| Status::not_found(format!("no sheet at index {i}"))),
         None => Err(Status::invalid_argument("sheet selector is empty")),
+    }
+}
+
+/// The next upload frame, or `DEADLINE_EXCEEDED` once the client has sent
+/// nothing for `stall`.
+async fn next_frame(
+    stream: &mut Streaming<pb::OpenWorkbookRequest>,
+    stall: std::time::Duration,
+) -> Result<Option<pb::OpenWorkbookRequest>, Status> {
+    match tokio::time::timeout(stall, stream.message()).await {
+        Ok(frame) => frame,
+        Err(_) => Err(Status::deadline_exceeded(format!(
+            "the client sent nothing for {stall:?} in the middle of an upload; \
+             abandoning it so its upload slot can be reused"
+        ))),
     }
 }
 
@@ -1382,11 +1458,14 @@ impl CalamineService for CalamineGrpc {
         &self,
         request: Request<Streaming<pb::OpenWorkbookRequest>>,
     ) -> Result<Response<pb::OpenWorkbookResponse>, Status> {
+        // Admitted before a single frame is read, so a refused upload has
+        // buffered nothing. The permit moves into the parse below and is
+        // released when the workbook is parsed, or when the client leaves.
+        let permit = self.admit_upload()?;
         let mut stream = request.into_inner();
 
         // First frame must carry the options.
-        let first = stream
-            .message()
+        let first = next_frame(&mut stream, self.upload_stall)
             .await?
             .ok_or_else(|| Status::invalid_argument("empty upload: no frames received"))?;
         let Some(pb::open_workbook_request::Payload::Options(options)) = first.payload else {
@@ -1403,15 +1482,21 @@ impl CalamineService for CalamineGrpc {
 
         // Remaining frames are file bytes; held in memory only.
         let mut bytes = Vec::new();
-        while let Some(frame) = stream.message().await? {
+        while let Some(frame) = next_frame(&mut stream, self.upload_stall).await? {
             match frame.payload {
                 Some(pb::open_workbook_request::Payload::Chunk(chunk)) => {
-                    if bytes.len() + chunk.len() > self.max_workbook_bytes {
+                    let len = bytes.len() + chunk.len();
+                    if len > self.max_workbook_bytes {
                         return Err(Status::resource_exhausted(format!(
                             "workbook exceeds the {} byte limit",
                             self.max_workbook_bytes
                         )));
                     }
+                    // Refused as soon as it cannot fit, not after it has been
+                    // buffered whole only to be turned away.
+                    self.store
+                        .admits(len as u64)
+                        .map_err(|limit| Status::resource_exhausted(limit.to_string()))?;
                     bytes.extend_from_slice(&chunk);
                 }
                 _ => {
@@ -1426,11 +1511,20 @@ impl CalamineService for CalamineGrpc {
         }
 
         let store = Arc::clone(&self.store);
-        let (id, entry) =
-            tokio::task::spawn_blocking(move || store.open(bytes, format_hint, header_row))
-                .await
-                .map_err(|e| Status::internal(format!("parser task failed: {e}")))?
-                .map_err(|e| Status::invalid_argument(format!("cannot open workbook: {e}")))?;
+        let (id, entry) = tokio::task::spawn_blocking(move || {
+            // Held until the parse ends even if the client has gone, so
+            // abandoned uploads cannot pile up parses past the cap.
+            let _permit = permit;
+            store.open(bytes, format_hint, header_row)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("parser task failed: {e}")))?
+        .map_err(|e| match e {
+            StoreError::Limit(limit) => Status::resource_exhausted(limit.to_string()),
+            StoreError::Unreadable(e) => {
+                Status::invalid_argument(format!("cannot open workbook: {e}"))
+            }
+        })?;
 
         Ok(Response::new(pb::OpenWorkbookResponse {
             workbook_id: id,
@@ -1563,6 +1657,20 @@ mod tests {
         drop(second);
         let reused = service.admit().expect("a released slot is reusable");
         drop((first, reused));
+    }
+
+    /// Uploads are admitted against their own slots, and an upload past the
+    /// cap is refused before it has buffered anything rather than queued.
+    #[test]
+    fn uploads_past_the_cap_are_refused_not_queued() {
+        let service = CalamineGrpc::new(WorkbookStore::new()).with_max_concurrent_uploads(1);
+        let first = service.admit_upload().expect("slot 1");
+
+        let refused = service.admit_upload().expect_err("the cap is 1");
+        assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
+
+        drop(first);
+        let _again = service.admit_upload().expect("a released slot is reusable");
     }
 
     /// Ids are dense from zero in first-appearance order, and repeats of the

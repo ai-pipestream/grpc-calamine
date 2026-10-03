@@ -3,20 +3,29 @@
 //! Binary entry point for the calamine gRPC server.
 //!
 //! Runtime sizing (all optional environment overrides):
-//! - `GRPC_CALAMINE_ADDR` — listen address (default `0.0.0.0:50062`).
-//! - `GRPC_CALAMINE_WORKERS` — tokio worker threads (default: CPU count).
-//! - `GRPC_CALAMINE_BLOCKING_THREADS` — cap of the blocking pool that runs
+//! - `GRPC_CALAMINE_ADDR`: listen address (default `0.0.0.0:50062`).
+//! - `GRPC_CALAMINE_WORKERS`: tokio worker threads (default: CPU count).
+//! - `GRPC_CALAMINE_BLOCKING_THREADS`: cap of the blocking pool that runs
 //!   calamine parsing (default: 512, tokio's own default).
-//! - `GRPC_CALAMINE_WINDOW_BYTES` — HTTP/2 initial stream and connection
+//! - `GRPC_CALAMINE_WINDOW_BYTES`: HTTP/2 initial stream and connection
 //!   window (default: 50 MiB).
-//! - `GRPC_CALAMINE_MAX_CONCURRENT_STREAMS` — streaming reads admitted at
+//! - `GRPC_CALAMINE_MAX_CONCURRENT_STREAMS`: streaming reads admitted at
 //!   once (default: 128). Past the cap a read is refused with
 //!   `RESOURCE_EXHAUSTED` rather than queued.
+//! - `GRPC_CALAMINE_MAX_CONCURRENT_UPLOADS`: `OpenWorkbook` uploads admitted
+//!   at once (default: 16), refused past the cap the same way.
+//! - `GRPC_CALAMINE_MAX_OPEN_WORKBOOKS`: workbooks open at once (default:
+//!   256). Opening one more is refused with `RESOURCE_EXHAUSTED`.
+//! - `GRPC_CALAMINE_MAX_STORE_BYTES`: bytes the open workbooks may hold
+//!   together (default: 2 GiB), refused past it the same way.
+//! - `GRPC_CALAMINE_HANDLE_TTL_SECS`: seconds a workbook may go unused
+//!   before it is closed for its client (default: 300; 0 never expires).
 
 use std::time::Duration;
 
 use tonic::transport::Server;
 
+use grpc_calamine::store::StoreLimits;
 use grpc_calamine::{CalamineGrpc, WorkbookStore, proto};
 
 /// Default listen address when `GRPC_CALAMINE_ADDR` is not set.
@@ -31,6 +40,14 @@ const DEFAULT_WINDOW_BYTES: u32 = 50 * 1024 * 1024;
 
 /// Read a `usize` environment variable, falling back to `default`.
 fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Read a `u64` environment variable, falling back to `default`.
+fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse().ok())
@@ -61,15 +78,36 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| DEFAULT_ADDR.to_string())
         .parse()?;
 
+    let defaults = StoreLimits::default();
+    let limits = StoreLimits {
+        max_open_workbooks: env_usize(
+            "GRPC_CALAMINE_MAX_OPEN_WORKBOOKS",
+            defaults.max_open_workbooks,
+        ),
+        max_store_bytes: env_u64("GRPC_CALAMINE_MAX_STORE_BYTES", defaults.max_store_bytes),
+        idle_ttl: Duration::from_secs(env_u64(
+            "GRPC_CALAMINE_HANDLE_TTL_SECS",
+            defaults.idle_ttl.as_secs(),
+        )),
+    };
+
     // Streaming reads are capped well below the blocking pool so they can
     // never take every thread and leave uploads with none.
-    let mut grpc = CalamineGrpc::new(WorkbookStore::new());
+    let mut grpc = CalamineGrpc::new(WorkbookStore::with_limits(limits));
     if let Some(max) = std::env::var("GRPC_CALAMINE_MAX_CONCURRENT_STREAMS")
         .ok()
         .and_then(|v| v.parse().ok())
     {
         grpc = grpc.with_max_concurrent_streams(max);
     }
+    if let Some(max) = std::env::var("GRPC_CALAMINE_MAX_CONCURRENT_UPLOADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        grpc = grpc.with_max_concurrent_uploads(max);
+    }
+    // Detached on purpose: it ends by itself once the service is dropped.
+    let _reaper = grpc.spawn_reaper();
     let service = grpc.into_service();
 
     // Reflection lets tooling such as grpcurl discover the service without a
@@ -90,6 +128,12 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     .unwrap_or(DEFAULT_WINDOW_BYTES);
 
     eprintln!("grpc-calamine listening on {addr} (http2 window {window} bytes)");
+    eprintln!(
+        "grpc-calamine holds at most {} workbooks and {} bytes; idle workbooks close after {}s",
+        limits.max_open_workbooks,
+        limits.max_store_bytes,
+        limits.idle_ttl.as_secs()
+    );
     Server::builder()
         // Latency/throughput tuning for many concurrent streaming clients.
         .tcp_nodelay(true)

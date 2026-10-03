@@ -8,14 +8,16 @@
 //! of what calamine parsed.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use calamine::{Data, HeaderRow, Reader, Sheets, open_workbook_auto};
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::Code;
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::{Endpoint, Server};
+use tonic::{Code, Status};
 
 use grpc_calamine::proto::v1 as pb;
 use grpc_calamine::proto::v1::calamine_service_client::CalamineServiceClient;
+use grpc_calamine::store::StoreLimits;
 use grpc_calamine::{CalamineGrpc, WorkbookStore, convert};
 
 /// Directory holding the workbook fixtures (originally from the calamine
@@ -27,11 +29,18 @@ fn fixtures() -> PathBuf {
 /// Start the server on an ephemeral localhost port and return a connected
 /// client.
 async fn start_server() -> CalamineServiceClient<tonic::transport::Channel> {
+    start_server_with(CalamineGrpc::new(WorkbookStore::new())).await
+}
+
+/// Start `grpc`, and its idle reaper, on an ephemeral localhost port and
+/// return a connected client.
+async fn start_server_with(grpc: CalamineGrpc) -> CalamineServiceClient<tonic::transport::Channel> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().unwrap();
-    let service = CalamineGrpc::new(WorkbookStore::new()).into_service();
+    let _reaper = grpc.spawn_reaper();
+    let service = grpc.into_service();
     tokio::spawn(async move {
         Server::builder()
             .add_service(service)
@@ -53,15 +62,7 @@ async fn upload(
     client: &CalamineServiceClient<tonic::transport::Channel>,
     file: &str,
 ) -> pb::OpenWorkbookResponse {
-    upload_with_options(
-        client,
-        file,
-        pb::WorkbookOptions {
-            format_hint: pb::WorkbookFormat::Unspecified as i32,
-            header_row: None,
-        },
-    )
-    .await
+    upload_with_options(client, file, default_options()).await
 }
 
 /// Upload a workbook file with explicit open-time options.
@@ -70,8 +71,37 @@ async fn upload_with_options(
     file: &str,
     options: pb::WorkbookOptions,
 ) -> pb::OpenWorkbookResponse {
-    let mut client = client.clone();
     let bytes = std::fs::read(fixtures().join(file)).expect("read fixture");
+    try_upload_bytes(client, bytes, options)
+        .await
+        .expect("open workbook")
+}
+
+/// Upload a workbook file and return whatever the server answers.
+async fn try_upload(
+    client: &CalamineServiceClient<tonic::transport::Channel>,
+    file: &str,
+) -> Result<pb::OpenWorkbookResponse, Status> {
+    let bytes = std::fs::read(fixtures().join(file)).expect("read fixture");
+    try_upload_bytes(client, bytes, default_options()).await
+}
+
+/// The open-time options every test uses unless it says otherwise.
+fn default_options() -> pb::WorkbookOptions {
+    pb::WorkbookOptions {
+        format_hint: pb::WorkbookFormat::Unspecified as i32,
+        header_row: None,
+    }
+}
+
+/// Upload workbook bytes in 64 KiB chunks and return whatever the server
+/// answers.
+async fn try_upload_bytes(
+    client: &CalamineServiceClient<tonic::transport::Channel>,
+    bytes: Vec<u8>,
+    options: pb::WorkbookOptions,
+) -> Result<pb::OpenWorkbookResponse, Status> {
+    let mut client = client.clone();
     let mut frames = vec![pb::OpenWorkbookRequest {
         payload: Some(pb::open_workbook_request::Payload::Options(options)),
     }];
@@ -85,8 +115,7 @@ async fn upload_with_options(
     client
         .open_workbook(tokio_stream::iter(frames))
         .await
-        .expect("open workbook")
-        .into_inner()
+        .map(tonic::Response::into_inner)
 }
 
 /// Stream a whole worksheet by index and return (header, rows).
@@ -1536,4 +1565,142 @@ async fn string_table_mode_composes_with_compression() {
 
     assert_eq!(resolved, plain);
     assert!(table_len > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Handle lifetime and admission.
+//
+// Nothing guarantees a client closes what it opens: a killed process, a
+// partition or a timed-out CloseWorkbook each leave a handle behind, holding
+// its upload and a parsed reader. Handles therefore expire when idle, the
+// store refuses past its caps, and uploads are admitted against their own
+// slots, which a client that stops sending cannot hold forever.
+// ---------------------------------------------------------------------------
+
+/// A handle nobody uses for the idle TTL is closed as if its client had
+/// called CloseWorkbook.
+#[tokio::test]
+async fn an_idle_handle_is_closed_by_the_reaper() {
+    let store = WorkbookStore::with_limits(StoreLimits {
+        idle_ttl: Duration::from_millis(200),
+        ..StoreLimits::default()
+    });
+    let mut client = start_server_with(CalamineGrpc::new(store)).await;
+    let opened = upload(&client, "date.xlsx").await;
+
+    // The reaper runs every 50 ms here, so this leaves over a second of slack.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let gone = client
+        .get_metadata(pb::GetMetadataRequest {
+            workbook_id: opened.workbook_id.clone(),
+        })
+        .await
+        .expect_err("the handle expired");
+    assert_eq!(gone.code(), Code::NotFound);
+    let closed = client
+        .close_workbook(pb::CloseWorkbookRequest {
+            workbook_id: opened.workbook_id,
+        })
+        .await
+        .expect("close")
+        .into_inner();
+    assert!(!closed.closed, "nothing is left to close");
+}
+
+/// Past the workbook cap OpenWorkbook is refused with RESOURCE_EXHAUSTED,
+/// naming the setting, and closing a handle makes room again.
+#[tokio::test]
+async fn opens_past_the_workbook_cap_are_refused() {
+    let store = WorkbookStore::with_limits(StoreLimits {
+        max_open_workbooks: 1,
+        ..StoreLimits::default()
+    });
+    let mut client = start_server_with(CalamineGrpc::new(store)).await;
+    let first = upload(&client, "date.xlsx").await;
+
+    let refused = try_upload(&client, "date.xlsx")
+        .await
+        .expect_err("the cap is 1");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    assert!(
+        refused
+            .message()
+            .contains("GRPC_CALAMINE_MAX_OPEN_WORKBOOKS"),
+        "{}",
+        refused.message()
+    );
+
+    client
+        .close_workbook(pb::CloseWorkbookRequest {
+            workbook_id: first.workbook_id,
+        })
+        .await
+        .expect("close");
+    upload(&client, "date.xlsx").await;
+}
+
+/// A workbook that does not fit the store's byte budget is refused with
+/// RESOURCE_EXHAUSTED, naming the setting.
+#[tokio::test]
+async fn an_upload_past_the_byte_budget_is_refused() {
+    let store = WorkbookStore::with_limits(StoreLimits {
+        max_store_bytes: 1024,
+        ..StoreLimits::default()
+    });
+    let client = start_server_with(CalamineGrpc::new(store)).await;
+
+    let refused = try_upload(&client, "date.xlsx")
+        .await
+        .expect_err("4.6 KB does not fit in 1 KiB");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    assert!(
+        refused.message().contains("GRPC_CALAMINE_MAX_STORE_BYTES"),
+        "{}",
+        refused.message()
+    );
+}
+
+/// An upload holds its slot only while it is moving: past the cap the next
+/// one is refused, and an upload that stops sending is abandoned with
+/// DEADLINE_EXCEEDED, which frees the slot.
+#[tokio::test]
+async fn a_stalled_upload_is_abandoned_and_frees_its_slot() {
+    let grpc = CalamineGrpc::new(WorkbookStore::new())
+        .with_max_concurrent_uploads(1)
+        .with_upload_stall(Duration::from_secs(1));
+    let client = start_server_with(grpc).await;
+
+    // Sends its options frame, then nothing, while staying connected.
+    let (frames, rx) = tokio::sync::mpsc::channel(1);
+    frames
+        .send(pb::OpenWorkbookRequest {
+            payload: Some(pb::open_workbook_request::Payload::Options(
+                default_options(),
+            )),
+        })
+        .await
+        .expect("queue the options frame");
+    let mut stalled_client = client.clone();
+    let stalled = tokio::spawn(async move {
+        stalled_client
+            .open_workbook(ReceiverStream::new(rx))
+            .await
+            .map(tonic::Response::into_inner)
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let refused = try_upload(&client, "date.xlsx")
+        .await
+        .expect_err("the only upload slot is taken");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+
+    let abandoned = stalled
+        .await
+        .expect("join")
+        .expect_err("a client that stops sending is not waited on forever");
+    assert_eq!(abandoned.code(), Code::DeadlineExceeded);
+    drop(frames);
+
+    upload(&client, "date.xlsx").await;
 }

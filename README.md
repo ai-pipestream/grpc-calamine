@@ -95,6 +95,10 @@ slower.
 | `GRPC_CALAMINE_BLOCKING_THREADS` | `512`          | max threads for calamine parsing tasks      |
 | `GRPC_CALAMINE_WINDOW_BYTES`     | `52428800`     | HTTP/2 initial stream and connection window |
 | `GRPC_CALAMINE_MAX_CONCURRENT_STREAMS` | `128`    | streaming reads admitted at once            |
+| `GRPC_CALAMINE_MAX_CONCURRENT_UPLOADS` | `16`     | `OpenWorkbook` uploads admitted at once     |
+| `GRPC_CALAMINE_MAX_OPEN_WORKBOOKS` | `256`        | workbooks open at once                      |
+| `GRPC_CALAMINE_MAX_STORE_BYTES`  | `2147483648`   | bytes the open workbooks hold together (2 GiB) |
+| `GRPC_CALAMINE_HANDLE_TTL_SECS`  | `300`          | idle seconds before a workbook is closed; `0` never |
 
 The window default is 50 MiB because window size over round-trip time caps
 upload throughput; hyper's 1 MiB default holds a 10 ms link near 100 MB/s.
@@ -105,9 +109,26 @@ The server accepts gzip- and zstd-compressed requests and compresses
 responses for any client that negotiates it. No configuration needed on
 either side beyond the client asking.
 
+Every workbook a client opens stays in memory until it is closed, and
+nothing guarantees a client gets to close it: a killed process, a network
+partition or a `CloseWorkbook` that times out each leave one behind. So the
+store is bounded three ways. A workbook nobody has used for
+`GRPC_CALAMINE_HANDLE_TTL_SECS` is closed for its client, and any later call
+on its id gets `NOT_FOUND`; one that a read is still streaming is in use, so
+a read that takes longer than the TTL keeps its handle. Past
+`GRPC_CALAMINE_MAX_OPEN_WORKBOOKS` workbooks, or past
+`GRPC_CALAMINE_MAX_STORE_BYTES` of uploaded bytes held between them, the
+next `OpenWorkbook` is refused with `RESOURCE_EXHAUSTED`, during the upload
+rather than after it, once idle workbooks have been closed to make room.
+Uploads themselves are admitted against `GRPC_CALAMINE_MAX_CONCURRENT_UPLOADS`
+slots, since each buffers its workbook in memory until it is parsed, and an
+upload that sends nothing for 30 s is abandoned with `DEADLINE_EXCEEDED` so
+it cannot hold a slot forever. The server logs each time it closes idle
+workbooks, with how many remain open and what they hold.
+
 Hard limits (compile-time, `src/service.rs`): 512 MiB max workbook upload,
 32 MiB max gRPC frame, 64-event stream backpressure channel, 8 MiB per row
-batch, 65,536 rows per batch, 30 s consumer stall.
+batch, 65,536 rows per batch, 30 s upload stall, 30 s consumer stall.
 
 That last one is what keeps a client from taking the server down by opening
 streams and never reading them: a parse waits on a slow consumer, but not
@@ -171,6 +192,10 @@ arrive batched (`WorksheetRowBatch`, up to 256 rows, 5 ms linger); set
 events define each distinct string once, cells carry `shared_string_id`,
 and every id is defined before the first row that references it. The
 dictionary is XLSX/XLSB only; other formats accept the flag unchanged.
+
+Close handles when you are done with them. One left open is closed for you
+once it has been idle for the TTL (five minutes by default), but until then
+it counts against the store's limits.
 
 `StreamWorksheetFormula` has the same shape with formula strings instead of
 values. `StreamVbaProject` sends project info, then one event per module

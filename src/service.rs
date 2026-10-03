@@ -732,16 +732,18 @@ impl RowBatcher {
                         at + n,
                         pb::WorksheetRow {
                             row_index: index,
-                            values: vec![convert::empty_cell_data(); width],
+                            values: Vec::new(),
                         },
                     );
                 }
                 at
             }
         };
+        // The row may be a gap row, which carries no cells; once it holds a
+        // value it is as wide as every other row holding one.
         let values = &mut self.rows[at].values;
         if col >= values.len() {
-            values.resize(col + 1, convert::empty_cell_data());
+            values.resize(width.max(col + 1), convert::empty_cell_data());
         }
         values[col] = value;
         // Only an unsorted sheet ever gets here, so the byte budget is simply
@@ -821,12 +823,20 @@ fn emit_range(
     // place a cell.
     let pad = start.1 as usize;
     for (offset, row) in range.rows().enumerate() {
-        let mut values = Vec::with_capacity(pad + row.len());
-        values.resize(pad, convert::empty_cell_data());
-        values.extend(
-            row.iter()
-                .map(|d| convert::cell_data(convert::data_value(d, is_1904))),
-        );
+        // A row with no value is sent with no cells, as on the incremental
+        // path: every row of a dense range is as wide as its widest, so an
+        // interior gap would otherwise carry `row.len()` empty cells apiece.
+        let values = if row.iter().all(|d| matches!(d, Data::Empty)) {
+            Vec::new()
+        } else {
+            let mut values = Vec::with_capacity(pad + row.len());
+            values.resize(pad, convert::empty_cell_data());
+            values.extend(
+                row.iter()
+                    .map(|d| convert::cell_data(convert::data_value(d, is_1904))),
+            );
+            values
+        };
         if !batcher.push(tx, start.0 + offset as u32, values) {
             return;
         }
@@ -839,9 +849,9 @@ fn emit_range(
 ///
 /// The emitted grid matches what calamine's own `worksheet_range` reports in
 /// row extent and populated cells: it spans the first to the last row holding
-/// a non-empty cell, interior gaps are filled with empty rows, and leading or
-/// trailing rows of blanks are not emitted even when the reader yields cells
-/// for them. Rows are dense from column 0, so a value's index is its absolute
+/// a non-empty cell, interior gaps are sent as rows with no cells, and leading
+/// or trailing rows of blanks are not emitted even when the reader yields
+/// cells for them. Rows are dense from column 0, so a value's index is its absolute
 /// column.
 /// `next_cell` yields `Ok(None)` at end of sheet.
 ///
@@ -922,12 +932,18 @@ fn emit_incremental<E: Display>(
     // rows (styled but blank), so they are held back rather than streamed: an
     // interior gap is released once a later non-empty row proves it was a gap,
     // and trailing padding is simply dropped at end of sheet.
+    //
+    // A released gap row carries no cells at all. The contract lets trailing
+    // empty cells be omitted, and every cell of a gap row is one, whereas
+    // `width` by then can include a cell 16,383 columns over: A1 plus
+    // XFD1048576 is a 2 KB file, and spelling its gap out at full width is
+    // 17 billion empty cells for the client to receive.
     macro_rules! complete_row {
         ($index:expr, $row:expr) => {{
             let index: u32 = $index;
             if row_has_value {
                 for back in (1..=pending_empty).rev() {
-                    if !batcher.push(tx, index - back, vec![convert::empty_cell_data(); width]) {
+                    if !batcher.push(tx, index - back, Vec::new()) {
                         return;
                     }
                 }
@@ -997,7 +1013,7 @@ fn emit_incremental<E: Display>(
                 // `current_row` and silently drop it.
                 let below = if started { row - band_lo } else { 0 };
                 for back in (1..=below).rev() {
-                    if !batcher.push(tx, row - back, vec![convert::empty_cell_data(); width]) {
+                    if !batcher.push(tx, row - back, Vec::new()) {
                         return;
                     }
                 }
@@ -1060,11 +1076,7 @@ fn emit_incremental<E: Display>(
     // trailing padding and is deliberately not emitted.
     if open && row_has_value {
         for back in (1..=pending_empty).rev() {
-            if !batcher.push(
-                tx,
-                current_row - back,
-                vec![convert::empty_cell_data(); width],
-            ) {
+            if !batcher.push(tx, current_row - back, Vec::new()) {
                 return;
             }
         }

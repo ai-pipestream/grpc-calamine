@@ -66,7 +66,7 @@ everything with one command.
   cell readers. XLS and ODS only support whole-range parsing, so those parse
   first and then stream. The wire contract is identical either way, and the
   streamed grid matches calamine's own `worksheet_range`: trailing blank
-  rows trimmed, interior gaps sent as explicit empty rows, `header_row`
+  rows trimmed, interior gaps sent as rows with no cells, `header_row`
   honored the same on every format. The test suite asserts that parity
   against calamine for every sheet of every fixture, including synthetic
   workbooks whose declared `<dimension>` lies.

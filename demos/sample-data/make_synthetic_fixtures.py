@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Generate the synthetic fixtures whose <dimension> deliberately lies.
+"""Generate the synthetic fixtures whose <dimension> deliberately lies, and
+the ones whose content is laid out to cost the server or a client too much.
 
 The fixtures from the calamine test suite all declare their extent honestly,
 so nothing in the suite exercised the cases that have actually bitten this
@@ -11,8 +12,9 @@ rows that calamine trims), and a declared dimension smaller than the content
 not adversarial ones.
 
 Each workbook is the minimum OPC package calamine will open: one sheet,
-numeric inline values, no shared strings, no styles part. Stored (not
-deflated) so the bytes are inspectable with `unzip -p`.
+numeric inline values, no shared strings, no styles part. The .ods fixtures
+are the same idea in OpenDocument form: a mimetype, a manifest and one table.
+Stored (not deflated) so the bytes are inspectable with `unzip -p`.
 
 Run from this directory: `python3 make_synthetic_fixtures.py`. The output is
 committed, so this only needs re-running when a fixture changes.
@@ -163,6 +165,55 @@ WIDE = (
 """,
 )
 
+# Two cells at opposite corners of Excel's grid, A1 and XFD1048576, in a file
+# of about 2 KB. The 1,048,574 rows between them hold nothing. Spelled out at
+# the sheet's final width of 16,384 columns they are 17.2 billion empty cells,
+# which is what OOM-killed a densifying client, so each must arrive as a row
+# with no cells. calamine's own `worksheet_range` allocates the whole
+# rectangle, so the test compares against the two cells, not against it.
+CORNERS = (
+    "A1:XFD1048576",
+    """<row r="1"><c r="A1"><v>1</v></c></row>
+<row r="1048576"><c r="XFD1048576"><v>2</v></c></row>
+""",
+)
+
+ODS_MIMETYPE = "application/vnd.oasis.opendocument.spreadsheet"
+
+ODS_MANIFEST = """<?xml version="1.0" encoding="UTF-8"?>
+<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">
+<manifest:file-entry manifest:full-path="/" manifest:version="1.2" manifest:media-type="application/vnd.oasis.opendocument.spreadsheet"/>
+<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>
+</manifest:manifest>
+"""
+
+ODS_CONTENT_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" office:version="1.2">
+<office:body><office:spreadsheet>
+<table:table table:name="Sheet1">
+{rows}</table:table>
+</office:spreadsheet></office:body>
+</office:document-content>
+"""
+
+
+def ods_value(value: int) -> str:
+    return (
+        f'<table:table-cell office:value-type="float" office:value="{value}">'
+        f"<text:p>{value}</text:p></table:table-cell>"
+    )
+
+
+# A1 and D5 with rows 2-4 empty. ODS is parsed into a dense range, where every
+# row is as wide as the widest, so the three gap rows come out of calamine as
+# four empty cells apiece; they must still stream as rows with no cells.
+ODS_GAP = (
+    f"<table:table-row>{ods_value(1)}</table:table-row>\n"
+    '<table:table-row table:number-rows-repeated="3"><table:table-cell/></table:table-row>\n'
+    '<table:table-row><table:table-cell table:number-columns-repeated="3"/>'
+    f"{ods_value(9)}</table:table-row>\n"
+)
+
 
 def write(name: str, dimension: str, sheet_data: str) -> None:
     with zipfile.ZipFile(name, "w", zipfile.ZIP_STORED) as z:
@@ -176,6 +227,15 @@ def write(name: str, dimension: str, sheet_data: str) -> None:
         )
 
 
+def write_ods(name: str, rows: str) -> None:
+    with zipfile.ZipFile(name, "w", zipfile.ZIP_STORED) as z:
+        # The mimetype must come first and uncompressed (OpenDocument 1.2,
+        # part 3, section 3.3).
+        z.writestr("mimetype", ODS_MIMETYPE)
+        z.writestr("META-INF/manifest.xml", ODS_MANIFEST)
+        z.writestr("content.xml", ODS_CONTENT_TEMPLATE.format(rows=rows))
+
+
 if __name__ == "__main__":
     write("dimension_inflated.xlsx", *INFLATED)
     write("dimension_underdeclared.xlsx", *UNDERDECLARED)
@@ -186,9 +246,11 @@ if __name__ == "__main__":
     write("rows_out_of_order.xlsx", *OUT_OF_ORDER)
     write("rows_descending.xlsx", *ROWS_DESCENDING)
     write("rows_late_backwards.xlsx", *ROWS_LATE_BACKWARDS)
+    write("corners.xlsx", *CORNERS)
+    write_ods("gap.ods", ODS_GAP)
     print(
         "wrote dimension_inflated.xlsx dimension_underdeclared.xlsx "
         "dimension_shifted.xlsx dimension_offset.xlsx dimension_reversed.xlsx "
         "dimension_wide.xlsx rows_out_of_order.xlsx rows_descending.xlsx "
-        "rows_late_backwards.xlsx"
+        "rows_late_backwards.xlsx corners.xlsx gap.ods"
     )

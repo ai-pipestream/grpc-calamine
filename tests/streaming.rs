@@ -727,11 +727,14 @@ async fn every_sheet_of_every_fixture_matches_calamine_counts() {
         "dimension_wide.xlsx",
         "rows_out_of_order.xlsx",
         "rows_descending.xlsx",
+        "gap.ods",
         // Deliberately absent: `dimension_reversed.xlsx`, whose declaration
         // underflows calamine's own unchecked corner subtraction, so building
         // the ground truth here would panic before the server was asked
-        // anything (it has its own test); and `rows_late_backwards.xlsx`,
-        // which calamine reads and a one-pass stream cannot (likewise).
+        // anything (it has its own test); `rows_late_backwards.xlsx`,
+        // which calamine reads and a one-pass stream cannot (likewise); and
+        // the `corners*` fixtures, whose ground truth would be calamine
+        // densifying 17 billion cells.
     ];
     for file in files {
         let client = start_server().await;
@@ -1135,6 +1138,94 @@ async fn a_wide_declared_dimension_does_not_size_the_row_buffer() {
         "the row is sized from the declared full-grid extent rather than \
          from the single cell present, so the declaration controls how much \
          the server allocates"
+    );
+}
+
+/// A1 and XFD1048576 in a 2 KB file: the 1,048,574 rows between them are a
+/// gap, and a gap row carries no cells. Each one used to be spelled out at the
+/// sheet's final width, 16,384 empty cells apiece and 17.2 billion in all,
+/// which no densifying client survives. Now the stream is the two populated
+/// rows plus row indices.
+///
+/// Rows are counted as they arrive rather than collected, so the test itself
+/// stays small whatever the server sends.
+#[tokio::test]
+async fn a_sparse_sheet_sends_its_gap_rows_without_cells() {
+    let mut client = start_server().await;
+    let opened = upload(&client, "corners.xlsx").await;
+    let mut stream = client
+        .stream_worksheet_range(pb::StreamWorksheetRangeRequest {
+            workbook_id: opened.workbook_id,
+            sheet: Some(pb::SheetSelector {
+                selector: Some(pb::sheet_selector::Selector::SheetIndex(0)),
+            }),
+            max_rows_per_message: 0,
+            use_string_table: false,
+        })
+        .await
+        .expect("stream worksheet range")
+        .into_inner();
+
+    let mut rows = 0u64;
+    let mut cells = 0u64;
+    let mut next_index = 0u32;
+    let mut populated = Vec::new();
+    while let Some(event) = stream.message().await.expect("stream event") {
+        let batch = match event.event.expect("event kind") {
+            pb::stream_worksheet_range_response::Event::Started(_) => continue,
+            pb::stream_worksheet_range_response::Event::Rows(batch) => batch.rows,
+            pb::stream_worksheet_range_response::Event::Row(row) => vec![row],
+            other => panic!("unexpected event {other:?}"),
+        };
+        for row in batch {
+            assert_eq!(row.row_index, next_index, "rows arrive contiguous");
+            next_index += 1;
+            rows += 1;
+            cells += row.values.len() as u64;
+            populated.extend(populated_cells(std::slice::from_ref(&row)));
+        }
+    }
+
+    assert_eq!(rows, 1_048_576, "every row from A1's to XFD1048576's");
+    assert_eq!(
+        populated,
+        vec![
+            (0, 0, pb::cell_data::Value::FloatValue(1.0)),
+            (1_048_575, 16_383, pb::cell_data::Value::FloatValue(2.0)),
+        ]
+    );
+    assert!(
+        cells <= 1 + 16_384,
+        "{cells} cells streamed for a sheet holding two"
+    );
+}
+
+/// The buffered path (XLS and ODS) gets its rows from a dense range, where a
+/// gap row is as wide as the widest row. It must still go out with no cells.
+#[tokio::test]
+async fn a_buffered_sheet_sends_its_gap_rows_without_cells() {
+    let client = start_server().await;
+    let opened = upload(&client, "gap.ods").await;
+    let (_header, rows) = stream_range(&client, &opened.workbook_id, 0).await;
+
+    assert_eq!(
+        rows.iter().map(|r| r.row_index).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4]
+    );
+    for gap in &rows[1..4] {
+        assert!(
+            gap.values.is_empty(),
+            "gap row {} carries {} cells",
+            gap.row_index,
+            gap.values.len()
+        );
+    }
+    assert_eq!(
+        populated_cells(&rows),
+        vec![
+            (0, 0, pb::cell_data::Value::FloatValue(1.0)),
+            (4, 3, pb::cell_data::Value::FloatValue(9.0)),
+        ]
     );
 }
 

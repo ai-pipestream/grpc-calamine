@@ -22,7 +22,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::convert;
 use crate::proto::v1 as pb;
 use crate::proto::v1::calamine_service_server::{CalamineService, CalamineServiceServer};
-use crate::store::{StoreError, WorkbookEntry, WorkbookStore};
+use crate::store::{PooledReader, ReaderError, StoreError, WorkbookEntry, WorkbookStore};
 
 /// Default upper bound on the uploaded workbook size: 512 MiB.
 const DEFAULT_MAX_WORKBOOK_BYTES: usize = 512 * 1024 * 1024;
@@ -711,6 +711,27 @@ fn abort_unsorted(
     );
 }
 
+/// Borrow a reader of `entry` for a stream, or end the stream: with
+/// `RESOURCE_EXHAUSTED` when a further reader does not fit in the store's
+/// byte budget, and in band when calamine cannot re-open the workbook.
+fn checkout<T: StreamResponse>(
+    entry: &WorkbookEntry,
+    kind: pb::CalamineErrorKind,
+    tx: &mpsc::Sender<Result<T, Status>>,
+) -> Option<PooledReader> {
+    match entry.reader() {
+        Ok(reader) => Some(reader),
+        Err(ReaderError::Limit(limit)) => {
+            let _ = tx.blocking_send(Err(Status::resource_exhausted(limit.to_string())));
+            None
+        }
+        Err(ReaderError::Open(e)) => {
+            abort_with(tx, kind, e);
+            None
+        }
+    }
+}
+
 /// Convert a calamine parse failure into an in-band terminal stream error.
 fn abort_with<T: StreamResponse>(
     tx: &mpsc::Sender<Result<T, Status>>,
@@ -1236,13 +1257,18 @@ fn emit_incremental<E: Display>(
     // anchoring at zero makes a value's index its absolute column and the
     // problem impossible.
     //
-    // The declaration is a capacity hint and nothing more. `width` is the
-    // emitted extent and grows only from cells that actually arrive, so the
+    // The declaration is a capacity hint and nothing more. A row's length
+    // comes only from the cells that actually arrive in it, so the
     // declaration can never reach the wire or the allocator: `A1:ZZZZZZ1` in a
     // 2 KB upload reserves 16,384 slots it never fills instead of committing
     // ~10 GiB, and a sheet holding one cell streams one cell wide.
+    //
+    // Each row ends at its own last value; the contract lets trailing empty
+    // cells be omitted. Rows are not padded to the widest row seen so far:
+    // that made one value at XFD1 widen every later row to 16,384 cells, so a
+    // couple of MB of upload holding one value per row sent 17 billion empty
+    // cells, and nothing here is under the dense-cell budget.
     let prealloc = (dims.end.1 as usize).min(MAX_DECLARED_COLUMNS - 1) + 1;
-    let mut width = 0usize;
     let mut values: Vec<pb::CellData> = Vec::with_capacity(prealloc);
 
     // With `HeaderRow::Row(n)` the sheet starts at `n` whatever `n` holds, so
@@ -1307,9 +1333,9 @@ fn emit_incremental<E: Display>(
             if !batcher.accepts(row) {
                 return abort_unsorted(tx, kind, sheet_name, row, col);
             }
-            // Padded to the running width like any other row, so a repaired
+            // As long as its own last value, like any other row, so a repaired
             // sheet streams the same shape a sorted one would.
-            let mut late = vec![convert::empty_cell_data(); width.max(idx + 1)];
+            let mut late = vec![convert::empty_cell_data(); idx + 1];
             late[idx] = convert::cell_data(value);
             if !batcher.push(tx, row, late) {
                 return;
@@ -1327,12 +1353,8 @@ fn emit_incremental<E: Display>(
                 if !batcher.accepts(current_row) {
                     return abort_unsorted(tx, kind, sheet_name, current_row, 0);
                 }
-                // `width` is the running maximum and is deliberately not reset,
-                // so the next row starts padded to it. Row *content* is then
-                // byte-identical to what a per-row walk produced, and the only
-                // thing this path changed is that empty rows became a gap.
-                let fresh = vec![convert::empty_cell_data(); width];
-                if !batcher.push(tx, current_row, std::mem::replace(&mut values, fresh)) {
+                // The next row starts empty and grows to its own last value.
+                if !batcher.push(tx, current_row, std::mem::take(&mut values)) {
                     return;
                 }
                 current_row = row;
@@ -1345,9 +1367,8 @@ fn emit_incremental<E: Display>(
             open = true;
         }
 
-        if idx >= width {
-            width = idx + 1;
-            values.resize(width, convert::empty_cell_data());
+        if idx >= values.len() {
+            values.resize(idx + 1, convert::empty_cell_data());
         }
         values[idx] = convert::cell_data(value);
     }
@@ -1410,9 +1431,8 @@ fn run_stream_worksheet_range(
     };
     let kind = convert::error_kind_for_format(entry.format);
     // Fresh independent reader: no locks, fully parallel with other reads.
-    let mut workbook = match entry.reader() {
-        Ok(workbook) => workbook,
-        Err(e) => return abort_with(tx, kind, e),
+    let Some(mut workbook) = checkout(entry, kind, tx) else {
+        return;
     };
 
     let is_1904 = entry.is_1904;
@@ -1716,9 +1736,8 @@ fn run_stream_worksheet_formula(
         }
     };
     let kind = convert::error_kind_for_format(entry.format);
-    let mut workbook = match entry.reader() {
-        Ok(workbook) => workbook,
-        Err(e) => return abort_with(tx, kind, e),
+    let Some(mut workbook) = checkout(entry, kind, tx) else {
+        return;
     };
     let collector = FormulaCollector::new(&sheet_name, max_dense_cells, max_formula_bytes);
     let sparse = match &mut *workbook {
@@ -1774,9 +1793,8 @@ fn run_stream_vba_project(
     tx: &mpsc::Sender<Result<pb::StreamVbaProjectResponse, Status>>,
 ) {
     let kind = convert::error_kind_for_format(entry.format);
-    let mut workbook = match entry.reader() {
-        Ok(workbook) => workbook,
-        Err(e) => return abort_with(tx, kind, e),
+    let Some(mut workbook) = checkout(entry, kind, tx) else {
+        return;
     };
     let project = match workbook.vba_project() {
         Ok(Some(project)) => project,
@@ -1860,9 +1878,8 @@ fn run_get_pictures(
     tx: &mpsc::Sender<Result<pb::GetPicturesResponse, Status>>,
 ) {
     let kind = convert::error_kind_for_format(entry.format);
-    let workbook = match entry.reader() {
-        Ok(workbook) => workbook,
-        Err(e) => return abort_with(tx, kind, e),
+    let Some(workbook) = checkout(entry, kind, tx) else {
+        return;
     };
     // One copy at a time: the reader shares an image between every anchor
     // that embeds it, and a copy is made only as each anchor's picture goes
@@ -1935,6 +1952,12 @@ impl CalamineService for CalamineGrpc {
             }
             StoreError::Malformed { part, detail } => {
                 Status::invalid_argument(format!("cannot open workbook: {part}: {detail}"))
+            }
+            refused @ StoreError::FormatRefused { .. } => {
+                Status::failed_precondition(format!("cannot open workbook: {refused}"))
+            }
+            unknown @ StoreError::NoAcceptedFormat { .. } => {
+                Status::invalid_argument(format!("cannot open workbook: {unknown}"))
             }
         })?;
 

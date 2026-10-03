@@ -111,7 +111,8 @@ slower.
 | `GRPC_CALAMINE_UPLOAD_DEADLINE_SECS` | `600`      | seconds one whole `OpenWorkbook` upload may take; `0` never |
 | `GRPC_CALAMINE_MAX_PICTURE_BYTES` | `67108864`    | largest embedded picture, inflated (64 MiB) |
 | `GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES` | `268435456` | one workbook's pictures together, inflated (256 MiB) |
-| `GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES` | `1073741824` | largest shared-string table, inflated (1 GiB) |
+| `GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES` | `268435456` | largest shared-string table, inflated (256 MiB) |
+| `GRPC_CALAMINE_FORMATS`          | `xlsx,xlsb,xls,ods` | workbook formats accepted; a refused one is never opened |
 | `GRPC_CALAMINE_MAX_DENSE_CELLS`  | `33554432`     | cells one formula, XLS or ODS stream may densify |
 | `GRPC_CALAMINE_MAX_FORMULA_BYTES` | `536870912`  | formula bytes one xlsx/xlsb formula stream may collect (512 MiB) |
 
@@ -165,9 +166,18 @@ every one its own copy of the image while it opens the workbook, but the
 pinned fork shares one copy between them, and `GetPictures` copies each
 anchor's picture only as it sends it. A 17 KB upload anchoring one 64 KiB
 image 20,000 times opens holding that image once rather than 1.25 GB of
-copies (`tests/pictures.rs`). The pictures that pass are charged against
-`GRPC_CALAMINE_MAX_STORE_BYTES` along with the upload, since the workbook's
-parked reader keeps them.
+copies (`tests/pictures.rs`).
+
+What passes is charged against `GRPC_CALAMINE_MAX_STORE_BYTES` along with
+the upload, since every reader of the workbook keeps it: the pictures, and
+the shared-string table as calamine parses it into owned strings. That
+table costs more than its XML, a slot and a heap block per string, so it is
+charged as its inflated bytes plus 16 bytes per tag (xlsx) or 48 per record
+(xlsb): a table of `<si><t>a</t></si>` entries, 16 bytes each, is charged 80
+per entry. The workbook's charge covers the one reader it keeps parked; a
+read that finds that reader busy (a second stream on the same workbook)
+opens another, which is charged the same again while it lives, and is
+refused with `RESOURCE_EXHAUSTED` when it does not fit.
 
 The same scan refuses, with `INVALID_ARGUMENT`, a shared-string table whose
 declared `uniqueCount` is larger than its inflated bytes could hold: calamine
@@ -194,7 +204,10 @@ the parse is delivered as a gRPC `INTERNAL` status, never as a stream that
 ends successfully having sent nothing.
 
 **Some streams send a dense range, and those are budgeted.** The value
-stream of an xlsx or xlsb sheet goes cell by cell and never builds one. A
+stream of an xlsx or xlsb sheet goes cell by cell and never builds one, and
+each of its rows ends at that row's own last value: a value at XFD1 does
+not widen the rows after it, so its output is the populated rows, each as
+long as its last value, and nothing is padded to a width no row has. A
 formula stream, and any XLS or ODS stream, sends every row of its range
 from column A, and a range is as large as the two cells furthest apart make
 it: two formulas at opposite corners of a sheet are about 17 billion cells.
@@ -227,8 +240,13 @@ many times over. An 823-byte .ods of one 4 KiB string repeated across 1,024
 columns and 16 rows opens as 64 MiB of strings, and the same recipe with
 larger counts goes as far as the cell cap times the string. That memory is
 held by the workbook's parked reader and is not charged against
-`GRPC_CALAMINE_MAX_STORE_BYTES`. Do not accept ODS uploads from untrusted
-clients until this is bounded.
+`GRPC_CALAMINE_MAX_STORE_BYTES`. A server that takes uploads from untrusted
+clients should refuse ODS until this is bounded, and XLS too unless the
+fallible allocation is enough: `GRPC_CALAMINE_FORMATS=xlsx,xlsb` does that.
+A refused format is never opened. Named as the format hint it fails
+`OpenWorkbook` with `FAILED_PRECONDITION`; auto-detection tries only the
+accepted formats, in calamine's own order, so an ODS upload to that server
+fails with `INVALID_ARGUMENT` without calamine ever parsing it as ODS.
 
 ## API
 

@@ -34,7 +34,10 @@
 //! an RPC is still reading is never idle, however long the read takes.
 //!
 //! What calamine inflates while opening a workbook is bounded too, before
-//! calamine is asked to: see [`crate::archive`].
+//! calamine is asked to: see [`crate::archive`]. What that leaves each reader
+//! holding (the pictures and the parsed shared-string table) is charged to
+//! the same byte budget: once in the workbook's own charge, for the reader it
+//! keeps parked, and again for every further reader while it lives.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -71,24 +74,80 @@ pub type WorkbookReader = Sheets<Cursor<WorkbookBytes>>;
 /// cannot spend. Readers beyond the parked one open their own, as before.
 const MAX_POOLED_READERS: usize = 1;
 
+/// A reader and what it is charged against the store's byte budget.
+///
+/// `None` is the workbook's first reader, which the workbook's own charge
+/// covers; every reader opened after it carries its own [`Charge`].
+type ParkedReader = (WorkbookReader, Option<Charge>);
+
 /// Free list of readers parked for reuse by one workbook.
 #[derive(Default)]
 struct ReaderPool {
-    free: Mutex<Vec<WorkbookReader>>,
+    free: Mutex<Vec<ParkedReader>>,
 }
 
 impl ReaderPool {
     /// Take a parked reader, if one is available.
-    fn take(&self) -> Option<WorkbookReader> {
+    fn take(&self) -> Option<ParkedReader> {
         self.free.lock().expect("reader pool lock poisoned").pop()
     }
 
     /// Park a reader for reuse, dropping it if the pool is already full.
-    fn park(&self, reader: WorkbookReader) {
+    ///
+    /// The first reader is never the one dropped: it takes the place of a
+    /// charged one if it must. So it lives as long as the workbook, the
+    /// workbook's own charge always has a reader to cover, and every other
+    /// live reader carries a charge of its own.
+    fn park(&self, reader: ParkedReader) {
         let mut free = self.free.lock().expect("reader pool lock poisoned");
         if free.len() < MAX_POOLED_READERS {
             free.push(reader);
+        } else if reader.1.is_none()
+            && let Some(charged) = free.iter_mut().find(|parked| parked.1.is_some())
+        {
+            *charged = reader;
         }
+    }
+}
+
+/// The byte budget the open workbooks and their extra readers share.
+#[derive(Debug)]
+struct Budget {
+    held: Mutex<u64>,
+    max: u64,
+}
+
+impl Budget {
+    fn held(&self) -> u64 {
+        *self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Take `bytes` if they fit, or return what is already held.
+    fn take(&self, bytes: u64) -> Result<(), u64> {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        if held.saturating_add(bytes) > self.max {
+            return Err(*held);
+        }
+        *held += bytes;
+        Ok(())
+    }
+
+    fn give(&self, bytes: u64) {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        *held = held.saturating_sub(bytes);
+    }
+}
+
+/// Bytes a reader beyond a workbook's first holds against the budget, given
+/// back when the reader is dropped.
+struct Charge {
+    budget: Arc<Budget>,
+    bytes: u64,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.budget.give(self.bytes);
     }
 }
 
@@ -98,7 +157,7 @@ impl ReaderPool {
 /// dropped, so the next read of the same workbook skips the open cost.
 pub struct PooledReader {
     /// Always `Some` until `Drop` takes it back out.
-    reader: Option<WorkbookReader>,
+    reader: Option<ParkedReader>,
     pool: Arc<ReaderPool>,
 }
 
@@ -106,13 +165,13 @@ impl std::ops::Deref for PooledReader {
     type Target = WorkbookReader;
 
     fn deref(&self) -> &Self::Target {
-        self.reader.as_ref().expect("reader taken only on drop")
+        &self.reader.as_ref().expect("reader taken only on drop").0
     }
 }
 
 impl std::ops::DerefMut for PooledReader {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.reader.as_mut().expect("reader taken only on drop")
+        &mut self.reader.as_mut().expect("reader taken only on drop").0
     }
 }
 
@@ -139,8 +198,10 @@ pub struct StoreLimits {
     /// Most workbooks open at once. Opening one more is refused.
     pub max_open_workbooks: usize,
     /// Most bytes the open workbooks may hold together, counting each one's
-    /// uploaded bytes and the pictures inflated from them, which its parked
-    /// reader keeps. Opening a workbook that would pass it is refused.
+    /// uploaded bytes and what one reader of it keeps (the pictures inflated
+    /// from it and an estimate of its parsed shared-string table), plus that
+    /// again for every further reader while it reads. Opening a workbook, or
+    /// a further reader, that would pass it is refused.
     pub max_store_bytes: u64,
     /// How long a workbook may go unused before it is closed on its client's
     /// behalf. Zero keeps every workbook until it is closed.
@@ -160,6 +221,99 @@ impl Default for StoreLimits {
     }
 }
 
+/// The workbook formats a store accepts, configured as a comma-separated
+/// list such as `xlsx,xlsb` (`GRPC_CALAMINE_FORMATS`).
+///
+/// A refused format is never handed to calamine at all, so it costs nothing
+/// that opening it would: XLS and ODS are parsed into dense ranges while they
+/// open, outside every byte limit, and a server that cannot afford that for
+/// its clients refuses them here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FormatSet(u8);
+
+impl FormatSet {
+    /// Every format calamine reads.
+    pub const ALL: Self = Self(0b1111);
+
+    /// The order calamine's `open_workbook_auto_from_rs` tries formats in.
+    const DETECTION_ORDER: [pb::WorkbookFormat; 4] = [
+        pb::WorkbookFormat::Xls,
+        pb::WorkbookFormat::Xlsx,
+        pb::WorkbookFormat::Xlsb,
+        pb::WorkbookFormat::Ods,
+    ];
+
+    /// The order formats are listed in.
+    const LISTED_ORDER: [pb::WorkbookFormat; 4] = [
+        pb::WorkbookFormat::Xlsx,
+        pb::WorkbookFormat::Xlsb,
+        pb::WorkbookFormat::Xls,
+        pb::WorkbookFormat::Ods,
+    ];
+
+    fn bit(format: pb::WorkbookFormat) -> u8 {
+        match format {
+            pb::WorkbookFormat::Unspecified => 0,
+            pb::WorkbookFormat::Xls => 1,
+            pb::WorkbookFormat::Xlsx => 2,
+            pb::WorkbookFormat::Xlsb => 4,
+            pb::WorkbookFormat::Ods => 8,
+        }
+    }
+
+    /// The name a format is configured by.
+    fn name(format: pb::WorkbookFormat) -> &'static str {
+        match format {
+            pb::WorkbookFormat::Unspecified => "unspecified",
+            pb::WorkbookFormat::Xls => "xls",
+            pb::WorkbookFormat::Xlsx => "xlsx",
+            pb::WorkbookFormat::Xlsb => "xlsb",
+            pb::WorkbookFormat::Ods => "ods",
+        }
+    }
+
+    /// Whether workbooks of `format` are accepted.
+    #[must_use]
+    pub fn accepts(self, format: pb::WorkbookFormat) -> bool {
+        self.0 & Self::bit(format) != 0
+    }
+}
+
+impl std::str::FromStr for FormatSet {
+    type Err = String;
+
+    /// Parse a comma-separated list of `xlsx`, `xlsb`, `xls` and `ods`, in
+    /// any case and order. A list naming none of them is an error: a server
+    /// that accepts no workbook is a mistake in its configuration.
+    fn from_str(list: &str) -> Result<Self, Self::Err> {
+        let mut set = 0u8;
+        for word in list.split(',').map(str::trim).filter(|w| !w.is_empty()) {
+            let format = Self::LISTED_ORDER
+                .into_iter()
+                .find(|format| Self::name(*format).eq_ignore_ascii_case(word))
+                .ok_or_else(|| {
+                    format!("unknown format {word:?}; list any of xlsx, xlsb, xls and ods")
+                })?;
+            set |= Self::bit(format);
+        }
+        if set == 0 {
+            return Err("no format is listed; list any of xlsx, xlsb, xls and ods".to_string());
+        }
+        Ok(Self(set))
+    }
+}
+
+impl std::fmt::Display for FormatSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = Self::LISTED_ORDER
+            .into_iter()
+            .filter(|format| self.accepts(*format))
+            .map(Self::name)
+            .collect();
+        f.write_str(&names.join(","))
+    }
+}
+
 /// A configured limit that opening a workbook would pass.
 ///
 /// A refusal, not a fault in the workbook: the same bytes open once there is
@@ -170,6 +324,16 @@ pub enum LimitExceeded {
     OpenWorkbooks {
         /// [`StoreLimits::max_open_workbooks`].
         max: usize,
+    },
+    /// A further reader of a workbook does not fit beside what the open
+    /// workbooks and their readers already hold.
+    ReaderBytes {
+        /// What the reader would hold.
+        needed: u64,
+        /// What is already held.
+        held: u64,
+        /// [`StoreLimits::max_store_bytes`].
+        max: u64,
     },
     /// The open workbooks hold too much for this one to fit beside them.
     StoreBytes {
@@ -216,6 +380,14 @@ impl std::fmt::Display for LimitExceeded {
                  {held} of the {max} this server keeps; close handles that are no \
                  longer needed, retry shortly, or raise GRPC_CALAMINE_MAX_STORE_BYTES"
             ),
+            Self::ReaderBytes { needed, held, max } => write!(
+                f,
+                "another read of this workbook already holds its reader, and a second \
+                 one needs {needed} bytes for its pictures and shared strings while \
+                 open workbooks and their readers already hold {held} of the {max} \
+                 this server keeps; retry once the other read ends, or raise \
+                 GRPC_CALAMINE_MAX_STORE_BYTES"
+            ),
             Self::Picture { name, max } => write!(
                 f,
                 "embedded picture {name:?} inflates past {max} bytes, the most one \
@@ -254,6 +426,11 @@ pub struct WorkbookEntry {
     pool: Arc<ReaderPool>,
     /// What this workbook counts against [`StoreLimits::max_store_bytes`].
     held_bytes: u64,
+    /// What each reader beyond the first is charged: its pictures and its
+    /// parsed shared-string table.
+    reader_bytes: u64,
+    /// The store's byte budget, which further readers are charged against.
+    budget: Arc<Budget>,
     /// When an RPC last used this workbook, for the idle TTL.
     last_used: Mutex<Instant>,
 }
@@ -281,14 +458,35 @@ impl WorkbookEntry {
     /// This is blocking CPU work; callers must run it inside
     /// `tokio::task::spawn_blocking`.
     ///
+    /// A reader opened because the parked one is busy holds its own pictures
+    /// and shared-string table, so it is charged against the store's byte
+    /// budget until it is dropped.
+    ///
     /// # Errors
     ///
-    /// Returns [`OpenError`] when calamine cannot re-open the bytes in the
-    /// format recorded at open time.
-    pub fn reader(&self) -> Result<PooledReader, OpenError> {
-        let mut workbook = match self.pool.take() {
+    /// [`ReaderError::Limit`] when a further reader does not fit in the
+    /// store's byte budget, and [`ReaderError::Open`] when calamine cannot
+    /// re-open the bytes in the format recorded at open time.
+    pub fn reader(&self) -> Result<PooledReader, ReaderError> {
+        let (mut workbook, charge) = match self.pool.take() {
             Some(parked) => parked,
-            None => open_as(Cursor::new(Arc::clone(&self.bytes)), self.format)?,
+            None => {
+                self.budget
+                    .take(self.reader_bytes)
+                    .map_err(|held| LimitExceeded::ReaderBytes {
+                        needed: self.reader_bytes,
+                        held,
+                        max: self.budget.max,
+                    })?;
+                let charge = Charge {
+                    budget: Arc::clone(&self.budget),
+                    bytes: self.reader_bytes,
+                };
+                (
+                    open_as(Cursor::new(Arc::clone(&self.bytes)), self.format)?,
+                    Some(charge),
+                )
+            }
         };
         // Re-applied on every checkout: a parked reader carries whatever the
         // previous borrower set.
@@ -296,9 +494,41 @@ impl WorkbookEntry {
             workbook.with_header_row(header_row);
         }
         Ok(PooledReader {
-            reader: Some(workbook),
+            reader: Some((workbook, charge)),
             pool: Arc::clone(&self.pool),
         })
+    }
+}
+
+/// Why [`WorkbookEntry::reader`] did not give a reader.
+#[derive(Debug)]
+pub enum ReaderError {
+    /// calamine cannot re-open the bytes.
+    Open(OpenError),
+    /// A further reader does not fit in the store's byte budget.
+    Limit(LimitExceeded),
+}
+
+impl std::fmt::Display for ReaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open(e) => e.fmt(f),
+            Self::Limit(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ReaderError {}
+
+impl From<OpenError> for ReaderError {
+    fn from(e: OpenError) -> Self {
+        Self::Open(e)
+    }
+}
+
+impl From<LimitExceeded> for ReaderError {
+    fn from(e: LimitExceeded) -> Self {
+        Self::Limit(e)
     }
 }
 
@@ -343,15 +573,17 @@ fn open_as(
 /// throttles read concurrency.
 pub struct WorkbookStore {
     inner: RwLock<Registry>,
+    /// Bytes held by the open workbooks, by opens admitted but not yet
+    /// registered, and by every reader beyond a workbook's first.
+    budget: Arc<Budget>,
     limits: StoreLimits,
+    formats: FormatSet,
 }
 
-/// The workbooks and what they are charged, behind the store's lock.
+/// The workbooks, behind the store's lock.
 #[derive(Default)]
 struct Registry {
     entries: HashMap<String, Arc<WorkbookEntry>>,
-    /// Bytes held by `entries` and by opens admitted but not yet registered.
-    held_bytes: u64,
     /// Opens admitted but not yet registered. They count against the
     /// workbook cap too, so concurrent opens cannot overshoot it together.
     pending: usize,
@@ -392,7 +624,7 @@ impl Drop for Reservation<'_> {
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         registry.pending -= 1;
-        registry.held_bytes = registry.held_bytes.saturating_sub(self.bytes);
+        self.store.budget.give(self.bytes);
     }
 }
 
@@ -411,6 +643,19 @@ pub enum StoreError {
         /// What is wrong with it.
         detail: String,
     },
+    /// The client asked for a format this server does not accept.
+    FormatRefused {
+        /// The format asked for.
+        format: pb::WorkbookFormat,
+        /// The formats this server accepts.
+        accepted: FormatSet,
+    },
+    /// Auto-detection found no format this server accepts that the bytes
+    /// open as. They may be a workbook of a format it refuses.
+    NoAcceptedFormat {
+        /// The formats this server accepts.
+        accepted: FormatSet,
+    },
 }
 
 impl std::fmt::Display for StoreError {
@@ -419,6 +664,17 @@ impl std::fmt::Display for StoreError {
             Self::Unreadable(e) => e.fmt(f),
             Self::Limit(e) => e.fmt(f),
             Self::Malformed { part, detail } => write!(f, "{part}: {detail}"),
+            Self::FormatRefused { format, accepted } => write!(
+                f,
+                "this server does not accept {} workbooks; it accepts {accepted} \
+                 (GRPC_CALAMINE_FORMATS)",
+                FormatSet::name(*format)
+            ),
+            Self::NoAcceptedFormat { accepted } => write!(
+                f,
+                "the upload does not open as any format this server accepts \
+                 ({accepted}; GRPC_CALAMINE_FORMATS)"
+            ),
         }
     }
 }
@@ -479,8 +735,21 @@ impl WorkbookStore {
     pub fn with_limits(limits: StoreLimits) -> Self {
         Self {
             inner: RwLock::new(Registry::default()),
+            budget: Arc::new(Budget {
+                held: Mutex::new(0),
+                max: limits.max_store_bytes,
+            }),
             limits,
+            formats: FormatSet::ALL,
         }
+    }
+
+    /// Accept only workbooks of `formats`. Every format is accepted unless
+    /// this narrows it.
+    #[must_use]
+    pub fn with_formats(mut self, formats: FormatSet) -> Self {
+        self.formats = formats;
+        self
     }
 
     fn read(&self) -> RwLockReadGuard<'_, Registry> {
@@ -498,14 +767,19 @@ impl WorkbookStore {
                 max: self.limits.max_open_workbooks,
             });
         }
-        if registry.held_bytes.saturating_add(bytes) > self.limits.max_store_bytes {
-            return Err(LimitExceeded::StoreBytes {
-                needed: bytes,
-                held: registry.held_bytes,
-                max: self.limits.max_store_bytes,
-            });
+        let held = self.budget.held();
+        if held.saturating_add(bytes) > self.limits.max_store_bytes {
+            return Err(self.store_bytes(bytes, held));
         }
         Ok(())
+    }
+
+    fn store_bytes(&self, needed: u64, held: u64) -> LimitExceeded {
+        LimitExceeded::StoreBytes {
+            needed,
+            held,
+            max: self.limits.max_store_bytes,
+        }
     }
 
     /// Whether a workbook of `bytes` could be opened now.
@@ -536,8 +810,12 @@ impl WorkbookStore {
         let mut registry = self.write();
         self.sweep(&mut registry, Instant::now());
         self.fits(&registry, bytes)?;
+        // Readers beyond a workbook's first take from the budget without the
+        // registry lock, so the bytes are taken, not just checked.
+        self.budget
+            .take(bytes)
+            .map_err(|held| self.store_bytes(bytes, held))?;
         registry.pending += 1;
-        registry.held_bytes += bytes;
         Ok(Reservation {
             store: self,
             bytes,
@@ -554,7 +832,9 @@ impl WorkbookStore {
     ///
     /// [`StoreError::Limit`] when the workbook would inflate too much or the
     /// store has no room for it, both checked before calamine parses
-    /// anything, and [`StoreError::Unreadable`] when the bytes cannot be
+    /// anything, [`StoreError::FormatRefused`] or
+    /// [`StoreError::NoAcceptedFormat`] when the format is not one this store
+    /// accepts, and [`StoreError::Unreadable`] when the bytes cannot be
     /// parsed as a workbook (or as the specific format given by
     /// `format_hint`).
     ///
@@ -567,15 +847,31 @@ impl WorkbookStore {
         format_hint: pb::WorkbookFormat,
         header_row: Option<HeaderRow>,
     ) -> Result<(String, Arc<WorkbookEntry>), StoreError> {
+        // A refused format is refused before anything is parsed: what calamine
+        // builds while opening some formats is the reason to refuse them.
+        if format_hint != pb::WorkbookFormat::Unspecified && !self.formats.accepts(format_hint) {
+            return Err(StoreError::FormatRefused {
+                format: format_hint,
+                accepted: self.formats,
+            });
+        }
+
         // What calamine would inflate is measured before calamine is allowed
-        // to, and the pictures every reader keeps are charged to the workbook.
+        // to, and what every reader keeps is charged to the workbook: once
+        // here for the reader it parks, and again by each further reader.
         let inflated = archive::inspect(&bytes, &self.limits.inflate)?;
-        let held_bytes = (bytes.len() as u64).saturating_add(inflated.picture_bytes);
+        let reader_bytes = inflated.reader_bytes();
+        let held_bytes = (bytes.len() as u64).saturating_add(reader_bytes);
         let reservation = self.reserve(held_bytes)?;
         let bytes: WorkbookBytes = bytes.into();
 
         // One probing reader to detect the format and snapshot metadata.
-        let probe = open_as(Cursor::new(Arc::clone(&bytes)), format_hint)?;
+        let probe =
+            if format_hint == pb::WorkbookFormat::Unspecified && self.formats != FormatSet::ALL {
+                self.detect_accepted(&bytes)?
+            } else {
+                open_as(Cursor::new(Arc::clone(&bytes)), format_hint)?
+            };
         let format = match &probe {
             Sheets::Xls(_) => pb::WorkbookFormat::Xls,
             Sheets::Xlsx(_) => pb::WorkbookFormat::Xlsx,
@@ -598,7 +894,7 @@ impl WorkbookStore {
         // The probe is a fully parsed reader. Park it instead of dropping it,
         // so the first read of this workbook does not repeat the open.
         let pool = Arc::new(ReaderPool::default());
-        pool.park(probe);
+        pool.park((probe, None));
 
         let entry = Arc::new(WorkbookEntry {
             bytes,
@@ -608,11 +904,26 @@ impl WorkbookStore {
             is_1904,
             pool,
             held_bytes,
+            reader_bytes,
+            budget: Arc::clone(&self.budget),
             last_used: Mutex::new(Instant::now()),
         });
 
         let id = reservation.register(Arc::clone(&entry));
         Ok((id, entry))
+    }
+
+    /// Open `bytes` as the first format this store accepts that they open
+    /// as, trying them in calamine's own auto-detection order and never
+    /// trying a refused one.
+    fn detect_accepted(&self, bytes: &WorkbookBytes) -> Result<WorkbookReader, StoreError> {
+        FormatSet::DETECTION_ORDER
+            .into_iter()
+            .filter(|format| self.formats.accepts(*format))
+            .find_map(|format| open_as(Cursor::new(Arc::clone(bytes)), format).ok())
+            .ok_or(StoreError::NoAcceptedFormat {
+                accepted: self.formats,
+            })
     }
 
     /// Look up an open workbook by id, recording the use.
@@ -640,7 +951,7 @@ impl WorkbookStore {
         let Some(entry) = registry.entries.remove(id) else {
             return false;
         };
-        registry.held_bytes = registry.held_bytes.saturating_sub(entry.held_bytes);
+        self.budget.give(entry.held_bytes);
         true
     }
 
@@ -678,7 +989,7 @@ impl WorkbookStore {
             freed += entry.held_bytes;
             false
         });
-        registry.held_bytes = registry.held_bytes.saturating_sub(freed);
+        self.budget.give(freed);
         before - registry.entries.len()
     }
 
@@ -719,15 +1030,11 @@ impl WorkbookStore {
         }))
     }
 
-    /// Bytes the open workbooks hold, as charged against
-    /// [`StoreLimits::max_store_bytes`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if the store lock was poisoned by a panic on another thread.
+    /// Bytes the open workbooks and their further readers hold, as charged
+    /// against [`StoreLimits::max_store_bytes`].
     #[must_use]
     pub fn held_bytes(&self) -> u64 {
-        self.read().held_bytes
+        self.budget.held()
     }
 
     /// Number of currently open workbooks.
@@ -887,6 +1194,38 @@ mod tests {
         assert!(matches!(refused, StoreError::Unreadable(_)));
         assert_eq!(store.held_bytes(), 0);
         open(&store, "date.xlsx").expect("the only slot is free again");
+    }
+
+    /// A format list parses in any case and order, and an unknown or empty
+    /// one is an error rather than a server that accepts nothing.
+    #[test]
+    fn format_lists_parse() {
+        let set: FormatSet = " ODS, xlsx ".parse().expect("two formats");
+        assert!(set.accepts(pb::WorkbookFormat::Ods));
+        assert!(set.accepts(pb::WorkbookFormat::Xlsx));
+        assert!(!set.accepts(pb::WorkbookFormat::Xls));
+        assert!(!set.accepts(pb::WorkbookFormat::Unspecified));
+        assert_eq!(set.to_string(), "xlsx,ods");
+        assert_eq!("xlsx,xlsb,xls,ods".parse::<FormatSet>(), Ok(FormatSet::ALL));
+        assert!("xlsx,csv".parse::<FormatSet>().is_err());
+        assert!(" , ".parse::<FormatSet>().is_err());
+    }
+
+    /// A refused format is refused before anything is parsed or reserved.
+    #[test]
+    fn a_refused_format_holds_nothing() {
+        let store = WorkbookStore::with_limits(limits(8, u64::MAX, TTL))
+            .with_formats("xlsx".parse().expect("one format"));
+        let named = store
+            .open(fixture("date.ods"), pb::WorkbookFormat::Ods, None)
+            .err()
+            .expect("ods is refused");
+        assert!(matches!(named, StoreError::FormatRefused { .. }));
+        let detected = open(&store, "date.ods").err().expect("never detected");
+        assert!(matches!(detected, StoreError::NoAcceptedFormat { .. }));
+        assert_eq!(store.held_bytes(), 0);
+        assert!(store.is_empty());
+        open(&store, "date.xlsx").expect("xlsx is accepted");
     }
 
     /// Idle workbooks are closed to make room for an open that needs it, even

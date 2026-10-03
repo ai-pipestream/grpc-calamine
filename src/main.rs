@@ -28,8 +28,12 @@
 //! - `GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES`: most inflated bytes of one
 //!   workbook's pictures together (default: 256 MiB).
 //! - `GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES`: largest shared-string table,
-//!   inflated (default: 1 GiB). A workbook past any of the three is refused
+//!   inflated (default: 256 MiB). A workbook past any of the three is refused
 //!   at `OpenWorkbook` with `RESOURCE_EXHAUSTED`.
+//! - `GRPC_CALAMINE_FORMATS`: comma-separated workbook formats accepted, any
+//!   of `xlsx`, `xlsb`, `xls` and `ods` (default: all four). A refused format
+//!   is never opened: named in the options it fails `OpenWorkbook` with
+//!   `FAILED_PRECONDITION`, and auto-detection never tries it.
 //! - `GRPC_CALAMINE_MAX_DENSE_CELLS`: most cells, counted from column A, that
 //!   one formula stream or XLS/ODS stream may densify (default: 33554432).
 //!   A larger range is refused with `RESOURCE_EXHAUSTED` before its first
@@ -44,7 +48,7 @@ use std::time::Duration;
 use tonic::transport::Server;
 
 use grpc_calamine::archive::InflateLimits;
-use grpc_calamine::store::StoreLimits;
+use grpc_calamine::store::{FormatSet, StoreLimits};
 use grpc_calamine::{CalamineGrpc, WorkbookStore, proto};
 
 /// Default listen address when `GRPC_CALAMINE_ADDR` is not set.
@@ -185,7 +189,8 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
     // Streaming reads are capped well below the blocking pool so they can
     // never take every thread and leave uploads with none.
-    let mut grpc = CalamineGrpc::new(WorkbookStore::with_limits(limits));
+    let formats = env_or("GRPC_CALAMINE_FORMATS", FormatSet::ALL)?;
+    let mut grpc = CalamineGrpc::new(WorkbookStore::with_limits(limits).with_formats(formats));
     if let Some(max) = env("GRPC_CALAMINE_MAX_CONCURRENT_STREAMS")? {
         grpc = grpc.with_max_concurrent_streams(max);
     }
@@ -225,6 +230,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         limits.max_store_bytes,
         limits.idle_ttl.as_secs()
     );
+    eprintln!("grpc-calamine accepts {formats} workbooks");
     Server::builder()
         // Latency/throughput tuning for many concurrent streaming clients.
         .tcp_nodelay(true)
@@ -292,5 +298,16 @@ mod tests {
         parse_env::<usize>("X", Some("-1".into())).expect_err("negative");
         parse_env::<u32>("X", Some("4294967296".into())).expect_err("past u32");
         parse_env::<u64>("X", Some(String::new().into())).expect_err("empty");
+    }
+
+    #[test]
+    fn a_format_list_parses_or_names_the_variable() {
+        let formats = parse_env::<FormatSet>("GRPC_CALAMINE_FORMATS", Some("xlsx,xlsb".into()))
+            .expect("parses")
+            .expect("set");
+        assert_eq!(formats.to_string(), "xlsx,xlsb");
+        let err = parse_env::<FormatSet>("GRPC_CALAMINE_FORMATS", Some("xlsx,csv".into()))
+            .expect_err("csv is not a workbook format");
+        assert!(err.to_string().contains("GRPC_CALAMINE_FORMATS"), "{err}");
     }
 }

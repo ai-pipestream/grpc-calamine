@@ -58,8 +58,35 @@ const DEFAULT_MAX_PICTURE_BYTES: u64 = 64 * 1024 * 1024;
 /// Default for [`InflateLimits::max_picture_total_bytes`]: 256 MiB.
 const DEFAULT_MAX_PICTURE_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Default for [`InflateLimits::max_shared_strings_bytes`]: 1 GiB.
-const DEFAULT_MAX_SHARED_STRINGS_BYTES: u64 = 1024 * 1024 * 1024;
+/// Default for [`InflateLimits::max_shared_strings_bytes`]: 256 MiB.
+///
+/// The parsed table is held by every reader of the workbook and charged to
+/// the store at more than its inflated size (see
+/// [`Inflated::shared_strings_bytes`]), so this keeps one table well inside
+/// the default 2 GiB store.
+const DEFAULT_MAX_SHARED_STRINGS_BYTES: u64 = 256 * 1024 * 1024;
+
+/// What one tag of an xlsx shared-string table is charged, on top of the
+/// table's inflated bytes, for the strings calamine parses out of it.
+///
+/// calamine keeps each `<si>` entry as an owned `String`: a 24-byte slot in
+/// the table plus its text in a heap block the allocator rounds up to at
+/// least 32 bytes. An entry calamine keeps has at least four tags
+/// (`<si><t>`, `</t></si>`), so 16 per tag charges it at least 64 bytes plus
+/// its text: `<si><t>a</t></si>`, 16 bytes of XML, is charged 80 and holds
+/// about 56. Text never adds a tag, because `<` in text is escaped.
+const SHARED_STRING_TAG_COST: u64 = 16;
+
+/// What one record of an xlsb shared-string table is charged, on top of the
+/// table's inflated bytes: the slot and the rounded heap block of the string
+/// calamine parses out of it, as for [`SHARED_STRING_TAG_COST`]. A record is
+/// at least 7 bytes, so a table of the shortest records is charged about
+/// eight times its size.
+const SHARED_STRING_RECORD_COST: u64 = 48;
+
+/// Bytes calamine reserves per declared shared string before reading one:
+/// the `String` slot `strings.reserve(uniqueCount)` makes room for.
+const SHARED_STRING_SLOT: u64 = 24;
 
 /// Smallest bytes a shared-string `<si>` entry can occupy in the table. Used
 /// only to turn the inflated table size into a ceiling on how many strings it
@@ -100,6 +127,22 @@ pub struct Inflated {
     /// once, however many anchors embed it. Every reader of the workbook
     /// holds this for as long as it lives.
     pub picture_bytes: u64,
+    /// Estimated bytes of the shared-string table once calamine has parsed
+    /// it into owned strings, which every reader also holds for as long as
+    /// it lives. An estimate, never below what the table can cost: the
+    /// inflated bytes, plus [`SHARED_STRING_TAG_COST`] per tag (xlsx) or
+    /// [`SHARED_STRING_RECORD_COST`] per record (xlsb), or what the declared
+    /// `uniqueCount` reserves if that is more.
+    pub shared_strings_bytes: u64,
+}
+
+impl Inflated {
+    /// What one reader of the workbook holds beyond the upload: its pictures
+    /// and its parsed shared-string table.
+    #[must_use]
+    pub fn reader_bytes(&self) -> u64 {
+        self.picture_bytes.saturating_add(self.shared_strings_bytes)
+    }
 }
 
 /// Why [`inspect`] refused a workbook.
@@ -193,6 +236,7 @@ pub fn inspect(bytes: &[u8], limits: &InflateLimits) -> Result<Inflated, Rejecte
     // for, so the work here is bounded by that total however many images the
     // archive holds.
     let mut media_total = 0u64;
+    let mut strings_total = 0u64;
     for index in 0..zip.len() {
         let Ok(mut entry) = zip.by_index(index) else {
             continue;
@@ -220,13 +264,16 @@ pub fn inspect(bytes: &[u8], limits: &InflateLimits) -> Result<Inflated, Rejecte
             }
             Some(Part::SharedStrings) => {
                 let name = quoted(entry.name());
-                scan_shared_strings(&mut entry, name, limits)?;
+                let binary = normalize(entry.name()).ends_with(".bin");
+                let parsed = scan_shared_strings(&mut entry, name, binary, limits)?;
+                strings_total = strings_total.saturating_add(parsed);
             }
             None => {}
         }
     }
     Ok(Inflated {
         picture_bytes: media_total,
+        shared_strings_bytes: strings_total,
     })
 }
 
@@ -253,8 +300,10 @@ fn inflated_size(part: &mut impl Read, limit: u64) -> Option<u64> {
     }
 }
 
-/// Validate a shared-string table: enforce its byte limit, and refuse one
-/// whose declared `uniqueCount` is more than the inflated bytes could hold.
+/// Validate a shared-string table: enforce its byte limit, refuse one whose
+/// declared `uniqueCount` is more than the inflated bytes could hold, and
+/// return the estimate of what it costs parsed (see
+/// [`Inflated::shared_strings_bytes`]). `binary` is an xlsb table.
 ///
 /// calamine reads `uniqueCount` and calls `self.strings.reserve(n)` with it
 /// before reading a single entry (xlsx/mod.rs:360), so a 2 KB table that
@@ -267,10 +316,13 @@ fn inflated_size(part: &mut impl Read, limit: u64) -> Option<u64> {
 fn scan_shared_strings(
     part: &mut impl Read,
     name: String,
+    binary: bool,
     limits: &InflateLimits,
-) -> Result<(), Rejected> {
+) -> Result<u64, Rejected> {
     let mut head: Vec<u8> = Vec::new();
     let mut total = 0u64;
+    let mut tags = 0u64;
+    let mut records = RecordCounter::default();
     let mut sink = vec![0u8; 64 * 1024];
     loop {
         match part.read(&mut sink) {
@@ -283,6 +335,11 @@ fn scan_shared_strings(
                         max: limits.max_shared_strings_bytes,
                     }));
                 }
+                if binary {
+                    records.feed(&sink[..n]);
+                } else {
+                    tags += sink[..n].iter().filter(|&&b| b == b'<').count() as u64;
+                }
                 if head.len() < SST_HEAD_SCAN {
                     let room = SST_HEAD_SCAN - head.len();
                     head.extend_from_slice(&sink[..n.min(room)]);
@@ -293,6 +350,12 @@ fn scan_shared_strings(
         }
     }
 
+    let entries = if binary {
+        records.records.saturating_mul(SHARED_STRING_RECORD_COST)
+    } else {
+        tags.saturating_mul(SHARED_STRING_TAG_COST)
+    };
+    let mut parsed = total.saturating_add(entries);
     if let Some(declared) = declared_unique_count(&head) {
         let capacity = total / MIN_SI_BYTES;
         if declared > capacity {
@@ -305,8 +368,82 @@ fn scan_shared_strings(
                 ),
             });
         }
+        parsed = parsed.max(declared.saturating_mul(SHARED_STRING_SLOT));
     }
-    Ok(())
+    Ok(parsed)
+}
+
+/// Counts the records of an xlsb (BIFF12) stream fed to it in pieces,
+/// reading each record header the way calamine's `RecordIter` does
+/// (xlsb/mod.rs `read_type`, `fill_buffer`): a type of one or two bytes, then
+/// a length of one to four bytes, seven bits each, then that many bytes.
+#[derive(Default)]
+struct RecordCounter {
+    /// Record headers read so far.
+    records: u64,
+    state: RecordState,
+}
+
+/// Where a [`RecordCounter`] is within the current record.
+#[derive(Clone, Copy, Default)]
+enum RecordState {
+    /// Reading the type's first byte.
+    #[default]
+    Type,
+    /// Reading the type's second byte, which the first asked for.
+    TypeSecond,
+    /// Reading the length: bytes read so far and the value so far.
+    Length { read: u32, len: u64 },
+    /// Skipping the payload: bytes still to skip, never zero.
+    Payload(u64),
+}
+
+impl RecordCounter {
+    fn feed(&mut self, mut bytes: &[u8]) {
+        while let Some((&byte, rest)) = bytes.split_first() {
+            self.state = match self.state {
+                RecordState::Payload(left) => {
+                    let skip = left.min(bytes.len() as u64);
+                    // `skip` is at most `bytes.len()`, so it fits in usize.
+                    bytes = &bytes[usize::try_from(skip).unwrap_or(bytes.len())..];
+                    if left == skip {
+                        RecordState::Type
+                    } else {
+                        RecordState::Payload(left - skip)
+                    }
+                }
+                RecordState::Type => {
+                    bytes = rest;
+                    if byte & 0x80 == 0 {
+                        RecordState::Length { read: 0, len: 0 }
+                    } else {
+                        RecordState::TypeSecond
+                    }
+                }
+                RecordState::TypeSecond => {
+                    bytes = rest;
+                    RecordState::Length { read: 0, len: 0 }
+                }
+                RecordState::Length { read, len } => {
+                    bytes = rest;
+                    let len = len | (u64::from(byte & 0x7F) << (7 * read));
+                    if byte & 0x80 != 0 && read < 3 {
+                        RecordState::Length {
+                            read: read + 1,
+                            len,
+                        }
+                    } else {
+                        self.records += 1;
+                        if len == 0 {
+                            RecordState::Type
+                        } else {
+                            RecordState::Payload(len)
+                        }
+                    }
+                }
+            };
+        }
+    }
 }
 
 /// The `uniqueCount` attribute of the `<sst>` root element, if present in the
@@ -455,6 +592,48 @@ mod tests {
         // No uniqueCount, and not the sst element.
         assert_eq!(declared_unique_count(br#"<sst count="5">"#), None);
         assert_eq!(declared_unique_count(br#"<sstx uniqueCount="5">"#), None);
+    }
+
+    /// The parsed estimate covers the inflated bytes and a slot per tag, and
+    /// a declared `uniqueCount` raises it to what calamine reserves.
+    #[test]
+    fn the_parsed_table_is_estimated_from_its_tags() {
+        let limits = InflateLimits::default();
+        let entry = "<si><t>a</t></si>";
+        let table = format!("<sst>{}</sst>", entry.repeat(1000));
+        let tags = 2 + 4 * 1000;
+        let parsed = scan_shared_strings(&mut table.as_bytes(), String::new(), false, &limits)
+            .expect("an honest table");
+        assert_eq!(parsed, table.len() as u64 + tags * SHARED_STRING_TAG_COST);
+        // At least the slot and a rounded heap block per string.
+        assert!(parsed >= 1000 * (24 + 32));
+
+        let declared = format!(r#"<sst uniqueCount="2000">{}</sst>"#, entry.repeat(1000));
+        let parsed = scan_shared_strings(&mut declared.as_bytes(), String::new(), false, &limits)
+            .expect("2000 fits in the bytes");
+        assert!(parsed >= 2000 * SHARED_STRING_SLOT);
+    }
+
+    /// xlsb records are counted from their headers, whatever the chunking.
+    #[test]
+    fn xlsb_records_are_counted_across_reads() {
+        // A one-byte type and length with a 7-byte payload, a two-byte type
+        // with an empty payload, and a two-byte length of 130.
+        let mut stream = vec![0x13, 0x07, 0, 1, 0, 0, 0, b'a', 0];
+        stream.extend([0x9F, 0x01, 0x00]);
+        stream.extend([0x13, 0x82, 0x01]);
+        stream.extend(std::iter::repeat_n(0u8, 130));
+        for chunk in [1, 2, 5, stream.len()] {
+            let mut counter = RecordCounter::default();
+            for piece in stream.chunks(chunk) {
+                counter.feed(piece);
+            }
+            assert_eq!(counter.records, 3, "chunks of {chunk}");
+            assert!(
+                matches!(counter.state, RecordState::Type),
+                "chunks of {chunk}"
+            );
+        }
     }
 
     #[test]

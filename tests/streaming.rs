@@ -2598,3 +2598,207 @@ async fn an_honest_shared_string_count_opens() {
         .await
         .expect("an honest table opens");
 }
+
+// ---------------------------------------------------------------------------
+// What every reader holds: the parsed shared-string table, charged to the
+// store once for the workbook's parked reader and again for each further one.
+// ---------------------------------------------------------------------------
+
+/// A shared-string table of `entries` strings like `<si><t>s0</t></si>`.
+fn shared_string_table(entries: usize) -> Vec<u8> {
+    let mut table = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">"#,
+    );
+    for i in 0..entries {
+        table.push_str(&format!("<si><t>s{i}</t></si>"));
+    }
+    table.push_str("</sst>");
+    table.into_bytes()
+}
+
+/// The parsed table is charged with the upload, and a reader opened while
+/// the parked one is busy is charged again until the workbook has only one
+/// reader left.
+#[test]
+fn the_shared_string_table_is_charged_for_every_reader() {
+    const ENTRIES: u64 = 10_000;
+    let package = xlsx_with_parts(&[(
+        "xl/sharedStrings.xml",
+        shared_string_table(ENTRIES as usize),
+    )]);
+    let upload = package.len() as u64;
+    let store = WorkbookStore::new();
+    let (_, entry) = store
+        .open(package, pb::WorkbookFormat::Unspecified, None)
+        .expect("open");
+
+    let held = store.held_bytes();
+    // At least a 24-byte slot and a heap block per string.
+    assert!(
+        held >= upload + ENTRIES * 56,
+        "{held} held for {upload} uploaded"
+    );
+    let per_reader = held - upload;
+
+    let first = entry.reader().expect("the parked reader");
+    assert_eq!(
+        store.held_bytes(),
+        held,
+        "the parked reader is already charged"
+    );
+    let second = entry.reader().expect("a further reader fits");
+    assert_eq!(store.held_bytes(), held + per_reader);
+    drop(second);
+    assert_eq!(
+        store.held_bytes(),
+        held + per_reader,
+        "parked while the first is out, it keeps its charge"
+    );
+    drop(first);
+    assert_eq!(
+        store.held_bytes(),
+        held,
+        "once both are back, one reader is kept and the other's charge returned"
+    );
+}
+
+/// A further reader that does not fit in the byte budget is refused rather
+/// than parsing the table again.
+#[test]
+fn a_further_reader_past_the_byte_budget_is_refused() {
+    let package = xlsx_with_parts(&[("xl/sharedStrings.xml", shared_string_table(10_000))]);
+    let probe = WorkbookStore::new();
+    probe
+        .open(package.clone(), pb::WorkbookFormat::Unspecified, None)
+        .expect("open");
+    let held = probe.held_bytes();
+
+    let store = WorkbookStore::with_limits(StoreLimits {
+        max_store_bytes: held + held / 4,
+        ..StoreLimits::default()
+    });
+    let (_, entry) = store
+        .open(package, pb::WorkbookFormat::Unspecified, None)
+        .expect("one reader fits");
+    let _busy = entry.reader().expect("the parked reader");
+    let refused = entry.reader().err().expect("a second does not fit");
+    assert!(
+        matches!(
+            refused,
+            grpc_calamine::store::ReaderError::Limit(
+                grpc_calamine::store::LimitExceeded::ReaderBytes { .. }
+            )
+        ),
+        "{refused}"
+    );
+    assert!(
+        refused
+            .to_string()
+            .contains("GRPC_CALAMINE_MAX_STORE_BYTES")
+    );
+    assert_eq!(store.held_bytes(), held, "a refused reader holds nothing");
+}
+
+/// A small upload whose table parses to far more than it weighs is refused
+/// by the byte budget at open, before calamine parses it.
+#[tokio::test]
+async fn a_shared_string_bomb_is_charged_at_open() {
+    let bomb = xlsx_with_parts(&[("xl/sharedStrings.xml", shared_string_table(400_000))]);
+    assert!(bomb.len() < 2 * MIB, "the upload is a couple of MB at most");
+    let store = WorkbookStore::with_limits(StoreLimits {
+        max_store_bytes: 16 * MIB as u64,
+        ..StoreLimits::default()
+    });
+    let client = start_server_with(CalamineGrpc::new(store)).await;
+
+    let refused = try_upload_bytes(&client, bomb, default_options())
+        .await
+        .expect_err("400,000 parsed strings do not fit in 16 MiB");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    assert!(
+        refused.message().contains("GRPC_CALAMINE_MAX_STORE_BYTES"),
+        "{}",
+        refused.message()
+    );
+}
+
+/// A value at XFD1 does not widen the rows after it: each row ends at its own
+/// last value, so one value per row down the sheet costs one cell per row
+/// rather than 16,384.
+#[tokio::test]
+async fn rows_are_not_padded_to_the_widest_row_before_them() {
+    let mut data = String::from(r#"<row r="1"><c r="XFD1"><v>1</v></c></row>"#);
+    for r in 2..=1000 {
+        data.push_str(&format!(r#"<row r="{r}"><c r="A{r}"><v>{r}</v></c></row>"#));
+    }
+    let client = start_server().await;
+    let opened = try_upload_bytes(&client, xlsx_with_sheet_data(&data), default_options())
+        .await
+        .expect("open");
+    let (_, rows) = stream_range(&client, &opened.workbook_id, 0).await;
+
+    assert_eq!(rows.len(), 1000);
+    assert_eq!(rows[0].values.len(), 16_384, "XFD1 is the 16,384th cell");
+    for row in &rows[1..] {
+        assert_eq!(
+            row.values.len(),
+            1,
+            "row {} ends at column A",
+            row.row_index
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GRPC_CALAMINE_FORMATS: formats a server refuses are never opened.
+// ---------------------------------------------------------------------------
+
+fn xlsx_only() -> grpc_calamine::store::FormatSet {
+    "xlsx,xlsb".parse().expect("a format list")
+}
+
+/// Asked for by name, a refused format is FAILED_PRECONDITION; detected, it
+/// is never tried, so the upload does not open as anything accepted.
+#[tokio::test]
+async fn a_refused_format_is_never_opened() {
+    let client = start_server_with(CalamineGrpc::new(
+        WorkbookStore::new().with_formats(xlsx_only()),
+    ))
+    .await;
+
+    let ods = std::fs::read(fixtures().join("date.ods")).expect("read fixture");
+    let named = try_upload_bytes(
+        &client,
+        ods,
+        pb::WorkbookOptions {
+            format_hint: pb::WorkbookFormat::Ods as i32,
+            header_row: None,
+        },
+    )
+    .await
+    .expect_err("ods is refused");
+    assert_eq!(named.code(), Code::FailedPrecondition);
+    assert!(
+        named.message().contains("ods") && named.message().contains("GRPC_CALAMINE_FORMATS"),
+        "{}",
+        named.message()
+    );
+
+    for file in ["date.ods", "date.xls"] {
+        let detected = try_upload(&client, file)
+            .await
+            .expect_err("auto-detection never tries a refused format");
+        assert_eq!(detected.code(), Code::InvalidArgument, "{file}");
+        assert!(
+            detected.message().contains("xlsx,xlsb"),
+            "{}",
+            detected.message()
+        );
+    }
+
+    let xlsx = upload(&client, "date.xlsx").await;
+    assert_eq!(xlsx.detected_format, pb::WorkbookFormat::Xlsx as i32);
+    let xlsb = upload(&client, "date.xlsb").await;
+    assert_eq!(xlsb.detected_format, pb::WorkbookFormat::Xlsb as i32);
+}

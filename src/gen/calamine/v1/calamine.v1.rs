@@ -646,7 +646,9 @@ pub mod open_workbook_request {
         #[prost(message, tag="1")]
         Options(super::WorkbookOptions),
         /// A chunk of the workbook file bytes. Chunks are concatenated in stream
-        /// order to form the complete file.
+        /// order to form the complete file. A chunk is never empty: an empty one
+        /// is refused with INVALID_ARGUMENT, and the whole upload must finish
+        /// within the server's upload deadline.
         #[prost(bytes, tag="2")]
         Chunk(::prost::alloc::vec::Vec<u8>),
     }

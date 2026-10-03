@@ -82,6 +82,13 @@ const DEFAULT_MAX_FORMULA_BYTES: u64 = 512 * 1024 * 1024;
 /// [`CONSUMER_STALL`] on the read side.
 const UPLOAD_STALL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Default for how long one whole upload may take: 10 minutes.
+///
+/// The stall bound alone does not free a slot: a client that sends a frame
+/// every 29 s never stalls, and holds its slot for as long as it likes. This
+/// bounds the upload as a whole. 512 MiB in 10 minutes is under 1 MB/s.
+const DEFAULT_UPLOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Rows the server will pack into one `rows` event when the caller does not
 /// choose. Only reached while the consumer is behind; a consumer that keeps up
 /// receives smaller batches sooner. Sized so a batch of ordinary rows stays
@@ -231,6 +238,8 @@ pub struct CalamineGrpc {
     upload_slots: Arc<tokio::sync::Semaphore>,
     /// How long an upload may go without a frame.
     upload_stall: std::time::Duration,
+    /// How long one whole upload may take; zero for no limit.
+    upload_deadline: std::time::Duration,
     /// Most cells one stream may densify, counted from column A.
     max_dense_cells: u64,
     /// Most bytes one formula stream may collect before it sends.
@@ -247,6 +256,7 @@ impl CalamineGrpc {
             stream_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONCURRENT_STREAMS)),
             upload_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONCURRENT_UPLOADS)),
             upload_stall: UPLOAD_STALL,
+            upload_deadline: DEFAULT_UPLOAD_DEADLINE,
             max_dense_cells: DEFAULT_MAX_DENSE_CELLS,
             max_formula_bytes: DEFAULT_MAX_FORMULA_BYTES,
         }
@@ -309,11 +319,82 @@ impl CalamineGrpc {
         self
     }
 
+    /// Override how long one whole upload may take, from its first frame to
+    /// its last, before it is abandoned with `DEADLINE_EXCEEDED` and its slot
+    /// released. Zero removes the limit.
+    #[must_use]
+    pub fn with_upload_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.upload_deadline = deadline;
+        self
+    }
+
     /// Start the task that closes workbooks left idle past the store's TTL;
     /// see [`WorkbookStore::spawn_reaper`]. Call it from inside the tokio
     /// runtime that serves the service.
     pub fn spawn_reaper(&self) -> Option<tokio::task::JoinHandle<()>> {
         WorkbookStore::spawn_reaper(&self.store)
+    }
+
+    /// Read an upload's options and file bytes, refusing it as soon as it
+    /// breaks a rule. Bounded per frame by the stall limit; the caller bounds
+    /// it as a whole.
+    async fn receive_upload(
+        &self,
+        mut stream: Streaming<pb::OpenWorkbookRequest>,
+    ) -> Result<(pb::WorkbookFormat, Option<HeaderRow>, Vec<u8>), Status> {
+        // First frame must carry the options.
+        let first = next_frame(&mut stream, self.upload_stall)
+            .await?
+            .ok_or_else(|| Status::invalid_argument("empty upload: no frames received"))?;
+        let Some(pb::open_workbook_request::Payload::Options(options)) = first.payload else {
+            return Err(Status::invalid_argument(
+                "first upload frame must carry `options`",
+            ));
+        };
+        let format_hint = pb::WorkbookFormat::try_from(options.format_hint)
+            .map_err(|_| Status::invalid_argument("unknown format_hint value"))?;
+        let header_row = options.header_row.map(|hr| match hr.selection {
+            Some(pb::header_row::Selection::RowIndex(i)) => HeaderRow::Row(i),
+            _ => HeaderRow::FirstNonEmptyRow,
+        });
+
+        // Remaining frames are file bytes; held in memory only.
+        let mut bytes = Vec::new();
+        while let Some(frame) = next_frame(&mut stream, self.upload_stall).await? {
+            match frame.payload {
+                // A frame that carries nothing would let a client keep an
+                // upload alive without ever sending the workbook.
+                Some(pb::open_workbook_request::Payload::Chunk(chunk)) if chunk.is_empty() => {
+                    return Err(Status::invalid_argument(
+                        "an upload chunk must carry at least one byte",
+                    ));
+                }
+                Some(pb::open_workbook_request::Payload::Chunk(chunk)) => {
+                    let len = bytes.len() + chunk.len();
+                    if len > self.max_workbook_bytes {
+                        return Err(Status::resource_exhausted(format!(
+                            "workbook exceeds the {} byte limit",
+                            self.max_workbook_bytes
+                        )));
+                    }
+                    // Refused as soon as it cannot fit, not after it has been
+                    // buffered whole only to be turned away.
+                    self.store
+                        .admits(len as u64)
+                        .map_err(|limit| Status::resource_exhausted(limit.to_string()))?;
+                    bytes.extend_from_slice(&chunk);
+                }
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "`options` frame must be the first and only options frame",
+                    ));
+                }
+            }
+        }
+        if bytes.is_empty() {
+            return Err(Status::invalid_argument("upload contained no file bytes"));
+        }
+        Ok((format_hint, header_row, bytes))
     }
 
     /// Take an upload slot, or refuse the upload.
@@ -1818,53 +1899,21 @@ impl CalamineService for CalamineGrpc {
         // buffered nothing. The permit moves into the parse below and is
         // released when the workbook is parsed, or when the client leaves.
         let permit = self.admit_upload()?;
-        let mut stream = request.into_inner();
-
-        // First frame must carry the options.
-        let first = next_frame(&mut stream, self.upload_stall)
-            .await?
-            .ok_or_else(|| Status::invalid_argument("empty upload: no frames received"))?;
-        let Some(pb::open_workbook_request::Payload::Options(options)) = first.payload else {
-            return Err(Status::invalid_argument(
-                "first upload frame must carry `options`",
-            ));
+        let stream = request.into_inner();
+        let upload = self.receive_upload(stream);
+        let (format_hint, header_row, bytes) = if self.upload_deadline.is_zero() {
+            upload.await?
+        } else {
+            tokio::time::timeout(self.upload_deadline, upload)
+                .await
+                .map_err(|_| {
+                    Status::deadline_exceeded(format!(
+                        "the upload did not finish within {:?}; abandoning it so its \
+                         upload slot can be reused (GRPC_CALAMINE_UPLOAD_DEADLINE_SECS)",
+                        self.upload_deadline
+                    ))
+                })??
         };
-        let format_hint = pb::WorkbookFormat::try_from(options.format_hint)
-            .map_err(|_| Status::invalid_argument("unknown format_hint value"))?;
-        let header_row = options.header_row.map(|hr| match hr.selection {
-            Some(pb::header_row::Selection::RowIndex(i)) => HeaderRow::Row(i),
-            _ => HeaderRow::FirstNonEmptyRow,
-        });
-
-        // Remaining frames are file bytes; held in memory only.
-        let mut bytes = Vec::new();
-        while let Some(frame) = next_frame(&mut stream, self.upload_stall).await? {
-            match frame.payload {
-                Some(pb::open_workbook_request::Payload::Chunk(chunk)) => {
-                    let len = bytes.len() + chunk.len();
-                    if len > self.max_workbook_bytes {
-                        return Err(Status::resource_exhausted(format!(
-                            "workbook exceeds the {} byte limit",
-                            self.max_workbook_bytes
-                        )));
-                    }
-                    // Refused as soon as it cannot fit, not after it has been
-                    // buffered whole only to be turned away.
-                    self.store
-                        .admits(len as u64)
-                        .map_err(|limit| Status::resource_exhausted(limit.to_string()))?;
-                    bytes.extend_from_slice(&chunk);
-                }
-                _ => {
-                    return Err(Status::invalid_argument(
-                        "`options` frame must be the first and only options frame",
-                    ));
-                }
-            }
-        }
-        if bytes.is_empty() {
-            return Err(Status::invalid_argument("upload contained no file bytes"));
-        }
 
         let store = Arc::clone(&self.store);
         let (id, entry) = tokio::task::spawn_blocking(move || {

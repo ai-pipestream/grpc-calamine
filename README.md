@@ -108,6 +108,7 @@ slower.
 | `GRPC_CALAMINE_MAX_OPEN_WORKBOOKS` | `256`        | workbooks open at once                      |
 | `GRPC_CALAMINE_MAX_STORE_BYTES`  | `2147483648`   | bytes the open workbooks hold together (2 GiB) |
 | `GRPC_CALAMINE_HANDLE_TTL_SECS`  | `300`          | idle seconds before a workbook is closed; `0` never |
+| `GRPC_CALAMINE_UPLOAD_DEADLINE_SECS` | `600`      | seconds one whole `OpenWorkbook` upload may take; `0` never |
 | `GRPC_CALAMINE_MAX_PICTURE_BYTES` | `67108864`    | largest embedded picture, inflated (64 MiB) |
 | `GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES` | `268435456` | one workbook's pictures together, inflated (256 MiB) |
 | `GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES` | `1073741824` | largest shared-string table, inflated (1 GiB) |
@@ -136,8 +137,11 @@ next `OpenWorkbook` is refused with `RESOURCE_EXHAUSTED`, during the upload
 rather than after it, once idle workbooks have been closed to make room.
 Uploads themselves are admitted against `GRPC_CALAMINE_MAX_CONCURRENT_UPLOADS`
 slots, since each buffers its workbook in memory until it is parsed, and an
-upload that sends nothing for 30 s is abandoned with `DEADLINE_EXCEEDED` so
-it cannot hold a slot forever. The server logs each time it closes idle
+upload that sends nothing for 30 s is abandoned with `DEADLINE_EXCEEDED`.
+That alone does not free a slot, because a client sending one byte every
+29 s never stalls, so an upload also has `GRPC_CALAMINE_UPLOAD_DEADLINE_SECS`
+to finish as a whole, and a chunk carrying no bytes is refused with
+`INVALID_ARGUMENT`. The server logs each time it closes idle
 workbooks, with how many remain open and what they hold.
 
 Some parts of a workbook are read whole while calamine opens it, before any

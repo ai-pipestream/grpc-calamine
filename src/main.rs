@@ -18,6 +18,9 @@
 //!   256). Opening one more is refused with `RESOURCE_EXHAUSTED`.
 //! - `GRPC_CALAMINE_MAX_STORE_BYTES`: bytes the open workbooks may hold
 //!   together (default: 2 GiB), refused past it the same way.
+//! - `GRPC_CALAMINE_UPLOAD_DEADLINE_SECS`: seconds one whole `OpenWorkbook`
+//!   upload may take before it is abandoned with `DEADLINE_EXCEEDED`
+//!   (default: 600; 0 never).
 //! - `GRPC_CALAMINE_HANDLE_TTL_SECS`: seconds a workbook may go unused
 //!   before it is closed for its client (default: 300; 0 never expires).
 //! - `GRPC_CALAMINE_MAX_PICTURE_BYTES`: largest embedded picture, inflated,
@@ -141,6 +144,12 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
     {
         grpc = grpc.with_max_dense_cells(max);
+    }
+    if let Some(secs) = std::env::var("GRPC_CALAMINE_UPLOAD_DEADLINE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        grpc = grpc.with_upload_deadline(Duration::from_secs(secs));
     }
     if let Some(max) = std::env::var("GRPC_CALAMINE_MAX_FORMULA_BYTES")
         .ok()

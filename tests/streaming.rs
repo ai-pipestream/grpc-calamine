@@ -1909,6 +1909,87 @@ async fn a_stalled_upload_is_abandoned_and_frees_its_slot() {
     upload(&client, "date.xlsx").await;
 }
 
+/// An upload that trickles never stalls, so the stall bound alone would let
+/// it hold its slot forever. One byte every 300 ms stays inside a 1 s stall
+/// bound throughout, and the whole-upload deadline still abandons it with
+/// DEADLINE_EXCEEDED, which frees the slot.
+#[tokio::test]
+async fn a_trickled_upload_is_abandoned_at_the_deadline() {
+    let grpc = CalamineGrpc::new(WorkbookStore::new())
+        .with_max_concurrent_uploads(1)
+        .with_upload_stall(Duration::from_secs(1))
+        .with_upload_deadline(Duration::from_secs(2));
+    let client = start_server_with(grpc).await;
+
+    let (frames, rx) = tokio::sync::mpsc::channel(1);
+    frames
+        .send(pb::OpenWorkbookRequest {
+            payload: Some(pb::open_workbook_request::Payload::Options(
+                default_options(),
+            )),
+        })
+        .await
+        .expect("queue the options frame");
+    let trickle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let chunk = pb::OpenWorkbookRequest {
+                payload: Some(pb::open_workbook_request::Payload::Chunk(vec![0])),
+            };
+            if frames.send(chunk).await.is_err() {
+                return;
+            }
+        }
+    });
+    let mut trickled_client = client.clone();
+    let started = std::time::Instant::now();
+    let abandoned = tokio::time::timeout(
+        Duration::from_secs(10),
+        trickled_client.open_workbook(ReceiverStream::new(rx)),
+    )
+    .await
+    .expect("the server ends the trickle well within 10 s")
+    .expect_err("a trickle is not waited on forever");
+    assert_eq!(abandoned.code(), Code::DeadlineExceeded);
+    assert!(
+        abandoned
+            .message()
+            .contains("GRPC_CALAMINE_UPLOAD_DEADLINE_SECS"),
+        "{}",
+        abandoned.message()
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "the stall bound never fired; the deadline did"
+    );
+    trickle.abort();
+
+    upload(&client, "date.xlsx").await;
+}
+
+/// A chunk that carries nothing is refused: it would let a client keep an
+/// upload alive without sending the workbook.
+#[tokio::test]
+async fn an_empty_upload_chunk_is_refused() {
+    let mut client = start_server().await;
+    let frames = vec![
+        pb::OpenWorkbookRequest {
+            payload: Some(pb::open_workbook_request::Payload::Options(
+                default_options(),
+            )),
+        },
+        pb::OpenWorkbookRequest {
+            payload: Some(pb::open_workbook_request::Payload::Chunk(Vec::new())),
+        },
+    ];
+    let refused = client
+        .open_workbook(tokio_stream::iter(frames))
+        .await
+        .expect_err("an empty chunk is refused");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(refused.message().contains("chunk"), "{}", refused.message());
+}
+
 // ---------------------------------------------------------------------------
 // What calamine inflates at open time.
 //

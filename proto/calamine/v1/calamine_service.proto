@@ -101,7 +101,9 @@ message OpenWorkbookRequest {
     WorkbookOptions options = 1;
 
     // A chunk of the workbook file bytes. Chunks are concatenated in stream
-    // order to form the complete file.
+    // order to form the complete file. A chunk is never empty: an empty one
+    // is refused with INVALID_ARGUMENT, and the whole upload must finish
+    // within the server's upload deadline.
     bytes chunk = 2;
   }
 }

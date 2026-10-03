@@ -112,6 +112,7 @@ slower.
 | `GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES` | `268435456` | one workbook's pictures together, inflated (256 MiB) |
 | `GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES` | `1073741824` | largest shared-string table, inflated (1 GiB) |
 | `GRPC_CALAMINE_MAX_DENSE_CELLS`  | `33554432`     | cells one formula, XLS or ODS stream may densify |
+| `GRPC_CALAMINE_MAX_FORMULA_BYTES` | `536870912`  | formula bytes one xlsx/xlsb formula stream may collect (512 MiB) |
 
 The window default is 50 MiB because window size over round-trip time caps
 upload throughput; hyper's 1 MiB default holds a 10 ms link near 100 MB/s.
@@ -189,7 +190,17 @@ row, about 412 GB of `String`s, so for xlsx and xlsb the server collects the
 formula cells itself and builds one row at a time. Either way a range of
 more than `GRPC_CALAMINE_MAX_DENSE_CELLS` cells, counted from column A, is
 refused with `RESOURCE_EXHAUSTED` before its first event. The default covers
-a whole .xls sheet (65,536 x 256) twice over.
+a whole .xls sheet (65,536 x 256) twice over. For xlsx and xlsb that extent is
+checked as each formula is collected, so a sheet is refused at the cell that
+takes it past the budget rather than after the whole sheet has been read.
+
+A cell count says nothing about the bytes behind it, though. calamine expands
+every cell of a shared formula into its own copy of the anchor's text, so a
+cell that is a few deflated bytes in the upload can be kilobytes in memory,
+and the formula stream has to hold every formula of the sheet before its
+first row. So the collected formulas are budgeted in bytes as well, text plus
+the slot that holds it, and a sheet past `GRPC_CALAMINE_MAX_FORMULA_BYTES` is
+refused with `RESOURCE_EXHAUSTED` before its first event.
 
 One cost stays outside that budget: calamine parses an XLS or ODS workbook
 into dense ranges while opening it, before the server sees a sheet. ODS is

@@ -31,6 +31,10 @@
 //!   one formula stream or XLS/ODS stream may densify (default: 33554432).
 //!   A larger range is refused with `RESOURCE_EXHAUSTED` before its first
 //!   event.
+//! - `GRPC_CALAMINE_MAX_FORMULA_BYTES`: most bytes of formulas, as calamine
+//!   expands them, that one xlsx or xlsb formula stream may collect before it
+//!   sends (default: 536870912). Past it the stream is refused with
+//!   `RESOURCE_EXHAUSTED` before its first event.
 
 use std::time::Duration;
 
@@ -137,6 +141,12 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
     {
         grpc = grpc.with_max_dense_cells(max);
+    }
+    if let Some(max) = std::env::var("GRPC_CALAMINE_MAX_FORMULA_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        grpc = grpc.with_max_formula_bytes(max);
     }
     // Detached on purpose: it ends by itself once the service is dropped.
     let _reaper = grpc.spawn_reaper();

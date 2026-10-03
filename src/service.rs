@@ -64,6 +64,16 @@ const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 16;
 /// sheet (65,536 x 256) twice over.
 const DEFAULT_MAX_DENSE_CELLS: u64 = 32 * 1024 * 1024;
 
+/// Default cap on the bytes one formula stream may collect: 512 MiB.
+///
+/// An xlsx or xlsb formula stream collects a sheet's formula cells before it
+/// sends the first row, and a cell's size on the wire says nothing about its
+/// size in memory: calamine expands every cell of a shared formula into its
+/// own copy of the anchor's text, so a 40-byte `<f t="shared" si="0"/>`
+/// becomes as long as the anchor formula, however long that is. The cell
+/// budget cannot see that, so the collected bytes are budgeted too.
+const DEFAULT_MAX_FORMULA_BYTES: u64 = 512 * 1024 * 1024;
+
 /// How long an upload may go without a frame before it is abandoned.
 ///
 /// The upload cap makes a stalled upload expensive: it holds a slot, and a
@@ -223,6 +233,8 @@ pub struct CalamineGrpc {
     upload_stall: std::time::Duration,
     /// Most cells one stream may densify, counted from column A.
     max_dense_cells: u64,
+    /// Most bytes one formula stream may collect before it sends.
+    max_formula_bytes: u64,
 }
 
 impl CalamineGrpc {
@@ -236,6 +248,7 @@ impl CalamineGrpc {
             upload_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONCURRENT_UPLOADS)),
             upload_stall: UPLOAD_STALL,
             max_dense_cells: DEFAULT_MAX_DENSE_CELLS,
+            max_formula_bytes: DEFAULT_MAX_FORMULA_BYTES,
         }
     }
 
@@ -274,6 +287,17 @@ impl CalamineGrpc {
     #[must_use]
     pub fn with_max_dense_cells(mut self, max: u64) -> Self {
         self.max_dense_cells = max;
+        self
+    }
+
+    /// Override how many bytes of formulas one xlsx or xlsb formula stream
+    /// may collect before it sends its first row.
+    ///
+    /// A sheet whose formulas, as calamine expands them, come to more is
+    /// refused with `RESOURCE_EXHAUSTED` as soon as the count passes it.
+    #[must_use]
+    pub fn with_max_formula_bytes(mut self, max: u64) -> Self {
+        self.max_formula_bytes = max;
         self
     }
 
@@ -1418,44 +1442,115 @@ fn run_stream_worksheet_range(
 /// One formula, at its absolute (row, column).
 type FormulaCell = (u32, u32, String);
 
+/// Why collecting a sheet's formulas stopped short.
+enum CollectError {
+    /// calamine could not read the sheet.
+    Read(calamine::Error),
+    /// The formulas pass a budget; the status says which.
+    Refused(Status),
+}
+
+impl<E: Into<calamine::Error>> From<E> for CollectError {
+    fn from(e: E) -> Self {
+        Self::Read(e.into())
+    }
+}
+
+/// The formula cells of one sheet, collected under both budgets.
+///
+/// The extent is the one the stream will densify, so it is checked as each
+/// cell arrives rather than once they are all in: it only ever grows, and a
+/// sheet past it is refused at the first cell that takes it there, before the
+/// rest is read. The bytes are what the cells cost in memory, the text plus
+/// the slot that holds it.
+struct FormulaCollector<'a> {
+    sheet_name: &'a str,
+    max_dense_cells: u64,
+    max_bytes: u64,
+    cells: Vec<FormulaCell>,
+    rows: Option<(u32, u32)>,
+    last_col: u32,
+    bytes: u64,
+}
+
+impl<'a> FormulaCollector<'a> {
+    fn new(sheet_name: &'a str, max_dense_cells: u64, max_bytes: u64) -> Self {
+        Self {
+            sheet_name,
+            max_dense_cells,
+            max_bytes,
+            cells: Vec::new(),
+            rows: None,
+            last_col: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Take one cell, or refuse the sheet once it passes a budget.
+    fn push(&mut self, cell: calamine::Cell<String>) -> Result<(), CollectError> {
+        if cell.get_value().is_empty() {
+            return Ok(());
+        }
+        let (row, col) = cell.get_position();
+        let (first, last) = self
+            .rows
+            .map_or((row, row), |(lo, hi)| (lo.min(row), hi.max(row)));
+        self.rows = Some((first, last));
+        self.last_col = self.last_col.max(col);
+        check_dense(
+            self.sheet_name,
+            u64::from(last - first) + 1,
+            u64::from(self.last_col) + 1,
+            self.max_dense_cells,
+        )
+        .map_err(CollectError::Refused)?;
+
+        let value = cell.get_value();
+        let cost = (value.len() as u64).saturating_add(std::mem::size_of::<FormulaCell>() as u64);
+        self.bytes = self.bytes.saturating_add(cost);
+        if self.bytes > self.max_bytes {
+            return Err(CollectError::Refused(Status::resource_exhausted(format!(
+                "the formulas of sheet {:?} come to more than the {} bytes one formula \
+                 stream may collect (GRPC_CALAMINE_MAX_FORMULA_BYTES); calamine expands \
+                 every cell of a shared formula into its own copy of the text",
+                self.sheet_name, self.max_bytes
+            ))));
+        }
+        self.cells.push((row, col, value.clone()));
+        Ok(())
+    }
+}
+
 /// An xlsx sheet's formulas, cell by cell: what calamine's
 /// `worksheet_formula` collects before it densifies them
 /// (xlsx/mod.rs:2607-2626), including its answer of nothing for a sheet that
 /// is not a worksheet.
 fn xlsx_formulas<RS: Read + Seek>(
     xlsx: &mut Xlsx<RS>,
-    name: &str,
-) -> Result<Vec<FormulaCell>, calamine::Error> {
-    let mut reader = match xlsx.worksheet_cells_reader(name) {
+    mut collector: FormulaCollector<'_>,
+) -> Result<Vec<FormulaCell>, CollectError> {
+    let mut reader = match xlsx.worksheet_cells_reader(collector.sheet_name) {
         Ok(reader) => reader,
         Err(calamine::XlsxError::NotAWorksheet(_)) => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
-    let mut cells = Vec::new();
     while let Some(cell) = reader.next_formula()? {
-        if !cell.get_value().is_empty() {
-            let (row, col) = cell.get_position();
-            cells.push((row, col, cell.get_value().clone()));
-        }
+        collector.push(cell)?;
     }
-    Ok(cells)
+    Ok(collector.cells)
 }
 
 /// An xlsb sheet's formulas, cell by cell, as [`xlsx_formulas`] does for xlsx
 /// (xlsb/mod.rs:538-547).
 fn xlsb_formulas<RS: Read + Seek>(
     xlsb: &mut Xlsb<RS>,
-    name: &str,
-) -> Result<Vec<FormulaCell>, calamine::Error> {
-    let mut reader = xlsb.worksheet_cells_reader(name)?;
-    let mut cells = Vec::new();
+    mut collector: FormulaCollector<'_>,
+) -> Result<Vec<FormulaCell>, CollectError> {
+    let mut reader = xlsb.worksheet_cells_reader(collector.sheet_name)?;
     while let Some(cell) = reader.next_formula()? {
-        if !cell.get_value().is_empty() {
-            let (row, col) = cell.get_position();
-            cells.push((row, col, cell.get_value().clone()));
-        }
+        collector.push(cell)?;
     }
-    Ok(cells)
+    Ok(collector.cells)
 }
 
 /// Stream formula cells as the rows `Range::from_sparse` would give them,
@@ -1529,6 +1624,7 @@ fn run_stream_worksheet_formula(
     entry: &WorkbookEntry,
     selector: Option<&pb::SheetSelector>,
     max_dense_cells: u64,
+    max_formula_bytes: u64,
     tx: &mpsc::Sender<Result<pb::StreamWorksheetFormulaResponse, Status>>,
 ) {
     let sheet_name = match resolve_sheet_name(entry, selector) {
@@ -1543,16 +1639,20 @@ fn run_stream_worksheet_formula(
         Ok(workbook) => workbook,
         Err(e) => return abort_with(tx, kind, e),
     };
+    let collector = FormulaCollector::new(&sheet_name, max_dense_cells, max_formula_bytes);
     let sparse = match &mut *workbook {
-        Sheets::Xlsx(xlsx) => Some(xlsx_formulas(xlsx, &sheet_name)),
-        Sheets::Xlsb(xlsb) => Some(xlsb_formulas(xlsb, &sheet_name)),
+        Sheets::Xlsx(xlsx) => Some(xlsx_formulas(xlsx, collector)),
+        Sheets::Xlsb(xlsb) => Some(xlsb_formulas(xlsb, collector)),
         _ => None,
     };
     if let Some(sparse) = sparse {
         drop(workbook);
         return match sparse {
             Ok(cells) => emit_sparse_formulas(&sheet_name, cells, max_dense_cells, tx),
-            Err(e) => abort_with(tx, kind, e),
+            Err(CollectError::Read(e)) => abort_with(tx, kind, e),
+            Err(CollectError::Refused(status)) => {
+                let _ = tx.blocking_send(Err(status));
+            }
         };
     }
     let range = match workbook.worksheet_formula(&sheet_name) {
@@ -1866,8 +1966,15 @@ impl CalamineService for CalamineGrpc {
         let entry = get_entry(&self.store, &req.workbook_id)?;
         let permit = self.admit()?;
         let max_dense_cells = self.max_dense_cells;
+        let max_formula_bytes = self.max_formula_bytes;
         Ok(spawn_blocking_stream(permit, move |tx| {
-            run_stream_worksheet_formula(&entry, req.sheet.as_ref(), max_dense_cells, &tx);
+            run_stream_worksheet_formula(
+                &entry,
+                req.sheet.as_ref(),
+                max_dense_cells,
+                max_formula_bytes,
+                &tx,
+            );
         }))
     }
 
@@ -1963,6 +2070,41 @@ mod tests {
         let detail = error.error.expect("error detail");
         assert_eq!(detail.kind, pb::CalamineErrorKind::Vba as i32);
         assert!(detail.message.contains("Module1"), "{}", detail.message);
+    }
+
+    /// The extent is checked as each formula arrives: the cell that takes
+    /// the sheet past the budget is refused there, and nothing after it is
+    /// collected.
+    #[test]
+    fn formulas_are_refused_at_the_cell_that_passes_the_extent() {
+        let mut collector = FormulaCollector::new("Sheet1", 100, u64::MAX);
+        let formula = |row, col| calamine::Cell::new((row, col), "1+1".to_string());
+        collector.push(formula(0, 0)).ok().expect("A1 alone fits");
+        collector
+            .push(formula(9, 9))
+            .ok()
+            .expect("10 x 10 is exactly the budget");
+        let Err(CollectError::Refused(status)) = collector.push(formula(10, 0)) else {
+            panic!("an eleventh row passes 100 cells");
+        };
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(status.message().contains("GRPC_CALAMINE_MAX_DENSE_CELLS"));
+        assert_eq!(collector.cells.len(), 2, "the refused cell was not kept");
+    }
+
+    /// Bytes are what the formulas cost in memory, counted as they arrive.
+    #[test]
+    fn formulas_are_refused_once_their_bytes_pass_the_budget() {
+        let slot = std::mem::size_of::<FormulaCell>() as u64;
+        let mut collector = FormulaCollector::new("Sheet1", u64::MAX, 2 * (slot + 4));
+        let formula = |row| calamine::Cell::new((row, 0), "1+11".to_string());
+        collector.push(formula(0)).ok().expect("one fits");
+        collector.push(formula(1)).ok().expect("two fit exactly");
+        let Err(CollectError::Refused(status)) = collector.push(formula(2)) else {
+            panic!("a third passes the budget");
+        };
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(status.message().contains("GRPC_CALAMINE_MAX_FORMULA_BYTES"));
     }
 
     /// Ids are dense from zero in first-appearance order, and repeats of the

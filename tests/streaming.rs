@@ -2295,6 +2295,82 @@ async fn formulas_at_opposite_corners_are_refused() {
     );
 }
 
+/// The minimal xlsx with its one sheet's `<sheetData>` replaced, deflated.
+fn xlsx_with_sheet_data(sheet_data: &str) -> Vec<u8> {
+    use std::io::Write;
+    let sheet = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>{sheet_data}</sheetData>
+</worksheet>"#
+    );
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, body) in MINIMAL_XLSX {
+        let body = if name == "xl/worksheets/sheet1.xml" {
+            sheet.as_str()
+        } else {
+            body
+        };
+        zip.start_file(name, deflated).expect("start part");
+        zip.write_all(body.as_bytes()).expect("write part");
+    }
+    zip.finish().expect("finish package").into_inner()
+}
+
+/// One shared formula of 64 KiB and the cells that share it: each derived
+/// cell is a few bytes of deflated XML, and calamine expands every one into
+/// its own copy of the anchor's text. 1,000 cells are well inside the cell
+/// budget and some 64 MB of strings, which the byte budget refuses before the
+/// first event; the same sheet with one cell sharing it streams.
+#[tokio::test]
+async fn shared_formulas_past_the_byte_budget_are_refused() {
+    let anchor = format!("{}1", "A1+".repeat(64 * 1024 / 3));
+    let sheet = |derived: u32| {
+        let mut data = format!(
+            r#"<row r="1"><c r="A1"><f t="shared" ref="A1:A{last}" si="0">{anchor}</f></c></row>"#,
+            last = derived + 1
+        );
+        for r in 2..=derived + 1 {
+            data.push_str(&format!(
+                r#"<row r="{r}"><c r="A{r}"><f t="shared" si="0"/></c></row>"#
+            ));
+        }
+        xlsx_with_sheet_data(&data)
+    };
+    let client = start_server_with(
+        CalamineGrpc::new(WorkbookStore::new()).with_max_formula_bytes(4 * MIB as u64),
+    )
+    .await;
+
+    let bomb = sheet(1_000);
+    assert!(bomb.len() < 64 * 1024, "the upload stays small");
+    let opened = try_upload_bytes(&client, bomb, default_options())
+        .await
+        .expect("the workbook itself opens");
+    let (header, rows, status) = stream_formulas(&client, &opened.workbook_id, 0).await;
+    assert!(
+        header.is_none() && rows.is_empty(),
+        "refused before any event"
+    );
+    let status = status.expect("a terminal status");
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert!(
+        status.message().contains("GRPC_CALAMINE_MAX_FORMULA_BYTES"),
+        "{}",
+        status.message()
+    );
+
+    let fits = try_upload_bytes(&client, sheet(1), default_options())
+        .await
+        .expect("open");
+    let (header, rows, status) = stream_formulas(&client, &fits.workbook_id, 0).await;
+    assert!(status.is_none(), "{status:?}");
+    assert!(header.is_some());
+    assert_eq!(rows.len(), 2, "the anchor and the one cell sharing it");
+}
+
 /// The budget holds on every path that streams a dense range: XLS and ODS
 /// values, and formulas.
 #[tokio::test]

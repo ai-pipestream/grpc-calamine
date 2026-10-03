@@ -57,28 +57,89 @@ const DEFAULT_ADDR: &str = "0.0.0.0:50062";
 /// one window per round trip over any link with real latency.
 const DEFAULT_WINDOW_BYTES: u32 = 50 * 1024 * 1024;
 
-/// Read a `usize` environment variable, falling back to `default`.
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+/// An environment variable that is set but cannot be used.
+///
+/// Every variable here is a limit or a size, and one that does not parse is a
+/// mistake in the deployment: falling back to the default would quietly run
+/// the server with a bound its operator did not choose, so startup fails
+/// instead, naming the variable.
+#[derive(Debug)]
+struct BadEnv {
+    name: &'static str,
+    value: String,
+    reason: String,
 }
 
-/// Read a `u64` environment variable, falling back to `default`.
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+impl std::fmt::Display for BadEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is set to {:?}, which is not valid: {}",
+            self.name, self.value, self.reason
+        )
+    }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let workers = env_usize(
+impl std::error::Error for BadEnv {}
+
+/// Parse `raw`, the value of environment variable `name`: `None` when it is
+/// unset, the parsed value when it parses, and an error otherwise.
+fn parse_env<T>(name: &'static str, raw: Option<std::ffi::OsString>) -> Result<Option<T>, BadEnv>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let value = raw.into_string().map_err(|raw| BadEnv {
+        name,
+        value: raw.to_string_lossy().into_owned(),
+        reason: "not valid UTF-8".to_string(),
+    })?;
+    value.trim().parse().map(Some).map_err(|e: T::Err| BadEnv {
+        name,
+        reason: e.to_string(),
+        value,
+    })
+}
+
+/// Read environment variable `name`; see [`parse_env`].
+fn env<T>(name: &'static str) -> Result<Option<T>, BadEnv>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    parse_env(name, std::env::var_os(name))
+}
+
+/// Read environment variable `name`, or `default` when it is unset.
+fn env_or<T>(name: &'static str, default: T) -> Result<T, BadEnv>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    Ok(env(name)?.unwrap_or(default))
+}
+
+/// Run the server, reporting a startup failure in words rather than as the
+/// `Debug` form `main` would print for a returned error.
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("grpc-calamine: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let workers = env_or(
         "GRPC_CALAMINE_WORKERS",
         std::thread::available_parallelism().map_or(4, usize::from),
-    );
-    let blocking = env_usize("GRPC_CALAMINE_BLOCKING_THREADS", 512);
+    )?;
+    let blocking = env_or("GRPC_CALAMINE_BLOCKING_THREADS", 512_usize)?;
 
     // Explicit multi-threaded runtime: every request and every parse task is
     // spread across all worker threads; calamine's CPU-bound parsing runs in
@@ -93,68 +154,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = std::env::var("GRPC_CALAMINE_ADDR")
-        .unwrap_or_else(|_| DEFAULT_ADDR.to_string())
-        .parse()?;
+    let addr: std::net::SocketAddr = env_or("GRPC_CALAMINE_ADDR", DEFAULT_ADDR.parse()?)?;
 
     let defaults = StoreLimits::default();
     let limits = StoreLimits {
-        max_open_workbooks: env_usize(
+        max_open_workbooks: env_or(
             "GRPC_CALAMINE_MAX_OPEN_WORKBOOKS",
             defaults.max_open_workbooks,
-        ),
-        max_store_bytes: env_u64("GRPC_CALAMINE_MAX_STORE_BYTES", defaults.max_store_bytes),
-        idle_ttl: Duration::from_secs(env_u64(
+        )?,
+        max_store_bytes: env_or("GRPC_CALAMINE_MAX_STORE_BYTES", defaults.max_store_bytes)?,
+        idle_ttl: Duration::from_secs(env_or(
             "GRPC_CALAMINE_HANDLE_TTL_SECS",
             defaults.idle_ttl.as_secs(),
-        )),
+        )?),
         inflate: InflateLimits {
-            max_picture_bytes: env_u64(
+            max_picture_bytes: env_or(
                 "GRPC_CALAMINE_MAX_PICTURE_BYTES",
                 defaults.inflate.max_picture_bytes,
-            ),
-            max_picture_total_bytes: env_u64(
+            )?,
+            max_picture_total_bytes: env_or(
                 "GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES",
                 defaults.inflate.max_picture_total_bytes,
-            ),
-            max_shared_strings_bytes: env_u64(
+            )?,
+            max_shared_strings_bytes: env_or(
                 "GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES",
                 defaults.inflate.max_shared_strings_bytes,
-            ),
+            )?,
         },
     };
 
     // Streaming reads are capped well below the blocking pool so they can
     // never take every thread and leave uploads with none.
     let mut grpc = CalamineGrpc::new(WorkbookStore::with_limits(limits));
-    if let Some(max) = std::env::var("GRPC_CALAMINE_MAX_CONCURRENT_STREAMS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
+    if let Some(max) = env("GRPC_CALAMINE_MAX_CONCURRENT_STREAMS")? {
         grpc = grpc.with_max_concurrent_streams(max);
     }
-    if let Some(max) = std::env::var("GRPC_CALAMINE_MAX_CONCURRENT_UPLOADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
+    if let Some(max) = env("GRPC_CALAMINE_MAX_CONCURRENT_UPLOADS")? {
         grpc = grpc.with_max_concurrent_uploads(max);
     }
-    if let Some(max) = std::env::var("GRPC_CALAMINE_MAX_DENSE_CELLS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
+    if let Some(max) = env("GRPC_CALAMINE_MAX_DENSE_CELLS")? {
         grpc = grpc.with_max_dense_cells(max);
     }
-    if let Some(secs) = std::env::var("GRPC_CALAMINE_UPLOAD_DEADLINE_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
+    if let Some(secs) = env("GRPC_CALAMINE_UPLOAD_DEADLINE_SECS")? {
         grpc = grpc.with_upload_deadline(Duration::from_secs(secs));
     }
-    if let Some(max) = std::env::var("GRPC_CALAMINE_MAX_FORMULA_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
+    if let Some(max) = env("GRPC_CALAMINE_MAX_FORMULA_BYTES")? {
         grpc = grpc.with_max_formula_bytes(max);
     }
     // Detached on purpose: it ends by itself once the service is dropped.
@@ -172,11 +216,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // A client that wants a wide download window has to set its own; hyper
     // defaults both to 1 MiB, which throttles a bulk transfer to one window
     // per round trip once there is real latency in the path.
-    let window = u32::try_from(env_usize(
-        "GRPC_CALAMINE_WINDOW_BYTES",
-        DEFAULT_WINDOW_BYTES as usize,
-    ))
-    .unwrap_or(DEFAULT_WINDOW_BYTES);
+    let window: u32 = env_or("GRPC_CALAMINE_WINDOW_BYTES", DEFAULT_WINDOW_BYTES)?;
 
     eprintln!("grpc-calamine listening on {addr} (http2 window {window} bytes)");
     eprintln!(
@@ -211,5 +251,46 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = sigterm.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unset_variable_is_none() {
+        assert_eq!(parse_env::<u64>("X", None).expect("unset is fine"), None);
+    }
+
+    #[test]
+    fn a_set_variable_parses() {
+        assert_eq!(
+            parse_env::<u64>("X", Some("536870912".into())).expect("parses"),
+            Some(536_870_912)
+        );
+        assert_eq!(
+            parse_env::<usize>("X", Some(" 16 ".into()))
+                .expect("surrounding space is not a mistake"),
+            Some(16)
+        );
+    }
+
+    /// A value that does not parse is an error naming the variable, never
+    /// the default.
+    #[test]
+    fn a_variable_that_does_not_parse_is_refused() {
+        let err = parse_env::<u64>("GRPC_CALAMINE_MAX_STORE_BYTES", Some("2GiB".into()))
+            .expect_err("2GiB is not a byte count");
+        let message = err.to_string();
+        assert!(
+            message.contains("GRPC_CALAMINE_MAX_STORE_BYTES"),
+            "{message}"
+        );
+        assert!(message.contains("2GiB"), "{message}");
+
+        parse_env::<usize>("X", Some("-1".into())).expect_err("negative");
+        parse_env::<u32>("X", Some("4294967296".into())).expect_err("past u32");
+        parse_env::<u64>("X", Some(String::new().into())).expect_err("empty");
     }
 }

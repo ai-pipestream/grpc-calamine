@@ -115,6 +115,10 @@ slower.
 | `GRPC_CALAMINE_MAX_DENSE_CELLS`  | `33554432`     | cells one formula, XLS or ODS stream may densify |
 | `GRPC_CALAMINE_MAX_FORMULA_BYTES` | `536870912`  | formula bytes one xlsx/xlsb formula stream may collect (512 MiB) |
 
+A variable that is set but does not parse (`2GiB`, `-1`, a number past its
+type) stops the server at startup with a message naming it, rather than
+running with the default in its place.
+
 The window default is 50 MiB because window size over round-trip time caps
 upload throughput; hyper's 1 MiB default holds a 10 ms link near 100 MB/s.
 It governs the upload only. A client that wants a wide window for the row

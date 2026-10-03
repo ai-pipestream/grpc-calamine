@@ -215,7 +215,9 @@ it counts against the store's limits.
 `StreamWorksheetFormula` has the same shape with formula strings instead of
 values. `StreamVbaProject` sends project info, then one event per module
 (raw MBCS bytes; decoding is the client's choice, matching calamine).
-`GetPictures` sends one event per embedded image. `GetMetadata`,
+`GetPictures` sends one event per embedded image. A picture or module too
+large for one 32 MiB message is reported with a non-terminal `StreamError`
+and skipped, and the stream goes on. `GetMetadata`,
 `GetDefinedNames`, and `CloseWorkbook` are the remaining unary calls.
 `GetMetadata` also returns the `UiInfo` frontend advertisement shared by
 every ai-pipestream service, so embedding hosts can discover and link this

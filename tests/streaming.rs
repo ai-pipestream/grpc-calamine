@@ -2134,3 +2134,54 @@ async fn ods_corners_are_refused_when_opened() {
     assert_eq!(refused.code(), Code::InvalidArgument);
     upload(&client, "date.ods").await;
 }
+
+/// A picture too large for one gRPC message is reported in-band and skipped,
+/// and the pictures around it are still delivered. It used to fail the
+/// encode and end the stream, losing every picture after it.
+#[tokio::test]
+async fn a_picture_too_large_for_one_message_is_skipped_not_fatal() {
+    use std::io::Write;
+    // Stored rather than deflated: building it should cost a copy, not a
+    // compression pass over 33 MiB.
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, body) in MINIMAL_XLSX {
+        zip.start_file(name, deflated).expect("start part");
+        zip.write_all(body.as_bytes()).expect("write part");
+    }
+    zip.start_file("xl/media/image1.png", stored)
+        .expect("start picture");
+    zip.write_all(&vec![7; 33 * MIB]).expect("write picture");
+    zip.start_file("xl/media/image2.png", deflated)
+        .expect("start picture");
+    zip.write_all(&[9; 1024]).expect("write picture");
+    let package = zip.finish().expect("finish package").into_inner();
+
+    let mut client = start_server().await;
+    let opened = try_upload_bytes(&client, package, default_options())
+        .await
+        .expect("33 MiB is within the picture limits");
+    let mut stream = client
+        .get_pictures(pb::GetPicturesRequest {
+            workbook_id: opened.workbook_id,
+        })
+        .await
+        .expect("get pictures")
+        .into_inner();
+
+    let mut pictures = Vec::new();
+    let mut skipped = Vec::new();
+    while let Some(event) = stream.message().await.expect("the stream survives") {
+        match event.event.expect("event kind") {
+            pb::get_pictures_response::Event::Picture(picture) => pictures.push(picture),
+            pb::get_pictures_response::Event::Error(err) => skipped.push(err),
+        }
+    }
+    assert_eq!(pictures.len(), 1, "the small picture still arrives");
+    assert_eq!(pictures[0].data, vec![9; 1024]);
+    assert_eq!(skipped.len(), 1, "the large one is reported");
+    assert!(!skipped[0].terminal);
+}

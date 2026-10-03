@@ -546,6 +546,33 @@ fn send_event<T>(tx: &mpsc::Sender<Result<T, Status>>, event: T) -> bool {
     }
 }
 
+/// `event` itself if it encodes within the frame limit, and otherwise a
+/// non-terminal in-band error naming `what` was skipped.
+///
+/// Pictures and VBA modules go out one per message, and a message past the
+/// limit fails to encode, which ends the stream with an error: one oversized
+/// picture would otherwise cost every picture after it.
+fn within_frame<T: StreamResponse + prost::Message>(
+    event: T,
+    kind: pb::CalamineErrorKind,
+    what: &str,
+) -> T {
+    let size = event.encoded_len();
+    if size <= MAX_FRAME_BYTES {
+        return event;
+    }
+    T::from_stream_error(pb::StreamError {
+        error: Some(convert::calamine_error(
+            kind,
+            format!(
+                "{what} encodes to {size} bytes, more than the {MAX_FRAME_BYTES} one \
+                 message may carry; skipped"
+            ),
+        )),
+        terminal: false,
+    })
+}
+
 /// Send an in-band error event; returns false when the client has gone away.
 fn send_stream_error<T: StreamResponse>(
     tx: &mpsc::Sender<Result<T, Status>>,
@@ -1612,15 +1639,20 @@ fn run_stream_vba_project(
     }
 
     for name in module_names {
+        let what = format!("VBA module {name:?}");
         let event = match project.get_module_raw(&name) {
-            Ok(raw) => pb::StreamVbaProjectResponse {
-                event: Some(pb::stream_vba_project_response::Event::Module(
-                    pb::VbaModule {
-                        name,
-                        raw_content: raw.to_vec(),
-                    },
-                )),
-            },
+            Ok(raw) => within_frame(
+                pb::StreamVbaProjectResponse {
+                    event: Some(pb::stream_vba_project_response::Event::Module(
+                        pb::VbaModule {
+                            name,
+                            raw_content: raw.to_vec(),
+                        },
+                    )),
+                },
+                pb::CalamineErrorKind::Vba,
+                &what,
+            ),
             // Per-module failures are non-terminal: remaining modules can
             // still be delivered.
             Err(e) => pb::StreamVbaProjectResponse::from_stream_error(pb::StreamError {
@@ -1646,16 +1678,24 @@ fn run_get_pictures(
         Err(e) => return abort_with(tx, kind, e),
     };
     for pic in workbook.pictures_with_metadata() {
-        let event = pb::GetPicturesResponse {
-            event: Some(pb::get_pictures_response::Event::Picture(pb::Picture {
-                row: pic.row,
-                col: pic.col,
-                sheet_name: pic.sheet_name,
-                extension: pic.extension,
-                data: pic.data,
-                name: pic.name,
-            })),
-        };
+        let what = format!(
+            "picture {:?} at row {}, column {} of sheet {:?}",
+            pic.name, pic.row, pic.col, pic.sheet_name
+        );
+        let event = within_frame(
+            pb::GetPicturesResponse {
+                event: Some(pb::get_pictures_response::Event::Picture(pb::Picture {
+                    row: pic.row,
+                    col: pic.col,
+                    sheet_name: pic.sheet_name,
+                    extension: pic.extension,
+                    data: pic.data,
+                    name: pic.name,
+                })),
+            },
+            kind,
+            &what,
+        );
         if !send_event(tx, event) {
             return;
         }
@@ -1884,6 +1924,36 @@ mod tests {
 
         drop(first);
         let _again = service.admit_upload().expect("a released slot is reusable");
+    }
+
+    /// An item that cannot be encoded under the frame limit is replaced by a
+    /// non-terminal error naming it, and one that can goes out unchanged.
+    #[test]
+    fn an_item_past_the_frame_limit_becomes_a_skip_notice() {
+        let module = |size: usize| pb::StreamVbaProjectResponse {
+            event: Some(pb::stream_vba_project_response::Event::Module(
+                pb::VbaModule {
+                    name: "Module1".to_string(),
+                    raw_content: vec![0; size],
+                },
+            )),
+        };
+
+        let small = within_frame(module(16), pb::CalamineErrorKind::Vba, "VBA module");
+        assert_eq!(small, module(16));
+
+        let skipped = within_frame(
+            module(MAX_FRAME_BYTES),
+            pb::CalamineErrorKind::Vba,
+            "VBA module \"Module1\"",
+        );
+        let Some(pb::stream_vba_project_response::Event::Error(error)) = skipped.event else {
+            panic!("expected a skip notice, got {skipped:?}");
+        };
+        assert!(!error.terminal, "the stream goes on past it");
+        let detail = error.error.expect("error detail");
+        assert_eq!(detail.kind, pb::CalamineErrorKind::Vba as i32);
+        assert!(detail.message.contains("Module1"), "{}", detail.message);
     }
 
     /// Ids are dense from zero in first-appearance order, and repeats of the

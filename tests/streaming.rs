@@ -2547,9 +2547,10 @@ async fn a_picture_too_large_for_one_message_is_skipped_not_fatal() {
 }
 
 // ---------------------------------------------------------------------------
-// Declared counts and anchor multiplication the pre-open scan catches, each a
-// way a crafted file drives calamine to allocate from a number it never
-// checks. Both are refused before calamine parses the file.
+// Declared counts the pre-open scan catches: a way a crafted file drives
+// calamine to allocate from a number it never checks, refused before calamine
+// parses the file. (Pictures multiplied across anchors need no scan: the fork
+// shares one copy between them; see tests/pictures.rs.)
 // ---------------------------------------------------------------------------
 
 /// A 1.8 KB workbook whose `sharedStrings.xml` declares a trillion unique
@@ -2596,69 +2597,4 @@ async fn an_honest_shared_string_count_opens() {
     try_upload_bytes(&client, package, default_options())
         .await
         .expect("an honest table opens");
-}
-
-/// Build a workbook with one media entry embedded by `anchors` drawing
-/// anchors, all pointing at the same image through the drawing's rels.
-fn xlsx_with_anchored_picture(image: Vec<u8>, anchors: usize) -> Vec<u8> {
-    let rels = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
-</Relationships>"#
-        .to_vec();
-    let mut drawing = String::from(
-        r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#,
-    );
-    for _ in 0..anchors {
-        drawing.push_str(
-            r#"<xdr:oneCellAnchor><xdr:pic><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic></xdr:oneCellAnchor>"#,
-        );
-    }
-    drawing.push_str("</xdr:wsDr>");
-    xlsx_with_parts(&[
-        ("xl/media/image1.png", image),
-        ("xl/drawings/drawing1.xml", drawing.into_bytes()),
-        ("xl/drawings/_rels/drawing1.xml.rels", rels),
-    ])
-}
-
-/// calamine clones a picture's bytes once per anchor that embeds it, so a
-/// small image referenced by many anchors is many copies in memory. The scan
-/// charges each anchor against the per-workbook picture budget: one anchor
-/// fits, many do not, though the distinct image is unchanged.
-#[tokio::test]
-async fn one_picture_multiplied_across_anchors_is_refused() {
-    let client = start_server_inflating(InflateLimits {
-        max_picture_bytes: (512 * 1024) as u64,
-        max_picture_total_bytes: MIB as u64,
-        ..InflateLimits::default()
-    })
-    .await;
-    // 256 KiB of zeros deflates to almost nothing, so neither upload is large.
-    let image = vec![0u8; 256 * 1024];
-
-    try_upload_bytes(
-        &client,
-        xlsx_with_anchored_picture(image.clone(), 1),
-        default_options(),
-    )
-    .await
-    .expect("one 256 KiB copy fits a 1 MiB budget");
-
-    let bomb = xlsx_with_anchored_picture(image, 8);
-    assert!(
-        bomb.len() < 64 * 1024,
-        "eight anchors to one image stay tiny on the wire"
-    );
-    let refused = try_upload_bytes(&client, bomb, default_options())
-        .await
-        .expect_err("eight 256 KiB copies do not");
-    assert_eq!(refused.code(), Code::ResourceExhausted);
-    assert!(
-        refused
-            .message()
-            .contains("GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES"),
-        "{}",
-        refused.message()
-    );
 }

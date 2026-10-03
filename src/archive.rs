@@ -26,12 +26,15 @@
 //! shared-string table is matched by file name, compared the way calamine
 //! looks it up (ignoring case and slash direction). Counting an entry calamine
 //! would skip costs a little work; missing one it reads would cost the process.
+//!
+//! What is counted is each distinct image, once. calamine attaches an image to
+//! every drawing anchor and rich-data cell that embeds it, and those are free
+//! to multiply in the XML, but the pinned fork shares one copy of the bytes
+//! between them (ai-pipestream/calamine 23ae1f1), so the reader holds the
+//! distinct images and nothing per reference. The server hands pictures out
+//! through `pictures_iter`, one copy at a time, for the same reason.
 
-use std::collections::{HashMap, HashSet};
-use std::io::{Cursor, ErrorKind, Read, Seek};
-
-use quick_xml::Reader;
-use quick_xml::events::Event;
+use std::io::{Cursor, ErrorKind, Read};
 
 use crate::store::LimitExceeded;
 
@@ -69,18 +72,6 @@ const MIN_SI_BYTES: u64 = 8;
 /// start; a megabyte is far more than any real one needs.
 const SST_HEAD_SCAN: usize = 1024 * 1024;
 
-/// Largest drawing part read to count its anchors. Real drawings are tiny; a
-/// part past this is refused rather than scanned.
-const MAX_DRAWING_BYTES: usize = 16 * 1024 * 1024;
-
-/// Largest relationships part read to resolve its image targets.
-const MAX_RELS_BYTES: usize = 4 * 1024 * 1024;
-
-/// Most bytes of drawing and relationships parts the anchor scan will read in
-/// one workbook, so a crafted archive of many structural parts cannot make the
-/// scan itself do unbounded work. Real workbooks stay far under this.
-const MAX_TOTAL_STRUCTURAL_BYTES: u64 = 256 * 1024 * 1024;
-
 /// Bounds on what opening one workbook may inflate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InflateLimits {
@@ -105,9 +96,9 @@ impl Default for InflateLimits {
 /// What [`inspect`] measured.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Inflated {
-    /// Inflated bytes of all embedded pictures together, counted once per
-    /// drawing anchor that embeds each one, as calamine clones them. Every
-    /// reader of the workbook holds this for as long as it lives.
+    /// Inflated bytes of the embedded pictures together, each distinct image
+    /// once, however many anchors embed it. Every reader of the workbook
+    /// holds this for as long as it lives.
     pub picture_bytes: u64,
 }
 
@@ -119,8 +110,8 @@ pub enum Rejected {
     Limit(LimitExceeded),
     /// The package is internally inconsistent in a way that would otherwise
     /// drive calamine to allocate from a number it never checks: a declared
-    /// count the inflated part cannot hold, or a structural part too large to
-    /// validate. A fault in the file, reported as `INVALID_ARGUMENT`.
+    /// count the inflated part cannot hold. A fault in the file, reported as
+    /// `INVALID_ARGUMENT`.
     Malformed {
         /// The entry at fault.
         part: String,
@@ -180,9 +171,8 @@ fn quoted(name: &str) -> String {
 }
 
 /// Inflate, into nothing, every part calamine would read whole when opening
-/// `bytes`, refuse the workbook once one passes its limit, and charge each
-/// embedded picture once per drawing anchor that embeds it, as calamine
-/// clones them.
+/// `bytes`, refuse the workbook once one passes its limit, and return what
+/// the embedded pictures add up to.
 ///
 /// Bytes that are not a zip archive (an xls file is a compound file instead)
 /// pass untouched, as do entries the zip reader cannot open or inflate:
@@ -193,30 +183,20 @@ fn quoted(name: &str) -> String {
 ///
 /// [`Rejected::Limit`] for a picture, picture total, or shared-string table
 /// past its byte limit; [`Rejected::Malformed`] for a shared-string table
-/// whose declared count the bytes cannot hold, or a structural part too
-/// large to validate.
+/// whose declared count the bytes cannot hold.
 pub fn inspect(bytes: &[u8], limits: &InflateLimits) -> Result<Inflated, Rejected> {
     let Ok(mut zip) = zip::ZipArchive::new(Cursor::new(bytes)) else {
         return Ok(Inflated::default());
     };
 
-    // Pass 1: measure each distinct media entry once, validate the
-    // shared-string table, and index the archive so pass 2 can read the
-    // drawing parts by name.
-    //
-    // Each media is inflated only as far as the picture total still has room
-    // for, so the work here is bounded by that total however many media the
-    // archive holds: a media calamine clones even once already counts against
-    // the total, so distinct media summing past it are refused now rather than
-    // inflated in full first.
-    let mut media: HashMap<String, u64> = HashMap::new();
-    let mut by_lc: HashMap<String, usize> = HashMap::new();
+    // Each image is inflated only as far as the picture total still has room
+    // for, so the work here is bounded by that total however many images the
+    // archive holds.
     let mut media_total = 0u64;
     for index in 0..zip.len() {
         let Ok(mut entry) = zip.by_index(index) else {
             continue;
         };
-        let lc = normalize(entry.name());
         match classify(entry.name()) {
             Some(Part::Picture) => {
                 let name = quoted(entry.name());
@@ -237,7 +217,6 @@ pub fn inspect(bytes: &[u8], limits: &InflateLimits) -> Result<Inflated, Rejecte
                     }
                 };
                 media_total = media_total.saturating_add(size);
-                media.insert(lc.clone(), size);
             }
             Some(Part::SharedStrings) => {
                 let name = quoted(entry.name());
@@ -245,11 +224,10 @@ pub fn inspect(bytes: &[u8], limits: &InflateLimits) -> Result<Inflated, Rejecte
             }
             None => {}
         }
-        by_lc.insert(lc, index);
     }
-
-    let picture_bytes = charge_pictures(&mut zip, &by_lc, &media, limits.max_picture_total_bytes)?;
-    Ok(Inflated { picture_bytes })
+    Ok(Inflated {
+        picture_bytes: media_total,
+    })
 }
 
 /// Read `part` to its end into nothing and return how many bytes it gave, or
@@ -390,210 +368,6 @@ fn attr_u64(tag: &[u8], name: &[u8]) -> Option<u64> {
     None
 }
 
-/// Charge every media entry against the per-workbook picture budget: once for
-/// each drawing anchor that embeds it (as calamine clones it per anchor), and
-/// once for a media no anchor references (calamine's fallback for unanchored
-/// media). Refuses as soon as the running total passes `max_total`.
-///
-/// Drawing anchors in the DrawingML `blip` elements are the vector a crafted
-/// file uses to multiply a small image into gigabytes. The rich-data (`vm`)
-/// picture path clones per reference too and is not counted per reference
-/// here; its media are still charged once, like calamine's unanchored media.
-fn charge_pictures<R: Read + Seek>(
-    zip: &mut zip::ZipArchive<R>,
-    by_lc: &HashMap<String, usize>,
-    media: &HashMap<String, u64>,
-    max_total: u64,
-) -> Result<u64, Rejected> {
-    if media.is_empty() {
-        return Ok(0);
-    }
-    let mut total = 0u64;
-    let mut scanned = 0u64;
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut drawings: Vec<&String> = by_lc.keys().filter(|p| is_drawing(p)).collect();
-    drawings.sort(); // deterministic refusal on crafted archives
-    for drawing in drawings {
-        let rid_to_media = match rels_sibling(drawing).and_then(|r| Some((by_lc.get(&r)?, r))) {
-            Some((&idx, name)) => {
-                let Some(bytes) = read_capped(zip, idx, MAX_RELS_BYTES) else {
-                    return Err(Rejected::Malformed {
-                        part: quoted(&name),
-                        detail: format!("relationships part exceeds {MAX_RELS_BYTES} bytes"),
-                    });
-                };
-                scanned = scanned.saturating_add(bytes.len() as u64);
-                rels_image_map(&bytes, parent(drawing))
-            }
-            None => HashMap::new(),
-        };
-        let &idx = by_lc.get(drawing).expect("drawing key came from by_lc");
-        let Some(xml) = read_capped(zip, idx, MAX_DRAWING_BYTES) else {
-            return Err(Rejected::Malformed {
-                part: quoted(drawing),
-                detail: format!(
-                    "drawing part exceeds {MAX_DRAWING_BYTES} bytes, too large to validate"
-                ),
-            });
-        };
-        scanned = scanned.saturating_add(xml.len() as u64);
-        if scanned > MAX_TOTAL_STRUCTURAL_BYTES {
-            return Err(Rejected::Malformed {
-                part: quoted(drawing),
-                detail: format!(
-                    "drawing and relationship parts exceed {MAX_TOTAL_STRUCTURAL_BYTES} bytes \
-                     together, too much to validate"
-                ),
-            });
-        }
-        for rid in blip_embeds(&xml) {
-            // `key` borrows `media`, which outlives the per-drawing maps, so a
-            // charged media stays recorded in `seen` across drawings.
-            if let Some(path) = rid_to_media.get(&rid)
-                && let Some((key, &size)) = media.get_key_value(path)
-            {
-                total = total.saturating_add(size);
-                seen.insert(key.as_str());
-                if total > max_total {
-                    return Err(Rejected::Limit(LimitExceeded::PictureTotal {
-                        max: max_total,
-                    }));
-                }
-            }
-        }
-    }
-    for (path, &size) in media {
-        if !seen.contains(path.as_str()) {
-            total = total.saturating_add(size);
-            if total > max_total {
-                return Err(Rejected::Limit(LimitExceeded::PictureTotal {
-                    max: max_total,
-                }));
-            }
-        }
-    }
-    Ok(total)
-}
-
-/// Whether a normalized entry path is a DrawingML drawing part (not its rels).
-fn is_drawing(path: &str) -> bool {
-    path.starts_with("xl/drawings/") && path.ends_with(".xml") && !path.contains("/_rels/")
-}
-
-/// The directory of a normalized path.
-fn parent(path: &str) -> &str {
-    path.rfind('/').map_or("", |i| &path[..i])
-}
-
-/// The `_rels` sibling of a part: `a/b.xml` -> `a/_rels/b.xml.rels`.
-fn rels_sibling(path: &str) -> Option<String> {
-    let i = path.rfind('/')?;
-    Some(format!("{}/_rels/{}.rels", &path[..i], &path[i + 1..]))
-}
-
-/// Read a zip entry fully into memory, capped at `cap` bytes. `None` when the
-/// entry inflates past the cap (the caller refuses it); an empty vec when the
-/// entry cannot be opened or read, so a corrupt part resolves to no mappings
-/// rather than a panic.
-fn read_capped<R: Read + Seek>(
-    zip: &mut zip::ZipArchive<R>,
-    index: usize,
-    cap: usize,
-) -> Option<Vec<u8>> {
-    let Ok(entry) = zip.by_index(index) else {
-        return Some(Vec::new());
-    };
-    let mut buf = Vec::new();
-    let _ = entry.take(cap as u64 + 1).read_to_end(&mut buf);
-    (buf.len() <= cap).then_some(buf)
-}
-
-/// Map relationship id -> resolved media path for every image relationship in
-/// a `.rels` part, resolving each `Target` against `base`.
-fn rels_image_map(bytes: &[u8], base: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    let mut reader = Reader::from_reader(bytes);
-    reader.config_mut().check_end_names = false;
-    let mut buf = Vec::new();
-    loop {
-        let event = reader.read_event_into(&mut buf);
-        match event {
-            Ok(Event::Eof) | Err(_) => break,
-            Ok(Event::Start(e) | Event::Empty(e)) if e.local_name().as_ref() == b"Relationship" => {
-                let mut id = None;
-                let mut target = None;
-                let mut is_image = false;
-                for attr in e.attributes().flatten() {
-                    match attr.key.local_name().as_ref() {
-                        b"Id" => id = Some(String::from_utf8_lossy(&attr.value).into_owned()),
-                        b"Target" => {
-                            target = Some(String::from_utf8_lossy(&attr.value).into_owned());
-                        }
-                        b"Type" => is_image = attr.value.ends_with(b"/image"),
-                        _ => {}
-                    }
-                }
-                if let (true, Some(id), Some(target)) = (is_image, id, target) {
-                    map.insert(id, resolve_path(base, &target));
-                }
-            }
-            Ok(_) => {}
-        }
-        buf.clear();
-    }
-    map
-}
-
-/// The `r:embed` relationship id of every DrawingML `blip` element, in order,
-/// one per picture anchor.
-fn blip_embeds(xml: &[u8]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut reader = Reader::from_reader(xml);
-    reader.config_mut().check_end_names = false;
-    let mut buf = Vec::new();
-    loop {
-        let event = reader.read_event_into(&mut buf);
-        match event {
-            Ok(Event::Eof) | Err(_) => break,
-            Ok(Event::Start(e) | Event::Empty(e)) if e.local_name().as_ref() == b"blip" => {
-                for attr in e.attributes().flatten() {
-                    if attr.key.local_name().as_ref() == b"embed" {
-                        out.push(String::from_utf8_lossy(&attr.value).into_owned());
-                    }
-                }
-            }
-            Ok(_) => {}
-        }
-        buf.clear();
-    }
-    out
-}
-
-/// Resolve a relationship `Target` against the part's directory, normalized
-/// the way media keys are, mirroring calamine's `resolve_path` (xlsx/mod.rs)
-/// but tolerating any number of leading `../`.
-fn resolve_path(base: &str, target: &str) -> String {
-    let target = target.replace('\\', "/");
-    if let Some(stripped) = target.strip_prefix('/') {
-        return stripped.to_ascii_lowercase();
-    }
-    let mut segments: Vec<&str> = if base.is_empty() {
-        Vec::new()
-    } else {
-        base.split('/').collect()
-    };
-    for segment in target.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop();
-            }
-            other => segments.push(other),
-        }
-    }
-    segments.join("/").to_ascii_lowercase()
-}
-
 /// First index of `needle` in `haystack`.
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
@@ -690,54 +464,6 @@ mod tests {
         assert_eq!(
             attr_u64(br#"<sst uniqueCount="7">"#, b"uniqueCount"),
             Some(7)
-        );
-    }
-
-    #[test]
-    fn resolve_path_walks_parent_references() {
-        assert_eq!(
-            resolve_path("xl/drawings", "../media/Image1.PNG"),
-            "xl/media/image1.png"
-        );
-        assert_eq!(
-            resolve_path("xl/drawings", "/xl/media/image1.png"),
-            "xl/media/image1.png"
-        );
-        assert_eq!(
-            resolve_path("xl/richData", "../media/i.png"),
-            "xl/media/i.png"
-        );
-    }
-
-    #[test]
-    fn is_drawing_matches_drawing_parts_only() {
-        assert!(is_drawing("xl/drawings/drawing1.xml"));
-        assert!(!is_drawing("xl/drawings/_rels/drawing1.xml.rels"));
-        assert!(!is_drawing("xl/worksheets/sheet1.xml"));
-        assert!(!is_drawing("xl/drawings/vmldrawing1.vml"));
-    }
-
-    #[test]
-    fn blip_embeds_lists_every_anchor_embed_in_order() {
-        let xml = br#"<xdr:wsDr xmlns:xdr="d" xmlns:a="a" xmlns:r="r">
-            <xdr:twoCellAnchor><xdr:pic><xdr:blipFill>
-              <a:blip r:embed="rId1"/>
-            </xdr:blipFill></xdr:pic></xdr:twoCellAnchor>
-            <xdr:oneCellAnchor><xdr:pic><xdr:blipFill>
-              <a:blip r:embed="rId1"/>
-            </xdr:blipFill></xdr:pic></xdr:oneCellAnchor>
-            <xdr:twoCellAnchor><xdr:pic><xdr:blipFill>
-              <a:blip r:embed="rId2"/>
-            </xdr:blipFill></xdr:pic></xdr:twoCellAnchor>
-        </xdr:wsDr>"#;
-        assert_eq!(blip_embeds(xml), vec!["rId1", "rId1", "rId2"]);
-    }
-
-    #[test]
-    fn rels_sibling_points_at_the_rels_of_a_part() {
-        assert_eq!(
-            rels_sibling("xl/drawings/drawing1.xml").as_deref(),
-            Some("xl/drawings/_rels/drawing1.xml.rels")
         );
     }
 }

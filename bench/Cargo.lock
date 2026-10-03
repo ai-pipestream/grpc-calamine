@@ -117,7 +117,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "calamine"
 version = "0.36.1"
-source = "git+https://github.com/ai-pipestream/calamine.git?rev=4fddaec383809e70738e7615653008199626e5f3#4fddaec383809e70738e7615653008199626e5f3"
+source = "git+https://github.com/ai-pipestream/calamine.git?rev=23ae1f1dc54b16152aa260fe2d6bcf62ae5077c3#23ae1f1dc54b16152aa260fe2d6bcf62ae5077c3"
 dependencies = [
  "atoi_simd",
  "byteorder",

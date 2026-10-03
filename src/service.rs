@@ -1864,7 +1864,11 @@ fn run_get_pictures(
         Ok(workbook) => workbook,
         Err(e) => return abort_with(tx, kind, e),
     };
-    for pic in workbook.pictures_with_metadata() {
+    // One copy at a time: the reader shares an image between every anchor
+    // that embeds it, and a copy is made only as each anchor's picture goes
+    // out, so a small image anchored a million times never exists a million
+    // times at once.
+    for pic in workbook.pictures_iter() {
         let what = format!(
             "picture {:?} at row {}, column {} of sheet {:?}",
             pic.name, pic.row, pic.col, pic.sheet_name

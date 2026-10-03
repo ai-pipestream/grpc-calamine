@@ -34,9 +34,11 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
 
 # Three defects found by this server are fixed upstream in tafia/calamine#695,
-# #696 and #697 but not yet released. The pinned commit is the fork's
-# `pipestream-main` at 4fddaec: calamine 0.36.1 plus upstream master as of
-# that merge (which brings #699, #701 and #707) plus those three fixes:
+# #696 and #697 but not yet released, and a fourth is fixed only in the fork
+# so far. The pinned commit is the fork's 23ae1f1 (ai-pipestream/calamine#2):
+# `pipestream-main` at 4fddaec, which is calamine 0.36.1 plus upstream master
+# as of that merge (which brings #699, #701 and #707) plus those three fixes,
+# plus the fork's own commit:
 #
 #   #695  a reversed `<dimension ref>` underflowed the extent arithmetic, so
 #         `Dimensions::len()` reported 18_446_744_056_529_682_435 cells
@@ -44,13 +46,16 @@ tokio-stream = { version = "0.1.19", features = ["net"] }
 #         yielded a cell position that appears nowhere in the file
 #   #697  `Range::from_sparse` densified without bound, so a 2 KB worksheet
 #         aborted the process through `handle_alloc_error` (uncatchable)
+#   23ae1f1  every anchor of an xlsx picture got its own copy of the image at
+#         open time, so one image anchored 20,000 times was 20,000 copies; and
+#         a shared formula's `si` sized a Vec, so si="1000000000000" aborted.
+#         Adds `Reader::pictures_iter`, which the server uses.
 #
 # Pinned by `rev`, not by branch, so `cargo update` cannot move it: a newer
 # fork commit is taken on purpose, by changing the rev here and in bench/.
-# Drop this section once the three land in a release; the fixes are additive
-# and the server does not depend on any API they introduce.
+# Drop this section once all four land in a release.
 [patch.crates-io]
-calamine = { git = "https://github.com/ai-pipestream/calamine.git", rev = "4fddaec383809e70738e7615653008199626e5f3" }
+calamine = { git = "https://github.com/ai-pipestream/calamine.git", rev = "23ae1f1dc54b16152aa260fe2d6bcf62ae5077c3" }
 
 [lints.rust]
 missing_docs = "warn"

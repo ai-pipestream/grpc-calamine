@@ -12,9 +12,9 @@ jobs:
           - stable
           - beta
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@master
+      uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
       with:
           toolchain: ${{ matrix.toolchain }}
     - name: Toolchain version
@@ -28,7 +28,7 @@ jobs:
       run: |
         cargo test
     - name: Install rustfmt, clippy
-      uses: dtolnay/rust-toolchain@master
+      uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
       if: ${{ matrix.toolchain == 'stable' }}
       with:
           toolchain: ${{ matrix.toolchain }}
@@ -45,11 +45,23 @@ jobs:
   proto:
     runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@v4
-    - uses: bufbuild/buf-action@v1
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1
       with:
         setup_only: true
+        # Pinned so the descriptor comparison below is against one encoder.
+        version: 1.71.0
     - name: Lint the protobuf contract
       run: |
         buf lint
         buf build
+    # src/gen is checked in, so nothing else notices when it falls behind the
+    # contract: reflection once served comments the protos no longer had.
+    - name: Install the codegen plugins
+      run: cargo install --locked protoc-gen-prost@0.5.0 protoc-gen-tonic@0.5.0
+    - name: Generated code and descriptor match the contract
+      run: |
+        buf generate
+        buf build -o src/gen/calamine/v1/calamine.v1.binpb
+        git status --short -- src/gen
+        test -z "$(git status --porcelain -- src/gen)"

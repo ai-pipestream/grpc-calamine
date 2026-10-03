@@ -30,4 +30,4 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 # above and make the native-vs-gRPC comparison dishonest. Keep in step with the
 # server's Cargo.toml; remove both together once the fixes are released.
 [patch.crates-io]
-calamine = { git = "https://github.com/ai-pipestream/calamine.git", branch = "pipestream-main" }
+calamine = { git = "https://github.com/ai-pipestream/calamine.git", rev = "23ae1f1dc54b16152aa260fe2d6bcf62ae5077c3" }

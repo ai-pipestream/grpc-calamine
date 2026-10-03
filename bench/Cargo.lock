@@ -116,8 +116,8 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "calamine"
-version = "0.36.0"
-source = "git+https://github.com/ai-pipestream/calamine.git?branch=pipestream-main#f17b0128c74e805e46adf6e2b841cf5797580623"
+version = "0.36.1"
+source = "git+https://github.com/ai-pipestream/calamine.git?rev=23ae1f1dc54b16152aa260fe2d6bcf62ae5077c3#23ae1f1dc54b16152aa260fe2d6bcf62ae5077c3"
 dependencies = [
  "atoi_simd",
  "byteorder",
@@ -288,11 +288,14 @@ version = "0.1.0"
 dependencies = [
  "calamine",
  "prost",
+ "quick-xml",
  "tokio",
  "tokio-stream",
  "tonic",
  "tonic-prost",
+ "tonic-reflection",
  "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -641,6 +644,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost-types"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
+dependencies = [
+ "prost",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -894,6 +906,20 @@ dependencies = [
  "bytes",
  "prost",
  "tonic",
+]
+
+[[package]]
+name = "tonic-reflection"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acccd136a4bf19810a1fde9c74edc6129b42a66b44d0c1c8aaa67aeb49a146a7"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]

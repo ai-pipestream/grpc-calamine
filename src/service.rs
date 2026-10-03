@@ -10,10 +10,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::io::{Read, Seek};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use calamine::{CellType, Data, HeaderRow, Range, Reader, Sheets};
+use calamine::{CellType, Data, HeaderRow, Range, Reader, Sheets, Xlsb, Xlsx};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -21,7 +22,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::convert;
 use crate::proto::v1 as pb;
 use crate::proto::v1::calamine_service_server::{CalamineService, CalamineServiceServer};
-use crate::store::{WorkbookEntry, WorkbookStore};
+use crate::store::{PooledReader, ReaderError, StoreError, WorkbookEntry, WorkbookStore};
 
 /// Default upper bound on the uploaded workbook size: 512 MiB.
 const DEFAULT_MAX_WORKBOOK_BYTES: usize = 512 * 1024 * 1024;
@@ -45,6 +46,48 @@ const CONSUMER_STALL: std::time::Duration = std::time::Duration::from_secs(30);
 /// each other, but they can never take the whole blocking pool and with it the
 /// unary RPCs.
 const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 128;
+
+/// Default cap on uploads in progress at once.
+///
+/// Every upload buffers its workbook in memory until it is parsed, up to
+/// [`DEFAULT_MAX_WORKBOOK_BYTES`] each, and none of it is counted against the
+/// store until then, so without a cap the number of uploads alone decides how
+/// much memory is committed.
+const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 16;
+
+/// Default cap on the cells one stream may densify: 32 Mi.
+///
+/// Formula streams, and every XLS and ODS stream, send each row of their range
+/// densely from column A, and the range is as large as the two cells furthest
+/// apart make it: A1 and XFD1048576 are 17.2 billion cells. This bounds the
+/// grid a single stream will produce. The default covers the whole of an .xls
+/// sheet (65,536 x 256) twice over.
+const DEFAULT_MAX_DENSE_CELLS: u64 = 32 * 1024 * 1024;
+
+/// Default cap on the bytes one formula stream may collect: 512 MiB.
+///
+/// An xlsx or xlsb formula stream collects a sheet's formula cells before it
+/// sends the first row, and a cell's size on the wire says nothing about its
+/// size in memory: calamine expands every cell of a shared formula into its
+/// own copy of the anchor's text, so a 40-byte `<f t="shared" si="0"/>`
+/// becomes as long as the anchor formula, however long that is. The cell
+/// budget cannot see that, so the collected bytes are budgeted too.
+const DEFAULT_MAX_FORMULA_BYTES: u64 = 512 * 1024 * 1024;
+
+/// How long an upload may go without a frame before it is abandoned.
+///
+/// The upload cap makes a stalled upload expensive: it holds a slot, and a
+/// handful of clients that open uploads and never finish them would otherwise
+/// lock every other client out. Same reasoning, and same bound, as
+/// [`CONSUMER_STALL`] on the read side.
+const UPLOAD_STALL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Default for how long one whole upload may take: 10 minutes.
+///
+/// The stall bound alone does not free a slot: a client that sends a frame
+/// every 29 s never stalls, and holds its slot for as long as it likes. This
+/// bounds the upload as a whole. 512 MiB in 10 minutes is under 1 MB/s.
+const DEFAULT_UPLOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Rows the server will pack into one `rows` event when the caller does not
 /// choose. Only reached while the consumer is behind; a consumer that keeps up
@@ -148,6 +191,39 @@ fn declared_total_cells(dims: calamine::Dimensions) -> u64 {
     rows * cols
 }
 
+/// Refuse a range that, streamed densely from column A, is more than `max`
+/// cells: `rows` by `columns`, where `columns` runs from A to the range's last
+/// column.
+fn check_dense(sheet_name: &str, rows: u64, columns: u64, max: u64) -> Result<(), Status> {
+    let cells = rows.saturating_mul(columns);
+    if cells <= max {
+        return Ok(());
+    }
+    Err(Status::resource_exhausted(format!(
+        "sheet {sheet_name:?} spans {rows} rows by {columns} columns counted from \
+         column A, {cells} cells, more than the {max} one stream may densify \
+         (GRPC_CALAMINE_MAX_DENSE_CELLS)"
+    )))
+}
+
+/// [`check_dense`] for a range calamine has already built.
+fn check_dense_range<T: CellType>(
+    sheet_name: &str,
+    range: &Range<T>,
+    max: u64,
+) -> Result<(), Status> {
+    let Some(start) = range.start() else {
+        return Ok(());
+    };
+    let (height, width) = range.get_size();
+    check_dense(
+        sheet_name,
+        height as u64,
+        u64::from(start.1) + width as u64,
+        max,
+    )
+}
+
 /// gRPC implementation of `calamine.v1.CalamineService`.
 pub struct CalamineGrpc {
     store: Arc<WorkbookStore>,
@@ -156,6 +232,18 @@ pub struct CalamineGrpc {
     /// its whole life, so the number of blocking-pool threads this service can
     /// occupy is bounded and the unary RPCs always have threads left.
     stream_slots: Arc<tokio::sync::Semaphore>,
+    /// Admission control for uploads. An upload holds a permit from its first
+    /// frame until its workbook is parsed, so the memory buffered by uploads
+    /// in flight is bounded by the cap times the upload size limit.
+    upload_slots: Arc<tokio::sync::Semaphore>,
+    /// How long an upload may go without a frame.
+    upload_stall: std::time::Duration,
+    /// How long one whole upload may take; zero for no limit.
+    upload_deadline: std::time::Duration,
+    /// Most cells one stream may densify, counted from column A.
+    max_dense_cells: u64,
+    /// Most bytes one formula stream may collect before it sends.
+    max_formula_bytes: u64,
 }
 
 impl CalamineGrpc {
@@ -166,6 +254,11 @@ impl CalamineGrpc {
             store: Arc::new(store),
             max_workbook_bytes: DEFAULT_MAX_WORKBOOK_BYTES,
             stream_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONCURRENT_STREAMS)),
+            upload_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONCURRENT_UPLOADS)),
+            upload_stall: UPLOAD_STALL,
+            upload_deadline: DEFAULT_UPLOAD_DEADLINE,
+            max_dense_cells: DEFAULT_MAX_DENSE_CELLS,
+            max_formula_bytes: DEFAULT_MAX_FORMULA_BYTES,
         }
     }
 
@@ -185,6 +278,135 @@ impl CalamineGrpc {
     pub fn with_max_concurrent_streams(mut self, max: usize) -> Self {
         self.stream_slots = Arc::new(tokio::sync::Semaphore::new(max));
         self
+    }
+
+    /// Override how many uploads may be in progress at once.
+    ///
+    /// An upload past the cap is refused immediately with
+    /// `RESOURCE_EXHAUSTED`, before it has buffered anything.
+    #[must_use]
+    pub fn with_max_concurrent_uploads(mut self, max: usize) -> Self {
+        self.upload_slots = Arc::new(tokio::sync::Semaphore::new(max));
+        self
+    }
+
+    /// Override how many cells one stream may densify, counted from column A.
+    ///
+    /// A formula stream, or an XLS or ODS stream, whose range is larger is
+    /// refused with `RESOURCE_EXHAUSTED` before its first event.
+    #[must_use]
+    pub fn with_max_dense_cells(mut self, max: u64) -> Self {
+        self.max_dense_cells = max;
+        self
+    }
+
+    /// Override how many bytes of formulas one xlsx or xlsb formula stream
+    /// may collect before it sends its first row.
+    ///
+    /// A sheet whose formulas, as calamine expands them, come to more is
+    /// refused with `RESOURCE_EXHAUSTED` as soon as the count passes it.
+    #[must_use]
+    pub fn with_max_formula_bytes(mut self, max: u64) -> Self {
+        self.max_formula_bytes = max;
+        self
+    }
+
+    /// Override how long an upload may go without a frame before it is
+    /// abandoned with `DEADLINE_EXCEEDED` and its slot released.
+    #[must_use]
+    pub fn with_upload_stall(mut self, stall: std::time::Duration) -> Self {
+        self.upload_stall = stall;
+        self
+    }
+
+    /// Override how long one whole upload may take, from its first frame to
+    /// its last, before it is abandoned with `DEADLINE_EXCEEDED` and its slot
+    /// released. Zero removes the limit.
+    #[must_use]
+    pub fn with_upload_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.upload_deadline = deadline;
+        self
+    }
+
+    /// Start the task that closes workbooks left idle past the store's TTL;
+    /// see [`WorkbookStore::spawn_reaper`]. Call it from inside the tokio
+    /// runtime that serves the service.
+    pub fn spawn_reaper(&self) -> Option<tokio::task::JoinHandle<()>> {
+        WorkbookStore::spawn_reaper(&self.store)
+    }
+
+    /// Read an upload's options and file bytes, refusing it as soon as it
+    /// breaks a rule. Bounded per frame by the stall limit; the caller bounds
+    /// it as a whole.
+    async fn receive_upload(
+        &self,
+        mut stream: Streaming<pb::OpenWorkbookRequest>,
+    ) -> Result<(pb::WorkbookFormat, Option<HeaderRow>, Vec<u8>), Status> {
+        // First frame must carry the options.
+        let first = next_frame(&mut stream, self.upload_stall)
+            .await?
+            .ok_or_else(|| Status::invalid_argument("empty upload: no frames received"))?;
+        let Some(pb::open_workbook_request::Payload::Options(options)) = first.payload else {
+            return Err(Status::invalid_argument(
+                "first upload frame must carry `options`",
+            ));
+        };
+        let format_hint = pb::WorkbookFormat::try_from(options.format_hint)
+            .map_err(|_| Status::invalid_argument("unknown format_hint value"))?;
+        let header_row = options.header_row.map(|hr| match hr.selection {
+            Some(pb::header_row::Selection::RowIndex(i)) => HeaderRow::Row(i),
+            _ => HeaderRow::FirstNonEmptyRow,
+        });
+
+        // Remaining frames are file bytes; held in memory only.
+        let mut bytes = Vec::new();
+        while let Some(frame) = next_frame(&mut stream, self.upload_stall).await? {
+            match frame.payload {
+                // A frame that carries nothing would let a client keep an
+                // upload alive without ever sending the workbook.
+                Some(pb::open_workbook_request::Payload::Chunk(chunk)) if chunk.is_empty() => {
+                    return Err(Status::invalid_argument(
+                        "an upload chunk must carry at least one byte",
+                    ));
+                }
+                Some(pb::open_workbook_request::Payload::Chunk(chunk)) => {
+                    let len = bytes.len() + chunk.len();
+                    if len > self.max_workbook_bytes {
+                        return Err(Status::resource_exhausted(format!(
+                            "workbook exceeds the {} byte limit",
+                            self.max_workbook_bytes
+                        )));
+                    }
+                    // Refused as soon as it cannot fit, not after it has been
+                    // buffered whole only to be turned away.
+                    self.store
+                        .admits(len as u64)
+                        .map_err(|limit| Status::resource_exhausted(limit.to_string()))?;
+                    bytes.extend_from_slice(&chunk);
+                }
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "`options` frame must be the first and only options frame",
+                    ));
+                }
+            }
+        }
+        if bytes.is_empty() {
+            return Err(Status::invalid_argument("upload contained no file bytes"));
+        }
+        Ok((format_hint, header_row, bytes))
+    }
+
+    /// Take an upload slot, or refuse the upload.
+    fn admit_upload(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
+        Arc::clone(&self.upload_slots)
+            .try_acquire_owned()
+            .map_err(|_| {
+                Status::resource_exhausted(
+                    "too many uploads in progress; retry shortly or raise \
+                     GRPC_CALAMINE_MAX_CONCURRENT_UPLOADS",
+                )
+            })
     }
 
     /// Take a streaming slot, or refuse the request.
@@ -279,6 +501,21 @@ fn resolve_sheet_name(
             .map(|s| s.name.clone())
             .ok_or_else(|| Status::not_found(format!("no sheet at index {i}"))),
         None => Err(Status::invalid_argument("sheet selector is empty")),
+    }
+}
+
+/// The next upload frame, or `DEADLINE_EXCEEDED` once the client has sent
+/// nothing for `stall`.
+async fn next_frame(
+    stream: &mut Streaming<pb::OpenWorkbookRequest>,
+    stall: std::time::Duration,
+) -> Result<Option<pb::OpenWorkbookRequest>, Status> {
+    match tokio::time::timeout(stall, stream.message()).await {
+        Ok(frame) => frame,
+        Err(_) => Err(Status::deadline_exceeded(format!(
+            "the client sent nothing for {stall:?} in the middle of an upload; \
+             abandoning it so its upload slot can be reused"
+        ))),
     }
 }
 
@@ -407,6 +644,33 @@ fn send_event<T>(tx: &mpsc::Sender<Result<T, Status>>, event: T) -> bool {
     }
 }
 
+/// `event` itself if it encodes within the frame limit, and otherwise a
+/// non-terminal in-band error naming `what` was skipped.
+///
+/// Pictures and VBA modules go out one per message, and a message past the
+/// limit fails to encode, which ends the stream with an error: one oversized
+/// picture would otherwise cost every picture after it.
+fn within_frame<T: StreamResponse + prost::Message>(
+    event: T,
+    kind: pb::CalamineErrorKind,
+    what: &str,
+) -> T {
+    let size = event.encoded_len();
+    if size <= MAX_FRAME_BYTES {
+        return event;
+    }
+    T::from_stream_error(pb::StreamError {
+        error: Some(convert::calamine_error(
+            kind,
+            format!(
+                "{what} encodes to {size} bytes, more than the {MAX_FRAME_BYTES} one \
+                 message may carry; skipped"
+            ),
+        )),
+        terminal: false,
+    })
+}
+
 /// Send an in-band error event; returns false when the client has gone away.
 fn send_stream_error<T: StreamResponse>(
     tx: &mpsc::Sender<Result<T, Status>>,
@@ -445,6 +709,27 @@ fn abort_unsorted(
              Retry with a larger max_rows_per_message to widen the repair window."
         ),
     );
+}
+
+/// Borrow a reader of `entry` for a stream, or end the stream: with
+/// `RESOURCE_EXHAUSTED` when a further reader does not fit in the store's
+/// byte budget, and in band when calamine cannot re-open the workbook.
+fn checkout<T: StreamResponse>(
+    entry: &WorkbookEntry,
+    kind: pb::CalamineErrorKind,
+    tx: &mpsc::Sender<Result<T, Status>>,
+) -> Option<PooledReader> {
+    match entry.reader() {
+        Ok(reader) => Some(reader),
+        Err(ReaderError::Limit(limit)) => {
+            let _ = tx.blocking_send(Err(Status::resource_exhausted(limit.to_string())));
+            None
+        }
+        Err(ReaderError::Open(e)) => {
+            abort_with(tx, kind, e);
+            None
+        }
+    }
 }
 
 /// Convert a calamine parse failure into an in-band terminal stream error.
@@ -867,13 +1152,22 @@ fn formula_row(row_index: u32, formulas: Vec<String>) -> pb::StreamWorksheetForm
 
 /// Emit the rows of a dense `Range<Data>` (buffered path for XLS and ODS,
 /// whose calamine readers do not expose an incremental cell iterator).
+///
+/// calamine has already built the range by now, when it opened the workbook,
+/// so the budget cannot spare that. It bounds what the stream copies out and
+/// sends, and how long it holds a parser thread doing so.
 fn emit_range(
     sheet_name: &str,
     range: &Range<Data>,
     is_1904: bool,
+    max_dense_cells: u64,
     batcher: &mut RowBatcher,
     tx: &mpsc::Sender<Result<pb::StreamWorksheetRangeResponse, Status>>,
 ) {
+    if let Err(status) = check_dense_range(sheet_name, range, max_dense_cells) {
+        let _ = tx.blocking_send(Err(status));
+        return;
+    }
     if !send_event(tx, range_started(range_header(sheet_name, range))) {
         return;
     }
@@ -883,7 +1177,19 @@ fn emit_range(
     // index is its absolute column, so a client never needs the header to
     // place a cell.
     let pad = start.1 as usize;
+    // The range starts where calamine says it does, which with
+    // `HeaderRow::Row(n)` is `n` whatever it holds, so blank rows from there to
+    // the first populated one are interior and leave as a `row_gap`, exactly
+    // as on the incremental path.
+    batcher.open_at(start.0);
     for (offset, row) in range.rows().enumerate() {
+        // A row holding nothing is never sent: every row of a dense range is
+        // as wide as its widest, so an interior run of them would otherwise
+        // carry `row.len()` empty cells apiece. The batcher announces the run
+        // as one gap before the next populated row.
+        if row.iter().all(|d| matches!(d, Data::Empty)) {
+            continue;
+        }
         let mut values = Vec::with_capacity(pad + row.len());
         values.resize(pad, convert::empty_cell_data());
         values.extend(
@@ -951,13 +1257,18 @@ fn emit_incremental<E: Display>(
     // anchoring at zero makes a value's index its absolute column and the
     // problem impossible.
     //
-    // The declaration is a capacity hint and nothing more. `width` is the
-    // emitted extent and grows only from cells that actually arrive, so the
+    // The declaration is a capacity hint and nothing more. A row's length
+    // comes only from the cells that actually arrive in it, so the
     // declaration can never reach the wire or the allocator: `A1:ZZZZZZ1` in a
     // 2 KB upload reserves 16,384 slots it never fills instead of committing
     // ~10 GiB, and a sheet holding one cell streams one cell wide.
+    //
+    // Each row ends at its own last value; the contract lets trailing empty
+    // cells be omitted. Rows are not padded to the widest row seen so far:
+    // that made one value at XFD1 widen every later row to 16,384 cells, so a
+    // couple of MB of upload holding one value per row sent 17 billion empty
+    // cells, and nothing here is under the dense-cell budget.
     let prealloc = (dims.end.1 as usize).min(MAX_DECLARED_COLUMNS - 1) + 1;
-    let mut width = 0usize;
     let mut values: Vec<pb::CellData> = Vec::with_capacity(prealloc);
 
     // With `HeaderRow::Row(n)` the sheet starts at `n` whatever `n` holds, so
@@ -1022,9 +1333,9 @@ fn emit_incremental<E: Display>(
             if !batcher.accepts(row) {
                 return abort_unsorted(tx, kind, sheet_name, row, col);
             }
-            // Padded to the running width like any other row, so a repaired
+            // As long as its own last value, like any other row, so a repaired
             // sheet streams the same shape a sorted one would.
-            let mut late = vec![convert::empty_cell_data(); width.max(idx + 1)];
+            let mut late = vec![convert::empty_cell_data(); idx + 1];
             late[idx] = convert::cell_data(value);
             if !batcher.push(tx, row, late) {
                 return;
@@ -1042,12 +1353,8 @@ fn emit_incremental<E: Display>(
                 if !batcher.accepts(current_row) {
                     return abort_unsorted(tx, kind, sheet_name, current_row, 0);
                 }
-                // `width` is the running maximum and is deliberately not reset,
-                // so the next row starts padded to it. Row *content* is then
-                // byte-identical to what a per-row walk produced, and the only
-                // thing this path changed is that empty rows became a gap.
-                let fresh = vec![convert::empty_cell_data(); width];
-                if !batcher.push(tx, current_row, std::mem::replace(&mut values, fresh)) {
+                // The next row starts empty and grows to its own last value.
+                if !batcher.push(tx, current_row, std::mem::take(&mut values)) {
                     return;
                 }
                 current_row = row;
@@ -1060,9 +1367,8 @@ fn emit_incremental<E: Display>(
             open = true;
         }
 
-        if idx >= width {
-            width = idx + 1;
-            values.resize(width, convert::empty_cell_data());
+        if idx >= values.len() {
+            values.resize(idx + 1, convert::empty_cell_data());
         }
         values[idx] = convert::cell_data(value);
     }
@@ -1109,6 +1415,7 @@ fn run_stream_worksheet_range(
     selector: Option<&pb::SheetSelector>,
     max_rows_per_message: u32,
     use_string_table: bool,
+    max_dense_cells: u64,
     tx: &mpsc::Sender<Result<pb::StreamWorksheetRangeResponse, Status>>,
 ) {
     // Only the incremental readers produce shared strings, so only they can
@@ -1124,9 +1431,8 @@ fn run_stream_worksheet_range(
     };
     let kind = convert::error_kind_for_format(entry.format);
     // Fresh independent reader: no locks, fully parallel with other reads.
-    let mut workbook = match entry.reader() {
-        Ok(workbook) => workbook,
-        Err(e) => return abort_with(tx, kind, e),
+    let Some(mut workbook) = checkout(entry, kind, tx) else {
+        return;
     };
 
     let is_1904 = entry.is_1904;
@@ -1169,7 +1475,14 @@ fn run_stream_worksheet_range(
             };
             if !streamed {
                 match xlsx.worksheet_range(&sheet_name) {
-                    Ok(range) => emit_range(&sheet_name, &range, is_1904, &mut batcher, tx),
+                    Ok(range) => emit_range(
+                        &sheet_name,
+                        &range,
+                        is_1904,
+                        max_dense_cells,
+                        &mut batcher,
+                        tx,
+                    ),
                     Err(e) => abort_with(tx, kind, e),
                 }
             }
@@ -1198,7 +1511,14 @@ fn run_stream_worksheet_range(
             };
             if !streamed {
                 match xlsb.worksheet_range(&sheet_name) {
-                    Ok(range) => emit_range(&sheet_name, &range, is_1904, &mut batcher, tx),
+                    Ok(range) => emit_range(
+                        &sheet_name,
+                        &range,
+                        is_1904,
+                        max_dense_cells,
+                        &mut batcher,
+                        tx,
+                    ),
                     Err(e) => abort_with(tx, kind, e),
                 }
             }
@@ -1208,18 +1528,204 @@ fn run_stream_worksheet_range(
                 Ok(range) => range,
                 Err(e) => return abort_with(tx, kind, e),
             };
-            emit_range(&sheet_name, &range, is_1904, &mut batcher, tx);
+            emit_range(
+                &sheet_name,
+                &range,
+                is_1904,
+                max_dense_cells,
+                &mut batcher,
+                tx,
+            );
+        }
+    }
+}
+
+/// One formula, at its absolute (row, column).
+type FormulaCell = (u32, u32, String);
+
+/// Why collecting a sheet's formulas stopped short.
+enum CollectError {
+    /// calamine could not read the sheet.
+    Read(calamine::Error),
+    /// The formulas pass a budget; the status says which.
+    Refused(Status),
+}
+
+impl<E: Into<calamine::Error>> From<E> for CollectError {
+    fn from(e: E) -> Self {
+        Self::Read(e.into())
+    }
+}
+
+/// The formula cells of one sheet, collected under both budgets.
+///
+/// The extent is the one the stream will densify, so it is checked as each
+/// cell arrives rather than once they are all in: it only ever grows, and a
+/// sheet past it is refused at the first cell that takes it there, before the
+/// rest is read. The bytes are what the cells cost in memory, the text plus
+/// the slot that holds it.
+struct FormulaCollector<'a> {
+    sheet_name: &'a str,
+    max_dense_cells: u64,
+    max_bytes: u64,
+    cells: Vec<FormulaCell>,
+    rows: Option<(u32, u32)>,
+    last_col: u32,
+    bytes: u64,
+}
+
+impl<'a> FormulaCollector<'a> {
+    fn new(sheet_name: &'a str, max_dense_cells: u64, max_bytes: u64) -> Self {
+        Self {
+            sheet_name,
+            max_dense_cells,
+            max_bytes,
+            cells: Vec::new(),
+            rows: None,
+            last_col: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Take one cell, or refuse the sheet once it passes a budget.
+    fn push(&mut self, cell: calamine::Cell<String>) -> Result<(), CollectError> {
+        if cell.get_value().is_empty() {
+            return Ok(());
+        }
+        let (row, col) = cell.get_position();
+        let (first, last) = self
+            .rows
+            .map_or((row, row), |(lo, hi)| (lo.min(row), hi.max(row)));
+        self.rows = Some((first, last));
+        self.last_col = self.last_col.max(col);
+        check_dense(
+            self.sheet_name,
+            u64::from(last - first) + 1,
+            u64::from(self.last_col) + 1,
+            self.max_dense_cells,
+        )
+        .map_err(CollectError::Refused)?;
+
+        let value = cell.get_value();
+        let cost = (value.len() as u64).saturating_add(std::mem::size_of::<FormulaCell>() as u64);
+        self.bytes = self.bytes.saturating_add(cost);
+        if self.bytes > self.max_bytes {
+            return Err(CollectError::Refused(Status::resource_exhausted(format!(
+                "the formulas of sheet {:?} come to more than the {} bytes one formula \
+                 stream may collect (GRPC_CALAMINE_MAX_FORMULA_BYTES); calamine expands \
+                 every cell of a shared formula into its own copy of the text",
+                self.sheet_name, self.max_bytes
+            ))));
+        }
+        self.cells.push((row, col, value.clone()));
+        Ok(())
+    }
+}
+
+/// An xlsx sheet's formulas, cell by cell: what calamine's
+/// `worksheet_formula` collects before it densifies them
+/// (xlsx/mod.rs:2607-2626), including its answer of nothing for a sheet that
+/// is not a worksheet.
+fn xlsx_formulas<RS: Read + Seek>(
+    xlsx: &mut Xlsx<RS>,
+    mut collector: FormulaCollector<'_>,
+) -> Result<Vec<FormulaCell>, CollectError> {
+    let mut reader = match xlsx.worksheet_cells_reader(collector.sheet_name) {
+        Ok(reader) => reader,
+        Err(calamine::XlsxError::NotAWorksheet(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    while let Some(cell) = reader.next_formula()? {
+        collector.push(cell)?;
+    }
+    Ok(collector.cells)
+}
+
+/// An xlsb sheet's formulas, cell by cell, as [`xlsx_formulas`] does for xlsx
+/// (xlsb/mod.rs:538-547).
+fn xlsb_formulas<RS: Read + Seek>(
+    xlsb: &mut Xlsb<RS>,
+    mut collector: FormulaCollector<'_>,
+) -> Result<Vec<FormulaCell>, CollectError> {
+    let mut reader = xlsb.worksheet_cells_reader(collector.sheet_name)?;
+    while let Some(cell) = reader.next_formula()? {
+        collector.push(cell)?;
+    }
+    Ok(collector.cells)
+}
+
+/// Stream formula cells as the rows `Range::from_sparse` would give them,
+/// building one row at a time instead of the whole range.
+fn emit_sparse_formulas(
+    sheet_name: &str,
+    mut cells: Vec<FormulaCell>,
+    max_dense_cells: u64,
+    tx: &mpsc::Sender<Result<pb::StreamWorksheetFormulaResponse, Status>>,
+) {
+    // Stable, so of two cells at one position the later still wins, as it
+    // does in `from_sparse`.
+    cells.sort_by_key(|&(row, col, _)| (row, col));
+    let rows_spanned = cells.first().zip(cells.last());
+    let Some(((first_row, _, _), (last_row, _, _))) = rows_spanned else {
+        // No formulas: the header is the whole stream.
+        let _ = send_event(
+            tx,
+            formula_started(pb::RangeStarted {
+                sheet_name: sheet_name.to_string(),
+                dimensions: None,
+                total_cells: 0,
+            }),
+        );
+        return;
+    };
+    let (first_row, last_row) = (*first_row, *last_row);
+    let columns = cells.iter().map(|&(_, col, _)| col);
+    let first_col = columns.clone().min().unwrap_or_default();
+    let last_col = columns.max().unwrap_or_default();
+    let rows = u64::from(last_row - first_row) + 1;
+    if let Err(status) = check_dense(sheet_name, rows, u64::from(last_col) + 1, max_dense_cells) {
+        let _ = tx.blocking_send(Err(status));
+        return;
+    }
+    let header = pb::RangeStarted {
+        sheet_name: sheet_name.to_string(),
+        dimensions: Some(pb::Dimensions {
+            start: Some(convert::cell_position((first_row, first_col))),
+            end: Some(convert::cell_position((last_row, last_col))),
+        }),
+        total_cells: rows * (u64::from(last_col - first_col) + 1),
+    };
+    if !send_event(tx, formula_started(header)) {
+        return;
+    }
+    // Anchored at column 0 like every other row: a formula's index is its
+    // absolute column, and cells without one are empty strings.
+    let width = last_col as usize + 1;
+    let mut cells = cells.into_iter().peekable();
+    for row in first_row..=last_row {
+        let mut formulas = vec![String::new(); width];
+        while let Some((_, col, formula)) = cells.next_if(|(at, _, _)| *at == row) {
+            formulas[col as usize] = formula;
+        }
+        if !send_event(tx, formula_row(row, formulas)) {
+            return;
         }
     }
 }
 
 /// The blocking body of `StreamWorksheetFormula`.
 ///
-/// Calamine only exposes formulas as a whole `Range<String>`, so the range
-/// is parsed first and then streamed row by row.
+/// calamine only offers formulas as a whole `Range<String>`, built densely
+/// over the extent of the cells, so two formulas at opposite corners of a
+/// sheet are 17 billion strings. For xlsx and xlsb the server collects the
+/// formulas cell by cell instead and builds one row at a time; for XLS and
+/// ODS the range already exists, built when the workbook was opened. Either
+/// way a range past the dense-cell budget is refused before its first event.
 fn run_stream_worksheet_formula(
     entry: &WorkbookEntry,
     selector: Option<&pb::SheetSelector>,
+    max_dense_cells: u64,
+    max_formula_bytes: u64,
     tx: &mpsc::Sender<Result<pb::StreamWorksheetFormulaResponse, Status>>,
 ) {
     let sheet_name = match resolve_sheet_name(entry, selector) {
@@ -1230,16 +1736,35 @@ fn run_stream_worksheet_formula(
         }
     };
     let kind = convert::error_kind_for_format(entry.format);
-    let mut workbook = match entry.reader() {
-        Ok(workbook) => workbook,
-        Err(e) => return abort_with(tx, kind, e),
+    let Some(mut workbook) = checkout(entry, kind, tx) else {
+        return;
     };
+    let collector = FormulaCollector::new(&sheet_name, max_dense_cells, max_formula_bytes);
+    let sparse = match &mut *workbook {
+        Sheets::Xlsx(xlsx) => Some(xlsx_formulas(xlsx, collector)),
+        Sheets::Xlsb(xlsb) => Some(xlsb_formulas(xlsb, collector)),
+        _ => None,
+    };
+    if let Some(sparse) = sparse {
+        drop(workbook);
+        return match sparse {
+            Ok(cells) => emit_sparse_formulas(&sheet_name, cells, max_dense_cells, tx),
+            Err(CollectError::Read(e)) => abort_with(tx, kind, e),
+            Err(CollectError::Refused(status)) => {
+                let _ = tx.blocking_send(Err(status));
+            }
+        };
+    }
     let range = match workbook.worksheet_formula(&sheet_name) {
         Ok(range) => range,
         Err(e) => return abort_with(tx, kind, e),
     };
     drop(workbook);
 
+    if let Err(status) = check_dense_range(&sheet_name, &range, max_dense_cells) {
+        let _ = tx.blocking_send(Err(status));
+        return;
+    }
     if !send_event(tx, formula_started(range_header(&sheet_name, &range))) {
         return;
     }
@@ -1268,9 +1793,8 @@ fn run_stream_vba_project(
     tx: &mpsc::Sender<Result<pb::StreamVbaProjectResponse, Status>>,
 ) {
     let kind = convert::error_kind_for_format(entry.format);
-    let mut workbook = match entry.reader() {
-        Ok(workbook) => workbook,
-        Err(e) => return abort_with(tx, kind, e),
+    let Some(mut workbook) = checkout(entry, kind, tx) else {
+        return;
     };
     let project = match workbook.vba_project() {
         Ok(Some(project)) => project,
@@ -1320,15 +1844,20 @@ fn run_stream_vba_project(
     }
 
     for name in module_names {
+        let what = format!("VBA module {name:?}");
         let event = match project.get_module_raw(&name) {
-            Ok(raw) => pb::StreamVbaProjectResponse {
-                event: Some(pb::stream_vba_project_response::Event::Module(
-                    pb::VbaModule {
-                        name,
-                        raw_content: raw.to_vec(),
-                    },
-                )),
-            },
+            Ok(raw) => within_frame(
+                pb::StreamVbaProjectResponse {
+                    event: Some(pb::stream_vba_project_response::Event::Module(
+                        pb::VbaModule {
+                            name,
+                            raw_content: raw.to_vec(),
+                        },
+                    )),
+                },
+                pb::CalamineErrorKind::Vba,
+                &what,
+            ),
             // Per-module failures are non-terminal: remaining modules can
             // still be delivered.
             Err(e) => pb::StreamVbaProjectResponse::from_stream_error(pb::StreamError {
@@ -1349,21 +1878,32 @@ fn run_get_pictures(
     tx: &mpsc::Sender<Result<pb::GetPicturesResponse, Status>>,
 ) {
     let kind = convert::error_kind_for_format(entry.format);
-    let workbook = match entry.reader() {
-        Ok(workbook) => workbook,
-        Err(e) => return abort_with(tx, kind, e),
+    let Some(workbook) = checkout(entry, kind, tx) else {
+        return;
     };
-    for pic in workbook.pictures_with_metadata() {
-        let event = pb::GetPicturesResponse {
-            event: Some(pb::get_pictures_response::Event::Picture(pb::Picture {
-                row: pic.row,
-                col: pic.col,
-                sheet_name: pic.sheet_name,
-                extension: pic.extension,
-                data: pic.data,
-                name: pic.name,
-            })),
-        };
+    // One copy at a time: the reader shares an image between every anchor
+    // that embeds it, and a copy is made only as each anchor's picture goes
+    // out, so a small image anchored a million times never exists a million
+    // times at once.
+    for pic in workbook.pictures_iter() {
+        let what = format!(
+            "picture {:?} at row {}, column {} of sheet {:?}",
+            pic.name, pic.row, pic.col, pic.sheet_name
+        );
+        let event = within_frame(
+            pb::GetPicturesResponse {
+                event: Some(pb::get_pictures_response::Event::Picture(pb::Picture {
+                    row: pic.row,
+                    col: pic.col,
+                    sheet_name: pic.sheet_name,
+                    extension: pic.extension,
+                    data: pic.data,
+                    name: pic.name,
+                })),
+            },
+            kind,
+            &what,
+        );
         if !send_event(tx, event) {
             return;
         }
@@ -1376,55 +1916,50 @@ impl CalamineService for CalamineGrpc {
         &self,
         request: Request<Streaming<pb::OpenWorkbookRequest>>,
     ) -> Result<Response<pb::OpenWorkbookResponse>, Status> {
-        let mut stream = request.into_inner();
-
-        // First frame must carry the options.
-        let first = stream
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("empty upload: no frames received"))?;
-        let Some(pb::open_workbook_request::Payload::Options(options)) = first.payload else {
-            return Err(Status::invalid_argument(
-                "first upload frame must carry `options`",
-            ));
+        // Admitted before a single frame is read, so a refused upload has
+        // buffered nothing. The permit moves into the parse below and is
+        // released when the workbook is parsed, or when the client leaves.
+        let permit = self.admit_upload()?;
+        let stream = request.into_inner();
+        let upload = self.receive_upload(stream);
+        let (format_hint, header_row, bytes) = if self.upload_deadline.is_zero() {
+            upload.await?
+        } else {
+            tokio::time::timeout(self.upload_deadline, upload)
+                .await
+                .map_err(|_| {
+                    Status::deadline_exceeded(format!(
+                        "the upload did not finish within {:?}; abandoning it so its \
+                         upload slot can be reused (GRPC_CALAMINE_UPLOAD_DEADLINE_SECS)",
+                        self.upload_deadline
+                    ))
+                })??
         };
-        let format_hint = pb::WorkbookFormat::try_from(options.format_hint)
-            .map_err(|_| Status::invalid_argument("unknown format_hint value"))?;
-        let header_row = options.header_row.map(|hr| match hr.selection {
-            Some(pb::header_row::Selection::RowIndex(i)) => HeaderRow::Row(i),
-            _ => HeaderRow::FirstNonEmptyRow,
-        });
-
-        // Remaining frames are file bytes; held in memory only.
-        let mut bytes = Vec::new();
-        while let Some(frame) = stream.message().await? {
-            match frame.payload {
-                Some(pb::open_workbook_request::Payload::Chunk(chunk)) => {
-                    if bytes.len() + chunk.len() > self.max_workbook_bytes {
-                        return Err(Status::resource_exhausted(format!(
-                            "workbook exceeds the {} byte limit",
-                            self.max_workbook_bytes
-                        )));
-                    }
-                    bytes.extend_from_slice(&chunk);
-                }
-                _ => {
-                    return Err(Status::invalid_argument(
-                        "`options` frame must be the first and only options frame",
-                    ));
-                }
-            }
-        }
-        if bytes.is_empty() {
-            return Err(Status::invalid_argument("upload contained no file bytes"));
-        }
 
         let store = Arc::clone(&self.store);
-        let (id, entry) =
-            tokio::task::spawn_blocking(move || store.open(bytes, format_hint, header_row))
-                .await
-                .map_err(|e| Status::internal(format!("parser task failed: {e}")))?
-                .map_err(|e| Status::invalid_argument(format!("cannot open workbook: {e}")))?;
+        let (id, entry) = tokio::task::spawn_blocking(move || {
+            // Held until the parse ends even if the client has gone, so
+            // abandoned uploads cannot pile up parses past the cap.
+            let _permit = permit;
+            store.open(bytes, format_hint, header_row)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("parser task failed: {e}")))?
+        .map_err(|e| match e {
+            StoreError::Limit(limit) => Status::resource_exhausted(limit.to_string()),
+            StoreError::Unreadable(e) => {
+                Status::invalid_argument(format!("cannot open workbook: {e}"))
+            }
+            StoreError::Malformed { part, detail } => {
+                Status::invalid_argument(format!("cannot open workbook: {part}: {detail}"))
+            }
+            refused @ StoreError::FormatRefused { .. } => {
+                Status::failed_precondition(format!("cannot open workbook: {refused}"))
+            }
+            unknown @ StoreError::NoAcceptedFormat { .. } => {
+                Status::invalid_argument(format!("cannot open workbook: {unknown}"))
+            }
+        })?;
 
         Ok(Response::new(pb::OpenWorkbookResponse {
             workbook_id: id,
@@ -1483,12 +2018,14 @@ impl CalamineService for CalamineGrpc {
         let req = request.into_inner();
         let entry = get_entry(&self.store, &req.workbook_id)?;
         let permit = self.admit()?;
+        let max_dense_cells = self.max_dense_cells;
         Ok(spawn_blocking_stream(permit, move |tx| {
             run_stream_worksheet_range(
                 &entry,
                 req.sheet.as_ref(),
                 req.max_rows_per_message,
                 req.use_string_table,
+                max_dense_cells,
                 &tx,
             );
         }))
@@ -1504,8 +2041,16 @@ impl CalamineService for CalamineGrpc {
         let req = request.into_inner();
         let entry = get_entry(&self.store, &req.workbook_id)?;
         let permit = self.admit()?;
+        let max_dense_cells = self.max_dense_cells;
+        let max_formula_bytes = self.max_formula_bytes;
         Ok(spawn_blocking_stream(permit, move |tx| {
-            run_stream_worksheet_formula(&entry, req.sheet.as_ref(), &tx);
+            run_stream_worksheet_formula(
+                &entry,
+                req.sheet.as_ref(),
+                max_dense_cells,
+                max_formula_bytes,
+                &tx,
+            );
         }))
     }
 
@@ -1557,6 +2102,85 @@ mod tests {
         drop(second);
         let reused = service.admit().expect("a released slot is reusable");
         drop((first, reused));
+    }
+
+    /// Uploads are admitted against their own slots, and an upload past the
+    /// cap is refused before it has buffered anything rather than queued.
+    #[test]
+    fn uploads_past_the_cap_are_refused_not_queued() {
+        let service = CalamineGrpc::new(WorkbookStore::new()).with_max_concurrent_uploads(1);
+        let first = service.admit_upload().expect("slot 1");
+
+        let refused = service.admit_upload().expect_err("the cap is 1");
+        assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
+
+        drop(first);
+        let _again = service.admit_upload().expect("a released slot is reusable");
+    }
+
+    /// An item that cannot be encoded under the frame limit is replaced by a
+    /// non-terminal error naming it, and one that can goes out unchanged.
+    #[test]
+    fn an_item_past_the_frame_limit_becomes_a_skip_notice() {
+        let module = |size: usize| pb::StreamVbaProjectResponse {
+            event: Some(pb::stream_vba_project_response::Event::Module(
+                pb::VbaModule {
+                    name: "Module1".to_string(),
+                    raw_content: vec![0; size],
+                },
+            )),
+        };
+
+        let small = within_frame(module(16), pb::CalamineErrorKind::Vba, "VBA module");
+        assert_eq!(small, module(16));
+
+        let skipped = within_frame(
+            module(MAX_FRAME_BYTES),
+            pb::CalamineErrorKind::Vba,
+            "VBA module \"Module1\"",
+        );
+        let Some(pb::stream_vba_project_response::Event::Error(error)) = skipped.event else {
+            panic!("expected a skip notice, got {skipped:?}");
+        };
+        assert!(!error.terminal, "the stream goes on past it");
+        let detail = error.error.expect("error detail");
+        assert_eq!(detail.kind, pb::CalamineErrorKind::Vba as i32);
+        assert!(detail.message.contains("Module1"), "{}", detail.message);
+    }
+
+    /// The extent is checked as each formula arrives: the cell that takes
+    /// the sheet past the budget is refused there, and nothing after it is
+    /// collected.
+    #[test]
+    fn formulas_are_refused_at_the_cell_that_passes_the_extent() {
+        let mut collector = FormulaCollector::new("Sheet1", 100, u64::MAX);
+        let formula = |row, col| calamine::Cell::new((row, col), "1+1".to_string());
+        collector.push(formula(0, 0)).ok().expect("A1 alone fits");
+        collector
+            .push(formula(9, 9))
+            .ok()
+            .expect("10 x 10 is exactly the budget");
+        let Err(CollectError::Refused(status)) = collector.push(formula(10, 0)) else {
+            panic!("an eleventh row passes 100 cells");
+        };
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(status.message().contains("GRPC_CALAMINE_MAX_DENSE_CELLS"));
+        assert_eq!(collector.cells.len(), 2, "the refused cell was not kept");
+    }
+
+    /// Bytes are what the formulas cost in memory, counted as they arrive.
+    #[test]
+    fn formulas_are_refused_once_their_bytes_pass_the_budget() {
+        let slot = std::mem::size_of::<FormulaCell>() as u64;
+        let mut collector = FormulaCollector::new("Sheet1", u64::MAX, 2 * (slot + 4));
+        let formula = |row| calamine::Cell::new((row, 0), "1+11".to_string());
+        collector.push(formula(0)).ok().expect("one fits");
+        collector.push(formula(1)).ok().expect("two fit exactly");
+        let Err(CollectError::Refused(status)) = collector.push(formula(2)) else {
+            panic!("a third passes the budget");
+        };
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(status.message().contains("GRPC_CALAMINE_MAX_FORMULA_BYTES"));
     }
 
     /// Ids are dense from zero in first-appearance order, and repeats of the

@@ -8,14 +8,17 @@
 //! of what calamine parsed.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use calamine::{Data, HeaderRow, Reader, Sheets, open_workbook_auto};
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::Code;
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::{Endpoint, Server};
+use tonic::{Code, Status};
 
+use grpc_calamine::archive::InflateLimits;
 use grpc_calamine::proto::v1 as pb;
 use grpc_calamine::proto::v1::calamine_service_client::CalamineServiceClient;
+use grpc_calamine::store::StoreLimits;
 use grpc_calamine::{CalamineGrpc, WorkbookStore, convert};
 
 /// Directory holding the workbook fixtures (originally from the calamine
@@ -27,11 +30,18 @@ fn fixtures() -> PathBuf {
 /// Start the server on an ephemeral localhost port and return a connected
 /// client.
 async fn start_server() -> CalamineServiceClient<tonic::transport::Channel> {
+    start_server_with(CalamineGrpc::new(WorkbookStore::new())).await
+}
+
+/// Start `grpc`, and its idle reaper, on an ephemeral localhost port and
+/// return a connected client.
+async fn start_server_with(grpc: CalamineGrpc) -> CalamineServiceClient<tonic::transport::Channel> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().unwrap();
-    let service = CalamineGrpc::new(WorkbookStore::new()).into_service();
+    let _reaper = grpc.spawn_reaper();
+    let service = grpc.into_service();
     tokio::spawn(async move {
         Server::builder()
             .add_service(service)
@@ -53,15 +63,7 @@ async fn upload(
     client: &CalamineServiceClient<tonic::transport::Channel>,
     file: &str,
 ) -> pb::OpenWorkbookResponse {
-    upload_with_options(
-        client,
-        file,
-        pb::WorkbookOptions {
-            format_hint: pb::WorkbookFormat::Unspecified as i32,
-            header_row: None,
-        },
-    )
-    .await
+    upload_with_options(client, file, default_options()).await
 }
 
 /// Upload a workbook file with explicit open-time options.
@@ -70,8 +72,37 @@ async fn upload_with_options(
     file: &str,
     options: pb::WorkbookOptions,
 ) -> pb::OpenWorkbookResponse {
-    let mut client = client.clone();
     let bytes = std::fs::read(fixtures().join(file)).expect("read fixture");
+    try_upload_bytes(client, bytes, options)
+        .await
+        .expect("open workbook")
+}
+
+/// Upload a workbook file and return whatever the server answers.
+async fn try_upload(
+    client: &CalamineServiceClient<tonic::transport::Channel>,
+    file: &str,
+) -> Result<pb::OpenWorkbookResponse, Status> {
+    let bytes = std::fs::read(fixtures().join(file)).expect("read fixture");
+    try_upload_bytes(client, bytes, default_options()).await
+}
+
+/// The open-time options every test uses unless it says otherwise.
+fn default_options() -> pb::WorkbookOptions {
+    pb::WorkbookOptions {
+        format_hint: pb::WorkbookFormat::Unspecified as i32,
+        header_row: None,
+    }
+}
+
+/// Upload workbook bytes in 64 KiB chunks and return whatever the server
+/// answers.
+async fn try_upload_bytes(
+    client: &CalamineServiceClient<tonic::transport::Channel>,
+    bytes: Vec<u8>,
+    options: pb::WorkbookOptions,
+) -> Result<pb::OpenWorkbookResponse, Status> {
+    let mut client = client.clone();
     let mut frames = vec![pb::OpenWorkbookRequest {
         payload: Some(pb::open_workbook_request::Payload::Options(options)),
     }];
@@ -85,8 +116,7 @@ async fn upload_with_options(
     client
         .open_workbook(tokio_stream::iter(frames))
         .await
-        .expect("open workbook")
-        .into_inner()
+        .map(tonic::Response::into_inner)
 }
 
 /// Stream a whole worksheet by index and return (header, rows).
@@ -356,7 +386,7 @@ async fn open_workbook_reports_format_and_metadata() {
         .into_inner();
     assert_eq!(again.metadata, opened.metadata);
 
-    // The response carries the shared-shell frontend advertisement.
+    // The response carries the frontend advertisement.
     let ui = again.ui.expect("ui info");
     assert_eq!(ui.title, "Calamine");
     assert_eq!(ui.path, "/ui/calamine");
@@ -766,16 +796,17 @@ async fn every_sheet_of_every_fixture_matches_calamine_counts() {
         "dimension_wide.xlsx",
         "rows_out_of_order.xlsx",
         "rows_descending.xlsx",
+        "gap.ods",
         "rows_with_gaps.xlsx",
         // Deliberately absent: `dimension_reversed.xlsx`, whose declaration
         // underflows calamine's own unchecked corner subtraction, so building
         // the ground truth here would panic before the server was asked
         // anything (it has its own test); `rows_late_backwards.xlsx`, which
-        // calamine reads and a one-pass stream cannot (likewise); and
-        // `corners.xlsx`, whose dense range is 17.2 billion cells, so asking
-        // calamine for the ground truth is itself the thing that cannot be
-        // afforded. It has its own test, which asserts against the two cells
-        // in the file rather than against a range nobody can allocate.
+        // calamine reads and a one-pass stream cannot (likewise); and the
+        // `corners*` fixtures, whose dense range is 17.2 billion cells, so
+        // asking calamine for the ground truth is itself the thing that cannot
+        // be afforded. They have their own tests, which assert against the
+        // cells in the file rather than against a range nobody can allocate.
     ];
     for file in files {
         let client = start_server().await;
@@ -1407,6 +1438,29 @@ async fn a_wide_declared_dimension_does_not_size_the_row_buffer() {
     );
 }
 
+/// The buffered path (XLS and ODS) gets its rows from a dense range, where a
+/// gap row is as wide as the widest row. It must still leave as one `row_gap`,
+/// exactly as on the incremental path, not as rows of empty cells.
+#[tokio::test]
+async fn a_buffered_sheet_collapses_its_gap_into_one_event() {
+    let client = start_server().await;
+    let opened = upload(&client, "gap.ods").await;
+    let (events, cells) = stream_range_events(&client, &opened.workbook_id, 0).await;
+
+    assert_eq!(
+        events,
+        vec![Event::Row(0), Event::Gap(1, 3), Event::Row(4)],
+        "the three empty rows of the dense range are one gap"
+    );
+    assert_eq!(
+        cells,
+        vec![
+            (0, 0, pb::cell_data::Value::FloatValue(1.0)),
+            (4, 3, pb::cell_data::Value::FloatValue(9.0)),
+        ]
+    );
+}
+
 /// Compression must change bytes on the wire, never content: a client that
 /// negotiates zstd (or gzip) gets exactly the rows a plain client gets.
 #[tokio::test]
@@ -1715,4 +1769,1036 @@ async fn string_table_mode_composes_with_compression() {
 
     assert_eq!(resolved, plain);
     assert!(table_len > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Handle lifetime and admission.
+//
+// Nothing guarantees a client closes what it opens: a killed process, a
+// partition or a timed-out CloseWorkbook each leave a handle behind, holding
+// its upload and a parsed reader. Handles therefore expire when idle, the
+// store refuses past its caps, and uploads are admitted against their own
+// slots, which a client that stops sending cannot hold forever.
+// ---------------------------------------------------------------------------
+
+/// A handle nobody uses for the idle TTL is closed as if its client had
+/// called CloseWorkbook.
+#[tokio::test]
+async fn an_idle_handle_is_closed_by_the_reaper() {
+    let store = WorkbookStore::with_limits(StoreLimits {
+        idle_ttl: Duration::from_millis(200),
+        ..StoreLimits::default()
+    });
+    let mut client = start_server_with(CalamineGrpc::new(store)).await;
+    let opened = upload(&client, "date.xlsx").await;
+
+    // The reaper runs every 50 ms here, so this leaves over a second of slack.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let gone = client
+        .get_metadata(pb::GetMetadataRequest {
+            workbook_id: opened.workbook_id.clone(),
+        })
+        .await
+        .expect_err("the handle expired");
+    assert_eq!(gone.code(), Code::NotFound);
+    let closed = client
+        .close_workbook(pb::CloseWorkbookRequest {
+            workbook_id: opened.workbook_id,
+        })
+        .await
+        .expect("close")
+        .into_inner();
+    assert!(!closed.closed, "nothing is left to close");
+}
+
+/// Past the workbook cap OpenWorkbook is refused with RESOURCE_EXHAUSTED,
+/// naming the setting, and closing a handle makes room again.
+#[tokio::test]
+async fn opens_past_the_workbook_cap_are_refused() {
+    let store = WorkbookStore::with_limits(StoreLimits {
+        max_open_workbooks: 1,
+        ..StoreLimits::default()
+    });
+    let mut client = start_server_with(CalamineGrpc::new(store)).await;
+    let first = upload(&client, "date.xlsx").await;
+
+    let refused = try_upload(&client, "date.xlsx")
+        .await
+        .expect_err("the cap is 1");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    assert!(
+        refused
+            .message()
+            .contains("GRPC_CALAMINE_MAX_OPEN_WORKBOOKS"),
+        "{}",
+        refused.message()
+    );
+
+    client
+        .close_workbook(pb::CloseWorkbookRequest {
+            workbook_id: first.workbook_id,
+        })
+        .await
+        .expect("close");
+    upload(&client, "date.xlsx").await;
+}
+
+/// A workbook that does not fit the store's byte budget is refused with
+/// RESOURCE_EXHAUSTED, naming the setting.
+#[tokio::test]
+async fn an_upload_past_the_byte_budget_is_refused() {
+    let store = WorkbookStore::with_limits(StoreLimits {
+        max_store_bytes: 1024,
+        ..StoreLimits::default()
+    });
+    let client = start_server_with(CalamineGrpc::new(store)).await;
+
+    let refused = try_upload(&client, "date.xlsx")
+        .await
+        .expect_err("4.6 KB does not fit in 1 KiB");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    assert!(
+        refused.message().contains("GRPC_CALAMINE_MAX_STORE_BYTES"),
+        "{}",
+        refused.message()
+    );
+}
+
+/// An upload holds its slot only while it is moving: past the cap the next
+/// one is refused, and an upload that stops sending is abandoned with
+/// DEADLINE_EXCEEDED, which frees the slot.
+#[tokio::test]
+async fn a_stalled_upload_is_abandoned_and_frees_its_slot() {
+    let grpc = CalamineGrpc::new(WorkbookStore::new())
+        .with_max_concurrent_uploads(1)
+        .with_upload_stall(Duration::from_secs(1));
+    let client = start_server_with(grpc).await;
+
+    // Sends its options frame, then nothing, while staying connected.
+    let (frames, rx) = tokio::sync::mpsc::channel(1);
+    frames
+        .send(pb::OpenWorkbookRequest {
+            payload: Some(pb::open_workbook_request::Payload::Options(
+                default_options(),
+            )),
+        })
+        .await
+        .expect("queue the options frame");
+    let mut stalled_client = client.clone();
+    let stalled = tokio::spawn(async move {
+        stalled_client
+            .open_workbook(ReceiverStream::new(rx))
+            .await
+            .map(tonic::Response::into_inner)
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let refused = try_upload(&client, "date.xlsx")
+        .await
+        .expect_err("the only upload slot is taken");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+
+    let abandoned = stalled
+        .await
+        .expect("join")
+        .expect_err("a client that stops sending is not waited on forever");
+    assert_eq!(abandoned.code(), Code::DeadlineExceeded);
+    drop(frames);
+
+    upload(&client, "date.xlsx").await;
+}
+
+/// An upload that trickles never stalls, so the stall bound alone would let
+/// it hold its slot forever. One byte every 300 ms stays inside a 1 s stall
+/// bound throughout, and the whole-upload deadline still abandons it with
+/// DEADLINE_EXCEEDED, which frees the slot.
+#[tokio::test]
+async fn a_trickled_upload_is_abandoned_at_the_deadline() {
+    let grpc = CalamineGrpc::new(WorkbookStore::new())
+        .with_max_concurrent_uploads(1)
+        .with_upload_stall(Duration::from_secs(1))
+        .with_upload_deadline(Duration::from_secs(2));
+    let client = start_server_with(grpc).await;
+
+    let (frames, rx) = tokio::sync::mpsc::channel(1);
+    frames
+        .send(pb::OpenWorkbookRequest {
+            payload: Some(pb::open_workbook_request::Payload::Options(
+                default_options(),
+            )),
+        })
+        .await
+        .expect("queue the options frame");
+    let trickle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let chunk = pb::OpenWorkbookRequest {
+                payload: Some(pb::open_workbook_request::Payload::Chunk(vec![0])),
+            };
+            if frames.send(chunk).await.is_err() {
+                return;
+            }
+        }
+    });
+    let mut trickled_client = client.clone();
+    let started = std::time::Instant::now();
+    let abandoned = tokio::time::timeout(
+        Duration::from_secs(10),
+        trickled_client.open_workbook(ReceiverStream::new(rx)),
+    )
+    .await
+    .expect("the server ends the trickle well within 10 s")
+    .expect_err("a trickle is not waited on forever");
+    assert_eq!(abandoned.code(), Code::DeadlineExceeded);
+    assert!(
+        abandoned
+            .message()
+            .contains("GRPC_CALAMINE_UPLOAD_DEADLINE_SECS"),
+        "{}",
+        abandoned.message()
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "the stall bound never fired; the deadline did"
+    );
+    trickle.abort();
+
+    upload(&client, "date.xlsx").await;
+}
+
+/// A chunk that carries nothing is refused: it would let a client keep an
+/// upload alive without sending the workbook.
+#[tokio::test]
+async fn an_empty_upload_chunk_is_refused() {
+    let mut client = start_server().await;
+    let frames = vec![
+        pb::OpenWorkbookRequest {
+            payload: Some(pb::open_workbook_request::Payload::Options(
+                default_options(),
+            )),
+        },
+        pb::OpenWorkbookRequest {
+            payload: Some(pb::open_workbook_request::Payload::Chunk(Vec::new())),
+        },
+    ];
+    let refused = client
+        .open_workbook(tokio_stream::iter(frames))
+        .await
+        .expect_err("an empty chunk is refused");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(refused.message().contains("chunk"), "{}", refused.message());
+}
+
+// ---------------------------------------------------------------------------
+// What calamine inflates at open time.
+//
+// calamine reads every embedded picture, and the shared-string table, whole
+// while it opens a package, before any sheet is asked for. A few KB of
+// deflated zeros can claim gigabytes there, so the server inflates those
+// parts into nothing first and refuses the workbook past its limits. The
+// packages below are built here rather than checked in, because what they
+// test is their recipe: how far each part inflates.
+// ---------------------------------------------------------------------------
+
+/// The parts of the smallest package calamine opens as xlsx: one sheet
+/// holding A1 = 1.
+const MINIMAL_XLSX: [(&str, &str); 5] = [
+    (
+        "[Content_Types].xml",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Default Extension="png" ContentType="image/png"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"#,
+    ),
+    (
+        "_rels/.rels",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#,
+    ),
+    (
+        "xl/workbook.xml",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#,
+    ),
+    (
+        "xl/_rels/workbook.xml.rels",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#,
+    ),
+    (
+        "xl/worksheets/sheet1.xml",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+</worksheet>"#,
+    ),
+];
+
+/// The minimal xlsx plus `extra` parts, every part deflated.
+fn xlsx_with_parts(extra: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let base = MINIMAL_XLSX
+        .iter()
+        .map(|(name, body)| (*name, body.as_bytes()));
+    let extra = extra.iter().map(|(name, body)| (*name, body.as_slice()));
+    for (name, body) in base.chain(extra) {
+        zip.start_file(name, deflated).expect("start part");
+        zip.write_all(body).expect("write part");
+    }
+    zip.finish().expect("finish package").into_inner()
+}
+
+/// A server whose inflation limits are `inflate` and nothing else changed.
+async fn start_server_inflating(
+    inflate: InflateLimits,
+) -> CalamineServiceClient<tonic::transport::Channel> {
+    let store = WorkbookStore::with_limits(StoreLimits {
+        inflate,
+        ..StoreLimits::default()
+    });
+    start_server_with(CalamineGrpc::new(store)).await
+}
+
+const MIB: usize = 1024 * 1024;
+
+/// One picture of 4 MiB of zeros deflates to a few KB, and calamine would
+/// `read_to_end` it while opening the workbook, for every reader. Past the
+/// per-picture limit it is refused before calamine sees it, and the server
+/// goes on serving.
+#[tokio::test]
+async fn a_picture_bomb_is_refused_before_calamine_inflates_it() {
+    let client = start_server_inflating(InflateLimits {
+        max_picture_bytes: MIB as u64,
+        ..InflateLimits::default()
+    })
+    .await;
+    let bomb = xlsx_with_parts(&[("xl/media/image1.png", vec![0; 4 * MIB])]);
+    assert!(bomb.len() < 64 * 1024, "the upload itself is small");
+
+    let refused = try_upload_bytes(&client, bomb, default_options())
+        .await
+        .expect_err("the picture inflates past its limit");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    assert!(
+        refused.message().contains("xl/media/image1.png")
+            && refused
+                .message()
+                .contains("GRPC_CALAMINE_MAX_PICTURE_BYTES"),
+        "{}",
+        refused.message()
+    );
+
+    upload(&client, "date.xlsx").await;
+}
+
+/// Pictures each under the per-picture limit can still add up past the
+/// per-workbook one.
+#[tokio::test]
+async fn pictures_past_the_workbook_total_are_refused() {
+    let client = start_server_inflating(InflateLimits {
+        max_picture_bytes: MIB as u64,
+        max_picture_total_bytes: MIB as u64,
+        ..InflateLimits::default()
+    })
+    .await;
+    let pictures: Vec<(&str, Vec<u8>)> = ["xl/media/image1.png", "xl/media/image2.png"]
+        .into_iter()
+        .map(|name| (name, vec![0; 3 * MIB / 4]))
+        .collect();
+
+    let refused = try_upload_bytes(&client, xlsx_with_parts(&pictures), default_options())
+        .await
+        .expect_err("two pictures of 0.75 MiB pass a 1 MiB total");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    assert!(
+        refused
+            .message()
+            .contains("GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES"),
+        "{}",
+        refused.message()
+    );
+}
+
+/// The shared-string table is read whole at open as well, into owned
+/// strings, so it is held to its own limit.
+#[tokio::test]
+async fn a_shared_string_bomb_is_refused() {
+    let client = start_server_inflating(InflateLimits {
+        max_shared_strings_bytes: MIB as u64,
+        ..InflateLimits::default()
+    })
+    .await;
+    let mut table =
+        br#"<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>"#
+            .to_vec();
+    table.resize(table.len() + 4 * MIB, b'A');
+    table.extend_from_slice(b"</t></si></sst>");
+
+    let refused = try_upload_bytes(
+        &client,
+        xlsx_with_parts(&[("xl/sharedStrings.xml", table)]),
+        default_options(),
+    )
+    .await
+    .expect_err("the table inflates past its limit");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    assert!(
+        refused
+            .message()
+            .contains("GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES"),
+        "{}",
+        refused.message()
+    );
+}
+
+/// Pictures stay in memory with every reader, so the store charges them to
+/// the workbook along with its upload: a few KB on the wire can be most of
+/// a budget once inflated.
+#[tokio::test]
+async fn inflated_pictures_count_against_the_store_budget() {
+    let store = WorkbookStore::with_limits(StoreLimits {
+        max_store_bytes: (MIB / 2) as u64,
+        ..StoreLimits::default()
+    });
+    let client = start_server_with(CalamineGrpc::new(store)).await;
+    let package = xlsx_with_parts(&[("xl/media/image1.png", vec![0; MIB])]);
+    assert!(package.len() < MIB / 2, "the upload alone fits");
+
+    let refused = try_upload_bytes(&client, package, default_options())
+        .await
+        .expect_err("the inflated picture does not");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    assert!(
+        refused.message().contains("GRPC_CALAMINE_MAX_STORE_BYTES"),
+        "{}",
+        refused.message()
+    );
+}
+
+/// Pictures within the limits open and come back intact from GetPictures.
+#[tokio::test]
+async fn pictures_within_the_limits_are_served() {
+    let mut client = start_server().await;
+    let image: Vec<u8> = (0..=255u8).cycle().take(64 * 1024).collect();
+    let opened = try_upload_bytes(
+        &client,
+        xlsx_with_parts(&[("xl/media/image1.png", image.clone())]),
+        default_options(),
+    )
+    .await
+    .expect("open");
+
+    let mut stream = client
+        .get_pictures(pb::GetPicturesRequest {
+            workbook_id: opened.workbook_id,
+        })
+        .await
+        .expect("get pictures")
+        .into_inner();
+    let mut pictures = Vec::new();
+    while let Some(event) = stream.message().await.expect("stream event") {
+        match event.event.expect("event kind") {
+            pb::get_pictures_response::Event::Picture(picture) => pictures.push(picture),
+            pb::get_pictures_response::Event::Error(err) => {
+                panic!("unexpected in-band error: {:?}", err.error)
+            }
+        }
+    }
+    assert_eq!(pictures.len(), 1);
+    assert_eq!(pictures[0].extension, "png");
+    assert_eq!(pictures[0].data, image);
+}
+
+// ---------------------------------------------------------------------------
+// Ranges the server densifies.
+//
+// Formula streams, and every XLS and ODS stream, send each row of their range
+// densely from column A, and the range is as large as its two furthest cells
+// make it. A server-wide budget bounds the grid one stream produces.
+// ---------------------------------------------------------------------------
+
+/// Stream a sheet's formulas and return the header, the dense rows (each
+/// anchored at column A) and the terminal status if the stream ended with one.
+async fn stream_formulas(
+    client: &CalamineServiceClient<tonic::transport::Channel>,
+    workbook_id: &str,
+    sheet_index: u32,
+) -> (
+    Option<pb::RangeStarted>,
+    Vec<pb::FormulaRow>,
+    Option<Status>,
+) {
+    let mut client = client.clone();
+    let mut stream = client
+        .stream_worksheet_formula(pb::StreamWorksheetFormulaRequest {
+            workbook_id: workbook_id.to_string(),
+            sheet: Some(pb::SheetSelector {
+                selector: Some(pb::sheet_selector::Selector::SheetIndex(sheet_index)),
+            }),
+        })
+        .await
+        .expect("stream formulas")
+        .into_inner();
+    let mut header = None;
+    let mut rows = Vec::new();
+    loop {
+        match stream.message().await {
+            Ok(None) => return (header, rows, None),
+            Ok(Some(event)) => match event.event.expect("event kind") {
+                pb::stream_worksheet_formula_response::Event::Started(h) => header = Some(h),
+                pb::stream_worksheet_formula_response::Event::Row(row) => rows.push(row),
+                pb::stream_worksheet_formula_response::Event::Error(err) => {
+                    panic!("unexpected in-band error: {:?}", err.error)
+                }
+            },
+            Err(status) => return (header, rows, Some(status)),
+        }
+    }
+}
+
+/// The status a value stream ends with, or `None` if it ends cleanly.
+async fn range_stream_status(
+    client: &CalamineServiceClient<tonic::transport::Channel>,
+    workbook_id: &str,
+) -> Option<Status> {
+    let mut client = client.clone();
+    let mut stream = client
+        .stream_worksheet_range(pb::StreamWorksheetRangeRequest {
+            workbook_id: workbook_id.to_string(),
+            sheet: Some(pb::SheetSelector {
+                selector: Some(pb::sheet_selector::Selector::SheetIndex(0)),
+            }),
+            max_rows_per_message: 0,
+            use_string_table: false,
+        })
+        .await
+        .expect("stream worksheet range")
+        .into_inner();
+    loop {
+        match stream.message().await {
+            Ok(None) => return None,
+            Ok(Some(_)) => {}
+            Err(status) => return Some(status),
+        }
+    }
+}
+
+/// xlsx and xlsb formulas are collected cell by cell rather than through
+/// calamine's dense `worksheet_formula`, and must come out exactly as it
+/// would give them, on every format, chartsheets and formula-free sheets
+/// included.
+#[tokio::test]
+async fn formula_streams_match_calamine_on_every_format() {
+    for file in [
+        "formula.issue.xlsx",
+        "any_sheets.xlsx",
+        "date.xlsx",
+        "date.xlsb",
+        "date.xls",
+        "date.ods",
+    ] {
+        let client = start_server().await;
+        let opened = upload(&client, file).await;
+        let mut workbook: Sheets<_> =
+            open_workbook_auto(fixtures().join(file)).expect("open fixture");
+        let names = workbook.sheet_names().to_vec();
+        for (index, name) in names.iter().enumerate() {
+            let range = workbook.worksheet_formula(name).expect("formulas");
+            let (header, rows, status) =
+                stream_formulas(&client, &opened.workbook_id, index as u32).await;
+            assert!(status.is_none(), "{file}/{name}: {status:?}");
+            let header = header.expect("a header first");
+            assert_eq!(header.sheet_name, *name);
+
+            let expected_dims = range
+                .start()
+                .zip(range.end())
+                .map(|(start, end)| pb::Dimensions {
+                    start: Some(convert::cell_position(start)),
+                    end: Some(convert::cell_position(end)),
+                });
+            assert_eq!(header.dimensions, expected_dims, "{file}/{name}");
+            let (height, width) = range.get_size();
+            assert_eq!(header.total_cells, (height * width) as u64, "{file}/{name}");
+
+            let start = range.start().unwrap_or_default();
+            let expected: Vec<(u32, Vec<String>)> = range
+                .rows()
+                .enumerate()
+                .map(|(offset, row)| {
+                    let mut formulas = vec![String::new(); start.1 as usize];
+                    formulas.extend_from_slice(row);
+                    (start.0 + offset as u32, formulas)
+                })
+                .collect();
+            let got: Vec<(u32, Vec<String>)> = rows
+                .into_iter()
+                .map(|row| (row.row_index, row.formulas))
+                .collect();
+            assert_eq!(got, expected, "{file}/{name}");
+        }
+    }
+}
+
+/// Two formulas at opposite corners make a 1,048,576 x 16,384 range. calamine
+/// would densify it into 17 billion strings before the first row; the server
+/// refuses it from the cells' positions alone, before any event.
+#[tokio::test]
+async fn formulas_at_opposite_corners_are_refused() {
+    let client = start_server().await;
+    let opened = upload(&client, "corners_formula.xlsx").await;
+    let (header, rows, status) = stream_formulas(&client, &opened.workbook_id, 0).await;
+
+    assert!(
+        header.is_none() && rows.is_empty(),
+        "refused before any event"
+    );
+    let status = status.expect("a terminal status");
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert!(
+        status.message().contains("GRPC_CALAMINE_MAX_DENSE_CELLS"),
+        "{}",
+        status.message()
+    );
+}
+
+/// The minimal xlsx with its one sheet's `<sheetData>` replaced, deflated.
+fn xlsx_with_sheet_data(sheet_data: &str) -> Vec<u8> {
+    use std::io::Write;
+    let sheet = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>{sheet_data}</sheetData>
+</worksheet>"#
+    );
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, body) in MINIMAL_XLSX {
+        let body = if name == "xl/worksheets/sheet1.xml" {
+            sheet.as_str()
+        } else {
+            body
+        };
+        zip.start_file(name, deflated).expect("start part");
+        zip.write_all(body.as_bytes()).expect("write part");
+    }
+    zip.finish().expect("finish package").into_inner()
+}
+
+/// One shared formula of 64 KiB and the cells that share it: each derived
+/// cell is a few bytes of deflated XML, and calamine expands every one into
+/// its own copy of the anchor's text. 1,000 cells are well inside the cell
+/// budget and some 64 MB of strings, which the byte budget refuses before the
+/// first event; the same sheet with one cell sharing it streams.
+#[tokio::test]
+async fn shared_formulas_past_the_byte_budget_are_refused() {
+    let anchor = format!("{}1", "A1+".repeat(64 * 1024 / 3));
+    let sheet = |derived: u32| {
+        let mut data = format!(
+            r#"<row r="1"><c r="A1"><f t="shared" ref="A1:A{last}" si="0">{anchor}</f></c></row>"#,
+            last = derived + 1
+        );
+        for r in 2..=derived + 1 {
+            data.push_str(&format!(
+                r#"<row r="{r}"><c r="A{r}"><f t="shared" si="0"/></c></row>"#
+            ));
+        }
+        xlsx_with_sheet_data(&data)
+    };
+    let client = start_server_with(
+        CalamineGrpc::new(WorkbookStore::new()).with_max_formula_bytes(4 * MIB as u64),
+    )
+    .await;
+
+    let bomb = sheet(1_000);
+    assert!(bomb.len() < 64 * 1024, "the upload stays small");
+    let opened = try_upload_bytes(&client, bomb, default_options())
+        .await
+        .expect("the workbook itself opens");
+    let (header, rows, status) = stream_formulas(&client, &opened.workbook_id, 0).await;
+    assert!(
+        header.is_none() && rows.is_empty(),
+        "refused before any event"
+    );
+    let status = status.expect("a terminal status");
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert!(
+        status.message().contains("GRPC_CALAMINE_MAX_FORMULA_BYTES"),
+        "{}",
+        status.message()
+    );
+
+    let fits = try_upload_bytes(&client, sheet(1), default_options())
+        .await
+        .expect("open");
+    let (header, rows, status) = stream_formulas(&client, &fits.workbook_id, 0).await;
+    assert!(status.is_none(), "{status:?}");
+    assert!(header.is_some());
+    assert_eq!(rows.len(), 2, "the anchor and the one cell sharing it");
+}
+
+/// The budget holds on every path that streams a dense range: XLS and ODS
+/// values, and formulas.
+#[tokio::test]
+async fn ranges_past_the_dense_budget_are_refused() {
+    let client =
+        start_server_with(CalamineGrpc::new(WorkbookStore::new()).with_max_dense_cells(5)).await;
+    for file in ["date.xls", "date.ods"] {
+        let opened = upload(&client, file).await;
+        let status = range_stream_status(&client, &opened.workbook_id)
+            .await
+            .unwrap_or_else(|| panic!("{file}: a range of more than 5 cells streamed"));
+        assert_eq!(status.code(), Code::ResourceExhausted, "{file}");
+    }
+    let opened = upload(&client, "formula.issue.xlsx").await;
+    let (_, _, status) = stream_formulas(&client, &opened.workbook_id, 0).await;
+    assert_eq!(
+        status.expect("a 14 x 10 formula range").code(),
+        Code::ResourceExhausted
+    );
+
+    // The value stream of an xlsx sheet never densifies, so it is not held to
+    // the budget at all.
+    let opened = upload(&client, "date.xlsx").await;
+    assert!(
+        range_stream_status(&client, &opened.workbook_id)
+            .await
+            .is_none()
+    );
+}
+
+/// ODS is densified by calamine while the workbook is opened, before the
+/// server sees a sheet, so its only bound there is calamine's own cell cap:
+/// the corners as ODS are refused at OpenWorkbook, and the server goes on.
+#[tokio::test]
+async fn ods_corners_are_refused_when_opened() {
+    let client = start_server().await;
+    let refused = try_upload(&client, "corners.ods")
+        .await
+        .expect_err("past calamine's cell cap");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    upload(&client, "date.ods").await;
+}
+
+/// A picture too large for one gRPC message is reported in-band and skipped,
+/// and the pictures around it are still delivered. It used to fail the
+/// encode and end the stream, losing every picture after it.
+#[tokio::test]
+async fn a_picture_too_large_for_one_message_is_skipped_not_fatal() {
+    use std::io::Write;
+    // Stored rather than deflated: building it should cost a copy, not a
+    // compression pass over 33 MiB.
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, body) in MINIMAL_XLSX {
+        zip.start_file(name, deflated).expect("start part");
+        zip.write_all(body.as_bytes()).expect("write part");
+    }
+    zip.start_file("xl/media/image1.png", stored)
+        .expect("start picture");
+    zip.write_all(&vec![7; 33 * MIB]).expect("write picture");
+    zip.start_file("xl/media/image2.png", deflated)
+        .expect("start picture");
+    zip.write_all(&[9; 1024]).expect("write picture");
+    let package = zip.finish().expect("finish package").into_inner();
+
+    let mut client = start_server().await;
+    let opened = try_upload_bytes(&client, package, default_options())
+        .await
+        .expect("33 MiB is within the picture limits");
+    let mut stream = client
+        .get_pictures(pb::GetPicturesRequest {
+            workbook_id: opened.workbook_id,
+        })
+        .await
+        .expect("get pictures")
+        .into_inner();
+
+    let mut pictures = Vec::new();
+    let mut skipped = Vec::new();
+    while let Some(event) = stream.message().await.expect("the stream survives") {
+        match event.event.expect("event kind") {
+            pb::get_pictures_response::Event::Picture(picture) => pictures.push(picture),
+            pb::get_pictures_response::Event::Error(err) => skipped.push(err),
+        }
+    }
+    assert_eq!(pictures.len(), 1, "the small picture still arrives");
+    assert_eq!(pictures[0].data, vec![9; 1024]);
+    assert_eq!(skipped.len(), 1, "the large one is reported");
+    assert!(!skipped[0].terminal);
+}
+
+// ---------------------------------------------------------------------------
+// Declared counts the pre-open scan catches: a way a crafted file drives
+// calamine to allocate from a number it never checks, refused before calamine
+// parses the file. (Pictures multiplied across anchors need no scan: the fork
+// shares one copy between them; see tests/pictures.rs.)
+// ---------------------------------------------------------------------------
+
+/// A 1.8 KB workbook whose `sharedStrings.xml` declares a trillion unique
+/// strings. calamine would `reserve(1_000_000_000_000)` (24 TB) before reading
+/// a single entry and abort the process; the scan refuses it as malformed
+/// (INVALID_ARGUMENT) because the table's few inflated bytes cannot hold that
+/// many strings. The server keeps serving afterward.
+#[tokio::test]
+async fn a_lying_shared_string_count_is_refused() {
+    let table = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1000000000000"><si><t>a</t></si></sst>"#
+        .to_vec();
+    let package = xlsx_with_parts(&[("xl/sharedStrings.xml", table)]);
+    assert!(package.len() < 4096, "the upload itself is tiny");
+
+    let mut client = start_server().await;
+    let refused = try_upload_bytes(&client, package, default_options())
+        .await
+        .expect_err("a trillion declared strings in 1.8 KB is a lie");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(
+        refused.message().contains("uniqueCount") && refused.message().contains("shared strings"),
+        "{}",
+        refused.message()
+    );
+
+    upload(&client, "date.xlsx").await;
+    let probe = client
+        .get_metadata(pb::GetMetadataRequest::default())
+        .await
+        .expect("the server still answers");
+    assert!(probe.into_inner().ui.is_some());
+}
+
+/// A legitimate `uniqueCount` opens: the guard is a ceiling, not a cap on
+/// real tables.
+#[tokio::test]
+async fn an_honest_shared_string_count_opens() {
+    let table = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="2" uniqueCount="2"><si><t>alpha</t></si><si><t>beta</t></si></sst>"#
+        .to_vec();
+    let package = xlsx_with_parts(&[("xl/sharedStrings.xml", table)]);
+    let client = start_server().await;
+    try_upload_bytes(&client, package, default_options())
+        .await
+        .expect("an honest table opens");
+}
+
+// ---------------------------------------------------------------------------
+// What every reader holds: the parsed shared-string table, charged to the
+// store once for the workbook's parked reader and again for each further one.
+// ---------------------------------------------------------------------------
+
+/// A shared-string table of `entries` strings like `<si><t>s0</t></si>`.
+fn shared_string_table(entries: usize) -> Vec<u8> {
+    let mut table = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">"#,
+    );
+    for i in 0..entries {
+        table.push_str(&format!("<si><t>s{i}</t></si>"));
+    }
+    table.push_str("</sst>");
+    table.into_bytes()
+}
+
+/// The parsed table is charged with the upload, and a reader opened while
+/// the parked one is busy is charged again until the workbook has only one
+/// reader left.
+#[test]
+fn the_shared_string_table_is_charged_for_every_reader() {
+    const ENTRIES: u64 = 10_000;
+    let package = xlsx_with_parts(&[(
+        "xl/sharedStrings.xml",
+        shared_string_table(ENTRIES as usize),
+    )]);
+    let upload = package.len() as u64;
+    let store = WorkbookStore::new();
+    let (_, entry) = store
+        .open(package, pb::WorkbookFormat::Unspecified, None)
+        .expect("open");
+
+    let held = store.held_bytes();
+    // At least a 24-byte slot and a heap block per string.
+    assert!(
+        held >= upload + ENTRIES * 56,
+        "{held} held for {upload} uploaded"
+    );
+    let per_reader = held - upload;
+
+    let first = entry.reader().expect("the parked reader");
+    assert_eq!(
+        store.held_bytes(),
+        held,
+        "the parked reader is already charged"
+    );
+    let second = entry.reader().expect("a further reader fits");
+    assert_eq!(store.held_bytes(), held + per_reader);
+    drop(second);
+    assert_eq!(
+        store.held_bytes(),
+        held + per_reader,
+        "parked while the first is out, it keeps its charge"
+    );
+    drop(first);
+    assert_eq!(
+        store.held_bytes(),
+        held,
+        "once both are back, one reader is kept and the other's charge returned"
+    );
+}
+
+/// A further reader that does not fit in the byte budget is refused rather
+/// than parsing the table again.
+#[test]
+fn a_further_reader_past_the_byte_budget_is_refused() {
+    let package = xlsx_with_parts(&[("xl/sharedStrings.xml", shared_string_table(10_000))]);
+    let probe = WorkbookStore::new();
+    probe
+        .open(package.clone(), pb::WorkbookFormat::Unspecified, None)
+        .expect("open");
+    let held = probe.held_bytes();
+
+    let store = WorkbookStore::with_limits(StoreLimits {
+        max_store_bytes: held + held / 4,
+        ..StoreLimits::default()
+    });
+    let (_, entry) = store
+        .open(package, pb::WorkbookFormat::Unspecified, None)
+        .expect("one reader fits");
+    let _busy = entry.reader().expect("the parked reader");
+    let refused = entry.reader().err().expect("a second does not fit");
+    assert!(
+        matches!(
+            refused,
+            grpc_calamine::store::ReaderError::Limit(
+                grpc_calamine::store::LimitExceeded::ReaderBytes { .. }
+            )
+        ),
+        "{refused}"
+    );
+    assert!(
+        refused
+            .to_string()
+            .contains("GRPC_CALAMINE_MAX_STORE_BYTES")
+    );
+    assert_eq!(store.held_bytes(), held, "a refused reader holds nothing");
+}
+
+/// A small upload whose table parses to far more than it weighs is refused
+/// by the byte budget at open, before calamine parses it.
+#[tokio::test]
+async fn a_shared_string_bomb_is_charged_at_open() {
+    let bomb = xlsx_with_parts(&[("xl/sharedStrings.xml", shared_string_table(400_000))]);
+    assert!(bomb.len() < 2 * MIB, "the upload is a couple of MB at most");
+    let store = WorkbookStore::with_limits(StoreLimits {
+        max_store_bytes: 16 * MIB as u64,
+        ..StoreLimits::default()
+    });
+    let client = start_server_with(CalamineGrpc::new(store)).await;
+
+    let refused = try_upload_bytes(&client, bomb, default_options())
+        .await
+        .expect_err("400,000 parsed strings do not fit in 16 MiB");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    assert!(
+        refused.message().contains("GRPC_CALAMINE_MAX_STORE_BYTES"),
+        "{}",
+        refused.message()
+    );
+}
+
+/// A value at XFD1 does not widen the rows after it: each row ends at its own
+/// last value, so one value per row down the sheet costs one cell per row
+/// rather than 16,384.
+#[tokio::test]
+async fn rows_are_not_padded_to_the_widest_row_before_them() {
+    let mut data = String::from(r#"<row r="1"><c r="XFD1"><v>1</v></c></row>"#);
+    for r in 2..=1000 {
+        data.push_str(&format!(r#"<row r="{r}"><c r="A{r}"><v>{r}</v></c></row>"#));
+    }
+    let client = start_server().await;
+    let opened = try_upload_bytes(&client, xlsx_with_sheet_data(&data), default_options())
+        .await
+        .expect("open");
+    let (_, rows) = stream_range(&client, &opened.workbook_id, 0).await;
+
+    assert_eq!(rows.len(), 1000);
+    assert_eq!(rows[0].values.len(), 16_384, "XFD1 is the 16,384th cell");
+    for row in &rows[1..] {
+        assert_eq!(
+            row.values.len(),
+            1,
+            "row {} ends at column A",
+            row.row_index
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GRPC_CALAMINE_FORMATS: formats a server refuses are never opened.
+// ---------------------------------------------------------------------------
+
+fn xlsx_only() -> grpc_calamine::store::FormatSet {
+    "xlsx,xlsb".parse().expect("a format list")
+}
+
+/// Asked for by name, a refused format is FAILED_PRECONDITION; detected, it
+/// is never tried, so the upload does not open as anything accepted.
+#[tokio::test]
+async fn a_refused_format_is_never_opened() {
+    let client = start_server_with(CalamineGrpc::new(
+        WorkbookStore::new().with_formats(xlsx_only()),
+    ))
+    .await;
+
+    let ods = std::fs::read(fixtures().join("date.ods")).expect("read fixture");
+    let named = try_upload_bytes(
+        &client,
+        ods,
+        pb::WorkbookOptions {
+            format_hint: pb::WorkbookFormat::Ods as i32,
+            header_row: None,
+        },
+    )
+    .await
+    .expect_err("ods is refused");
+    assert_eq!(named.code(), Code::FailedPrecondition);
+    assert!(
+        named.message().contains("ods") && named.message().contains("GRPC_CALAMINE_FORMATS"),
+        "{}",
+        named.message()
+    );
+
+    for file in ["date.ods", "date.xls"] {
+        let detected = try_upload(&client, file)
+            .await
+            .expect_err("auto-detection never tries a refused format");
+        assert_eq!(detected.code(), Code::InvalidArgument, "{file}");
+        assert!(
+            detected.message().contains("xlsx,xlsb"),
+            "{}",
+            detected.message()
+        );
+    }
+
+    let xlsx = upload(&client, "date.xlsx").await;
+    assert_eq!(xlsx.detected_format, pb::WorkbookFormat::Xlsx as i32);
+    let xlsb = upload(&client, "date.xlsb").await;
+    assert_eq!(xlsb.detected_format, pb::WorkbookFormat::Xlsb as i32);
 }

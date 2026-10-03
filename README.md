@@ -104,6 +104,21 @@ slower.
 | `GRPC_CALAMINE_BLOCKING_THREADS` | `512`          | max threads for calamine parsing tasks      |
 | `GRPC_CALAMINE_WINDOW_BYTES`     | `52428800`     | HTTP/2 initial stream and connection window |
 | `GRPC_CALAMINE_MAX_CONCURRENT_STREAMS` | `128`    | streaming reads admitted at once            |
+| `GRPC_CALAMINE_MAX_CONCURRENT_UPLOADS` | `16`     | `OpenWorkbook` uploads admitted at once     |
+| `GRPC_CALAMINE_MAX_OPEN_WORKBOOKS` | `256`        | workbooks open at once                      |
+| `GRPC_CALAMINE_MAX_STORE_BYTES`  | `2147483648`   | bytes the open workbooks hold together (2 GiB) |
+| `GRPC_CALAMINE_HANDLE_TTL_SECS`  | `300`          | idle seconds before a workbook is closed; `0` never |
+| `GRPC_CALAMINE_UPLOAD_DEADLINE_SECS` | `600`      | seconds one whole `OpenWorkbook` upload may take; `0` never |
+| `GRPC_CALAMINE_MAX_PICTURE_BYTES` | `67108864`    | largest embedded picture, inflated (64 MiB) |
+| `GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES` | `268435456` | one workbook's pictures together, inflated (256 MiB) |
+| `GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES` | `268435456` | largest shared-string table, inflated (256 MiB) |
+| `GRPC_CALAMINE_FORMATS`          | `xlsx,xlsb,xls,ods` | workbook formats accepted; a refused one is never opened |
+| `GRPC_CALAMINE_MAX_DENSE_CELLS`  | `33554432`     | cells one formula, XLS or ODS stream may densify |
+| `GRPC_CALAMINE_MAX_FORMULA_BYTES` | `536870912`  | formula bytes one xlsx/xlsb formula stream may collect (512 MiB) |
+
+A variable that is set but does not parse (`2GiB`, `-1`, a number past its
+type) stops the server at startup with a message naming it, rather than
+running with the default in its place.
 
 The window default is 50 MiB because window size over round-trip time caps
 upload throughput; hyper's 1 MiB default holds a 10 ms link near 100 MB/s.
@@ -114,9 +129,64 @@ The server accepts gzip- and zstd-compressed requests and compresses
 responses for any client that negotiates it. No configuration needed on
 either side beyond the client asking.
 
+Every workbook a client opens stays in memory until it is closed, and
+nothing guarantees a client gets to close it: a killed process, a network
+partition or a `CloseWorkbook` that times out each leave one behind. So the
+store is bounded three ways. A workbook nobody has used for
+`GRPC_CALAMINE_HANDLE_TTL_SECS` is closed for its client, and any later call
+on its id gets `NOT_FOUND`; one that a read is still streaming is in use, so
+a read that takes longer than the TTL keeps its handle. Past
+`GRPC_CALAMINE_MAX_OPEN_WORKBOOKS` workbooks, or past
+`GRPC_CALAMINE_MAX_STORE_BYTES` of uploaded bytes held between them, the
+next `OpenWorkbook` is refused with `RESOURCE_EXHAUSTED`, during the upload
+rather than after it, once idle workbooks have been closed to make room.
+Uploads themselves are admitted against `GRPC_CALAMINE_MAX_CONCURRENT_UPLOADS`
+slots, since each buffers its workbook in memory until it is parsed, and an
+upload that sends nothing for 30 s is abandoned with `DEADLINE_EXCEEDED`.
+That alone does not free a slot, because a client sending one byte every
+29 s never stalls, so an upload also has `GRPC_CALAMINE_UPLOAD_DEADLINE_SECS`
+to finish as a whole, and a chunk carrying no bytes is refused with
+`INVALID_ARGUMENT`. The server logs each time it closes idle
+workbooks, with how many remain open and what they hold.
+
+Some parts of a workbook are read whole while calamine opens it, before any
+sheet is asked for: every embedded picture (the server is built with
+calamine's `picture` feature) and the shared-string table. Deflate reaches
+about 1,000:1 and the zip format's recorded sizes come from the uploader,
+so a 5 MB upload could claim 5 GB there, and an allocation that size aborts
+the process rather than failing the request. So the server inflates those
+parts first, into nothing, counting, and refuses the workbook with
+`RESOURCE_EXHAUSTED` past `GRPC_CALAMINE_MAX_PICTURE_BYTES` for one picture,
+`GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES` for all of them, or
+`GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES` for the table. That costs one extra
+inflation of those parts per open. Each distinct image is counted once,
+however many drawing anchors or rich-data cells embed it: those references
+cost a few bytes of XML apiece and multiply freely, and stock calamine gives
+every one its own copy of the image while it opens the workbook, but the
+pinned fork shares one copy between them, and `GetPictures` copies each
+anchor's picture only as it sends it. A 17 KB upload anchoring one 64 KiB
+image 20,000 times opens holding that image once rather than 1.25 GB of
+copies (`tests/pictures.rs`).
+
+What passes is charged against `GRPC_CALAMINE_MAX_STORE_BYTES` along with
+the upload, since every reader of the workbook keeps it: the pictures, and
+the shared-string table as calamine parses it into owned strings. That
+table costs more than its XML, a slot and a heap block per string, so it is
+charged as its inflated bytes plus 16 bytes per tag (xlsx) or 48 per record
+(xlsb): a table of `<si><t>a</t></si>` entries, 16 bytes each, is charged 80
+per entry. The workbook's charge covers the one reader it keeps parked; a
+read that finds that reader busy (a second stream on the same workbook)
+opens another, which is charged the same again while it lives, and is
+refused with `RESOURCE_EXHAUSTED` when it does not fit.
+
+The same scan refuses, with `INVALID_ARGUMENT`, a shared-string table whose
+declared `uniqueCount` is larger than its inflated bytes could hold: calamine
+reserves space for that many strings before reading one, so a 2 KB table that
+claims a trillion would otherwise reserve terabytes and abort the process.
+
 Hard limits (compile-time, `src/service.rs`): 512 MiB max workbook upload,
 32 MiB max gRPC frame, 64-event stream backpressure channel, 8 MiB per row
-batch, 65,536 rows per batch, 30 s consumer stall.
+batch, 65,536 rows per batch, 30 s upload stall, 30 s consumer stall.
 
 That last one is what keeps a client from taking the server down by opening
 streams and never reading them: a parse waits on a slow consumer, but not
@@ -133,27 +203,50 @@ its start reports zero cells rather than underflowing. A panic anywhere in
 the parse is delivered as a gRPC `INTERNAL` status, never as a stream that
 ends successfully having sent nothing.
 
-**Formulas are the one path that still densifies.**
-`StreamWorksheetFormula` has no incremental API in calamine, so it goes
-through `Range::from_sparse`, which builds `rows * cols` cells. Two formula
-cells at opposite corners of a sheet are ~17 billion `String`s, about
-412 GB. On stock crates.io calamine that allocation fails through
-`handle_alloc_error`, which aborts the process without unwinding, so the
-panic supervisor above cannot catch it and the server dies. This build links
-[the fork](#building-against-patched-calamine), where the same case is a
-catchable panic and the caller gets `INTERNAL` naming the extent:
+**Some streams send a dense range, and those are budgeted.** The value
+stream of an xlsx or xlsb sheet goes cell by cell and never builds one, and
+each of its rows ends at that row's own last value: a value at XFD1 does
+not widen the rows after it, so its output is the populated rows, each as
+long as its last value, and nothing is padded to a width no row has. A
+formula stream, and any XLS or ODS stream, sends every row of its range
+from column A, and a range is as large as the two cells furthest apart make
+it: two formulas at opposite corners of a sheet are about 17 billion cells.
+calamine's own `worksheet_formula` densifies that extent before the first
+row, about 412 GB of `String`s, so for xlsx and xlsb the server collects the
+formula cells itself and builds one row at a time. Either way a range of
+more than `GRPC_CALAMINE_MAX_DENSE_CELLS` cells, counted from column A, is
+refused with `RESOURCE_EXHAUSTED` before its first event. The default covers
+a whole .xls sheet (65,536 x 256) twice over. For xlsx and xlsb that extent is
+checked as each formula is collected, so a sheet is refused at the cell that
+takes it past the budget rather than after the whole sheet has been read.
 
-```
-parser panicked: calamine: cannot densify a 1048576 x 16384 range
-(17179869184 cells of 24 bytes). This extent is derived from the positions
-of the cells in the file, not from its declared dimension, so a sheet with
-very few cells can still reach it.
-```
+A cell count says nothing about the bytes behind it, though. calamine expands
+every cell of a shared formula into its own copy of the anchor's text, so a
+cell that is a few deflated bytes in the upload can be kilobytes in memory,
+and the formula stream has to hold every formula of the sheet before its
+first row. So the collected formulas are budgeted in bytes as well, text plus
+the slot that holds it, and a sheet past `GRPC_CALAMINE_MAX_FORMULA_BYTES` is
+refused with `RESOURCE_EXHAUSTED` before its first event.
 
-The value stream is not affected either way: it streams cells and never
-calls `from_sparse`, which is what makes a `row_gap` possible there and not
-here. If you build against unpatched calamine, do not expose
-`StreamWorksheetFormula` to untrusted uploads.
+One cost stays outside that budget, and outside every other limit here:
+calamine parses an XLS or ODS workbook into dense ranges while opening it,
+before the server sees a sheet. XLS ranges are allocated fallibly by the
+fork's `Range::from_sparse`, but one that merely fits is still allocated in
+full. ODS is capped by calamine at 100 million cells per sheet, past which
+`OpenWorkbook` is refused, but nothing caps its bytes: a repeated cell or row
+(`table:number-columns-repeated`, `table:number-rows-repeated`) is a copy of
+the cell's value per repetition, so one long string repeated is that string
+many times over. An 823-byte .ods of one 4 KiB string repeated across 1,024
+columns and 16 rows opens as 64 MiB of strings, and the same recipe with
+larger counts goes as far as the cell cap times the string. That memory is
+held by the workbook's parked reader and is not charged against
+`GRPC_CALAMINE_MAX_STORE_BYTES`. A server that takes uploads from untrusted
+clients should refuse ODS until this is bounded, and XLS too unless the
+fallible allocation is enough: `GRPC_CALAMINE_FORMATS=xlsx,xlsb` does that.
+A refused format is never opened. Named as the format hint it fails
+`OpenWorkbook` with `FAILED_PRECONDITION`; auto-detection tries only the
+accepted formats, in calamine's own order, so an ODS upload to that server
+fails with `INVALID_ARGUMENT` without calamine ever parsing it as ODS.
 
 ## API
 
@@ -182,10 +275,16 @@ events define each distinct string once, cells carry `shared_string_id`,
 and every id is defined before the first row that references it. The
 dictionary is XLSX/XLSB only; other formats accept the flag unchanged.
 
+Close handles when you are done with them. One left open is closed for you
+once it has been idle for the TTL (five minutes by default), but until then
+it counts against the store's limits.
+
 `StreamWorksheetFormula` has the same shape with formula strings instead of
 values. `StreamVbaProject` sends project info, then one event per module
 (raw MBCS bytes; decoding is the client's choice, matching calamine).
-`GetPictures` sends one event per embedded image. `GetMetadata`,
+`GetPictures` sends one event per embedded image. A picture or module too
+large for one 32 MiB message is reported with a non-terminal `StreamError`
+and skipped, and the stream goes on. `GetMetadata`,
 `GetDefinedNames`, and `CloseWorkbook` are the remaining unary calls.
 `GetMetadata` also returns the `UiInfo` frontend advertisement shared by
 every ai-pipestream service, so embedding hosts can discover and link this
@@ -227,38 +326,47 @@ client.close_workbook(CloseWorkbookRequest {
 ## Building from source
 
 Rust stable, the [buf](https://buf.build/docs/installation) CLI, and the
-codegen plugins (`cargo install protoc-gen-prost protoc-gen-tonic`).
+codegen plugins at the versions that produced `src/gen`
+(`cargo install --locked protoc-gen-prost@0.5.0 protoc-gen-tonic@0.5.0`).
 
 ```bash
 buf lint && buf generate   # after editing anything under proto/
+buf build -o src/gen/calamine/v1/calamine.v1.binpb   # the reflection descriptor
 cargo build
 cargo test                 # unit + end-to-end streaming tests
 ```
 
+CI regenerates both and fails if `src/gen` differs from what is checked in,
+so the code and the descriptor that reflection serves cannot drift from the
+contract.
+
 ### Building against patched calamine
 
 The API used is calamine 0.36, but `Cargo.toml` carries a
-`[patch.crates-io]` pointing at [`ai-pipestream/calamine`][fork]
+`[patch.crates-io]` pinned to a commit of [`ai-pipestream/calamine`][fork]
 `pipestream-main`, which is upstream `master` with three fix branches
-merged:
+merged, plus one commit of its own:
 
 | upstream defect | issue | fix |
 |---|---|---|
 | reversed `<dimension ref>` underflows the extent | [#692][i692] | [#695][p695] |
 | `from_sparse` densifies without a bound | [#693][i693] | [#697][p697] |
 | cell-ref column arithmetic overflows `u32` | [#694][i694] | [#696][p696] |
+| a picture is copied per anchor; a shared formula's `si` sizes a `Vec` | none upstream yet | [fork #2][f2] |
 
 `bench/` carries the same patch, because it is a separate crate and does not
 inherit one. Without it the harness would link crates.io calamine while the
 server links the fork, quietly falsifying its own claim to measure the same
 build. Both lock files pin the same commit.
 
-Nothing here depends on an API those fixes introduce, so remove both
-`[patch]` sections once the fixes are released. Until then, building against
-stock crates.io calamine still works and still passes the suite; you just
-lose the three guarantees above, of which the `from_sparse` bound is the one
-that can take the process down, as the formula note under [Run](#run)
-explains.
+The server depends on one API the fork adds, `Reader::pictures_iter`, so it
+no longer builds against stock crates.io calamine; remove both `[patch]`
+sections once all four fixes are released, the last of them with that
+method. Every one of them guards against an upload that takes the process
+down: the `from_sparse` bound because calamine builds every XLS sheet with it
+when the workbook is opened, as the dense-range note under [Run](#run)
+explains, and the shared pictures because without them an image anchored many
+times is copied that many times before the server sees a sheet.
 
 [fork]: https://github.com/ai-pipestream/calamine
 [i692]: https://github.com/tafia/calamine/issues/692
@@ -267,6 +375,7 @@ explains.
 [p695]: https://github.com/tafia/calamine/pull/695
 [p696]: https://github.com/tafia/calamine/pull/696
 [p697]: https://github.com/tafia/calamine/pull/697
+[f2]: https://github.com/ai-pipestream/calamine/pull/2
 
 ```
 proto/calamine/v1/     protobuf contract (source of truth)
@@ -276,6 +385,7 @@ src/
   service.rs           the CalamineService implementation
   gen/                 generated by `buf generate`, never edited by hand
 tests/streaming.rs     end-to-end tests against real workbook fixtures
+tests/pictures.rs      peak-memory test for one image anchored many times
 bench/                 the measurement harness behind the numbers above
 demos/                 Java, Python, and Node clients, plus a web viewer
 ```

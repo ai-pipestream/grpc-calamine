@@ -16,6 +16,7 @@
 //!   mirrors calamine's public types exactly; conversions in [`convert`] are
 //!   total and lossless.
 
+pub mod archive;
 pub mod convert;
 pub mod proto;
 pub mod service;

@@ -646,7 +646,9 @@ pub mod open_workbook_request {
         #[prost(message, tag="1")]
         Options(super::WorkbookOptions),
         /// A chunk of the workbook file bytes. Chunks are concatenated in stream
-        /// order to form the complete file.
+        /// order to form the complete file. A chunk is never empty: an empty one
+        /// is refused with INVALID_ARGUMENT, and the whole upload must finish
+        /// within the server's upload deadline.
         #[prost(bytes, tag="2")]
         Chunk(::prost::alloc::vec::Vec<u8>),
     }
@@ -683,7 +685,9 @@ pub struct CloseWorkbookResponse {
 /// GetMetadataRequest selects the workbook whose metadata is requested.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetMetadataRequest {
-    /// Handle returned by `OpenWorkbook`.
+    /// Handle returned by `OpenWorkbook`. Leave empty for the service-level
+    /// probe: the response then carries only the UiInfo block, so hosts can
+    /// discover the web UI without opening a workbook.
     #[prost(string, tag="1")]
     pub workbook_id: ::prost::alloc::string::String,
 }

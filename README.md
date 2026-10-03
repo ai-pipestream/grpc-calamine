@@ -140,9 +140,16 @@ parts first, into nothing, counting, and refuses the workbook with
 `RESOURCE_EXHAUSTED` past `GRPC_CALAMINE_MAX_PICTURE_BYTES` for one picture,
 `GRPC_CALAMINE_MAX_PICTURE_TOTAL_BYTES` for all of them, or
 `GRPC_CALAMINE_MAX_SHARED_STRINGS_BYTES` for the table. That costs one extra
-inflation of those parts per open. The pictures that pass are charged
-against `GRPC_CALAMINE_MAX_STORE_BYTES` along with the upload, since the
-workbook's parked reader keeps them.
+inflation of those parts per open. Pictures are counted once per drawing
+anchor that embeds them, as calamine clones them per anchor, so a small image
+referenced by many anchors cannot multiply past the total; the pictures that
+pass are charged against `GRPC_CALAMINE_MAX_STORE_BYTES` along with the
+upload, since the workbook's parked reader keeps them.
+
+The same scan refuses, with `INVALID_ARGUMENT`, a shared-string table whose
+declared `uniqueCount` is larger than its inflated bytes could hold: calamine
+reserves space for that many strings before reading one, so a 2 KB table that
+claims a trillion would otherwise reserve terabytes and abort the process.
 
 Hard limits (compile-time, `src/service.rs`): 512 MiB max workbook upload,
 32 MiB max gRPC frame, 64-event stream backpressure channel, 8 MiB per row

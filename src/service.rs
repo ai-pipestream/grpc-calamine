@@ -1774,6 +1774,9 @@ impl CalamineService for CalamineGrpc {
             StoreError::Unreadable(e) => {
                 Status::invalid_argument(format!("cannot open workbook: {e}"))
             }
+            StoreError::Malformed { part, detail } => {
+                Status::invalid_argument(format!("cannot open workbook: {part}: {detail}"))
+            }
         })?;
 
         Ok(Response::new(pb::OpenWorkbookResponse {

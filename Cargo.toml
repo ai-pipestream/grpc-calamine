@@ -16,6 +16,9 @@ exclude = ["bench", "demos"]
 [dependencies]
 calamine = { version = "0.36.0", features = ["picture"] }
 prost = "0.14.4"
+# Already in the tree through calamine; used by src/archive.rs to read the
+# `<sst>` count and the drawing anchors in the pre-open scan.
+quick-xml = "0.41"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 tonic = { version = "0.14.6", features = ["gzip", "zstd"] }

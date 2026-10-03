@@ -403,6 +403,14 @@ pub enum StoreError {
     Unreadable(OpenError),
     /// Opening the workbook would pass a configured limit.
     Limit(LimitExceeded),
+    /// The package is internally inconsistent in a way the pre-open scan
+    /// refuses (see [`archive::Rejected::Malformed`]).
+    Malformed {
+        /// The entry at fault.
+        part: String,
+        /// What is wrong with it.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for StoreError {
@@ -410,6 +418,7 @@ impl std::fmt::Display for StoreError {
         match self {
             Self::Unreadable(e) => e.fmt(f),
             Self::Limit(e) => e.fmt(f),
+            Self::Malformed { part, detail } => write!(f, "{part}: {detail}"),
         }
     }
 }
@@ -425,6 +434,15 @@ impl From<OpenError> for StoreError {
 impl From<LimitExceeded> for StoreError {
     fn from(e: LimitExceeded) -> Self {
         Self::Limit(e)
+    }
+}
+
+impl From<archive::Rejected> for StoreError {
+    fn from(e: archive::Rejected) -> Self {
+        match e {
+            archive::Rejected::Limit(limit) => Self::Limit(limit),
+            archive::Rejected::Malformed { part, detail } => Self::Malformed { part, detail },
+        }
     }
 }
 

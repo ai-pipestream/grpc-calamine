@@ -288,6 +288,7 @@ version = "0.1.0"
 dependencies = [
  "calamine",
  "prost",
+ "quick-xml",
  "tokio",
  "tokio-stream",
  "tonic",

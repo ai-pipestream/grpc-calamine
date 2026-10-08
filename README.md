@@ -274,6 +274,8 @@ arrive batched (`WorksheetRowBatch`, up to 256 rows, 5 ms linger); set
 events define each distinct string once, cells carry `shared_string_id`,
 and every id is defined before the first row that references it. The
 dictionary is XLSX/XLSB only; other formats accept the flag unchanged.
+The header also lists the sheet's merged cell areas (`merged_regions`) for
+XLS and XLSX; a merged area's value sits at its top-left cell.
 
 Close handles when you are done with them. One left open is closed for you
 once it has been idle for the TTL (five minutes by default), but until then

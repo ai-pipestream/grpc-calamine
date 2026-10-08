@@ -743,7 +743,11 @@ fn abort_with<T: StreamResponse>(
 
 /// Build the `RangeStarted` header for a parsed range. An empty range gets
 /// no dimensions and zero cells.
-fn range_header<T: CellType>(sheet_name: &str, range: &Range<T>) -> pb::RangeStarted {
+fn range_header<T: CellType>(
+    sheet_name: &str,
+    range: &Range<T>,
+    merged_regions: Vec<pb::Dimensions>,
+) -> pb::RangeStarted {
     match (range.start(), range.end()) {
         (Some(start), Some(end)) => {
             let (height, width) = range.get_size();
@@ -754,13 +758,30 @@ fn range_header<T: CellType>(sheet_name: &str, range: &Range<T>) -> pb::RangeSta
                     end: Some(convert::cell_position(end)),
                 }),
                 total_cells: (height * width) as u64,
+                merged_regions,
             }
         }
         _ => pb::RangeStarted {
             sheet_name: sheet_name.to_string(),
             dimensions: None,
             total_cells: 0,
+            merged_regions,
         },
+    }
+}
+
+/// Build the `RangeStarted` header for an incremental read from the sheet's
+/// declared extent, which is a hint (see `emit_incremental`).
+fn declared_header(
+    sheet_name: &str,
+    dims: calamine::Dimensions,
+    merged_regions: Vec<pb::Dimensions>,
+) -> pb::RangeStarted {
+    pb::RangeStarted {
+        sheet_name: sheet_name.to_string(),
+        dimensions: Some(convert::dimensions(dims)),
+        total_cells: declared_total_cells(dims),
+        merged_regions,
     }
 }
 
@@ -1159,6 +1180,7 @@ fn formula_row(row_index: u32, formulas: Vec<String>) -> pb::StreamWorksheetForm
 fn emit_range(
     sheet_name: &str,
     range: &Range<Data>,
+    merged_regions: Vec<pb::Dimensions>,
     is_1904: bool,
     max_dense_cells: u64,
     batcher: &mut RowBatcher,
@@ -1168,7 +1190,10 @@ fn emit_range(
         let _ = tx.blocking_send(Err(status));
         return;
     }
-    if !send_event(tx, range_started(range_header(sheet_name, range))) {
+    if !send_event(
+        tx,
+        range_started(range_header(sheet_name, range, merged_regions)),
+    ) {
         return;
     }
     // Empty range: the header is the whole stream.
@@ -1226,7 +1251,7 @@ fn emit_range(
 /// (xlsx/mod.rs:2652, xlsb/mod.rs:562) and never in `worksheet_cells_reader`
 /// (xlsx/mod.rs:2517, xlsb/mod.rs:418), which is the reader streamed here.
 fn emit_incremental<E: Display>(
-    sheet_name: &str,
+    header: pb::RangeStarted,
     dims: calamine::Dimensions,
     header_row: Option<u32>,
     mut next_cell: impl FnMut() -> Result<Option<(u32, u32, pb::cell_data::Value)>, E>,
@@ -1234,11 +1259,8 @@ fn emit_incremental<E: Display>(
     batcher: &mut RowBatcher,
     tx: &mpsc::Sender<Result<pb::StreamWorksheetRangeResponse, Status>>,
 ) {
-    let header = pb::RangeStarted {
-        sheet_name: sheet_name.to_string(),
-        dimensions: Some(convert::dimensions(dims)),
-        total_cells: declared_total_cells(dims),
-    };
+    let sheet_name = header.sheet_name.clone();
+    let sheet_name = sheet_name.as_str();
     if !send_event(tx, range_started(header)) {
         return;
     }
@@ -1405,6 +1427,27 @@ fn cell_tuple(
     (row, col, value)
 }
 
+/// The merged cell areas a sheet declares, for its `RangeStarted` header.
+/// XLS and XLSX declare them; XLSB and ODS reads have none to report. A
+/// sheet whose merge list cannot be read streams without merges: the cells
+/// are the contract, and a merge read that fails will fail the cell read of
+/// the same part as well.
+fn merged_regions(
+    workbook: &mut crate::store::WorkbookReader,
+    sheet_name: &str,
+) -> Vec<pb::Dimensions> {
+    let areas = match workbook {
+        Sheets::Xlsx(xlsx) => xlsx
+            .merge_cells_by_sheet_name(sheet_name)
+            .unwrap_or_default(),
+        Sheets::Xls(xls) => xls
+            .merge_cells_by_sheet_name(sheet_name)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    areas.into_iter().map(convert::dimensions).collect()
+}
+
 /// The blocking body of `StreamWorksheetRange`.
 ///
 /// XLSX and XLSB use calamine's incremental cell readers, so rows are sent
@@ -1445,6 +1488,7 @@ fn run_stream_worksheet_range(
         Some(HeaderRow::Row(n)) => Some(n),
         _ => None,
     };
+    let merged = merged_regions(&mut workbook, &sheet_name);
     match &mut *workbook {
         Sheets::Xlsx(xlsx) => {
             // The cells reader refuses non-worksheets (e.g. chartsheets)
@@ -1457,7 +1501,7 @@ fn run_stream_worksheet_range(
                 Ok(mut reader) => {
                     let dims = reader.dimensions();
                     emit_incremental(
-                        &sheet_name,
+                        declared_header(&sheet_name, dims, merged.clone()),
                         dims,
                         header_row,
                         || {
@@ -1478,6 +1522,7 @@ fn run_stream_worksheet_range(
                     Ok(range) => emit_range(
                         &sheet_name,
                         &range,
+                        merged,
                         is_1904,
                         max_dense_cells,
                         &mut batcher,
@@ -1493,7 +1538,7 @@ fn run_stream_worksheet_range(
                 Ok(mut reader) => {
                     let dims = reader.dimensions();
                     emit_incremental(
-                        &sheet_name,
+                        declared_header(&sheet_name, dims, merged.clone()),
                         dims,
                         header_row,
                         || {
@@ -1514,6 +1559,7 @@ fn run_stream_worksheet_range(
                     Ok(range) => emit_range(
                         &sheet_name,
                         &range,
+                        merged,
                         is_1904,
                         max_dense_cells,
                         &mut batcher,
@@ -1531,6 +1577,7 @@ fn run_stream_worksheet_range(
             emit_range(
                 &sheet_name,
                 &range,
+                merged,
                 is_1904,
                 max_dense_cells,
                 &mut batcher,
@@ -1674,6 +1721,7 @@ fn emit_sparse_formulas(
                 sheet_name: sheet_name.to_string(),
                 dimensions: None,
                 total_cells: 0,
+                merged_regions: Vec::new(),
             }),
         );
         return;
@@ -1694,6 +1742,7 @@ fn emit_sparse_formulas(
             end: Some(convert::cell_position((last_row, last_col))),
         }),
         total_cells: rows * (u64::from(last_col - first_col) + 1),
+        merged_regions: Vec::new(),
     };
     if !send_event(tx, formula_started(header)) {
         return;
@@ -1765,7 +1814,10 @@ fn run_stream_worksheet_formula(
         let _ = tx.blocking_send(Err(status));
         return;
     }
-    if !send_event(tx, formula_started(range_header(&sheet_name, &range))) {
+    if !send_event(
+        tx,
+        formula_started(range_header(&sheet_name, &range, Vec::new())),
+    ) {
         return;
     }
     // Empty range: the header is the whole stream.

@@ -2802,3 +2802,31 @@ async fn a_refused_format_is_never_opened() {
     let xlsb = upload(&client, "date.xlsb").await;
     assert_eq!(xlsb.detected_format, pb::WorkbookFormat::Xlsb as i32);
 }
+
+/// The merged areas of a sheet, as (start row, start column, end row, end
+/// column) tuples.
+fn merged_areas(header: &pb::RangeStarted) -> Vec<(u32, u32, u32, u32)> {
+    header
+        .merged_regions
+        .iter()
+        .map(|d| {
+            let (start, end) = (d.start.unwrap_or_default(), d.end.unwrap_or_default());
+            (start.row, start.col, end.row, end.col)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn range_header_carries_merged_regions() {
+    let client = start_server().await;
+    let want = vec![(0, 0, 0, 1), (1, 0, 3, 0), (1, 1, 3, 3)];
+    for file in ["merge_cells.xlsx", "merge_cells.xls"] {
+        let opened = upload(&client, file).await;
+        let (header, _) = stream_range(&client, &opened.workbook_id, 0).await;
+        assert_eq!(merged_areas(&header), want, "{file}");
+    }
+    // A sheet without merges reports none.
+    let opened = upload(&client, "date.xlsx").await;
+    let (header, _) = stream_range(&client, &opened.workbook_id, 0).await;
+    assert!(header.merged_regions.is_empty());
+}

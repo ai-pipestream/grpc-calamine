@@ -780,7 +780,7 @@ pub struct StreamWorksheetRangeRequest {
 /// RangeStarted is the header event of a streamed range. It is always the
 /// first event of `StreamWorksheetRange` and `StreamWorksheetFormula` and
 /// lets the caller allocate/validate before any row arrives.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RangeStarted {
     /// Resolved name of the worksheet being streamed.
     #[prost(string, tag="1")]
@@ -807,6 +807,13 @@ pub struct RangeStarted {
     /// arithmetic on it would otherwise underflow.
     #[prost(uint64, tag="3")]
     pub total_cells: u64,
+    /// The sheet's merged cell areas, in absolute coordinates, as the workbook
+    /// declares them (`merge_cells_by_sheet_name`). The value of a merged area
+    /// sits at its top-left cell; the other cells of the area stream as empty.
+    /// XLS and XLSX declare merges; XLSB and ODS reads report none, and a
+    /// formula stream never carries them.
+    #[prost(message, repeated, tag="4")]
+    pub merged_regions: ::prost::alloc::vec::Vec<Dimensions>,
 }
 /// WorksheetRow is one streamed row of cell values.
 ///
@@ -971,7 +978,7 @@ pub struct FormulaRow {
     pub formulas: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// StreamWorksheetFormulaResponse is one event of the formula stream.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StreamWorksheetFormulaResponse {
     /// Exactly one event kind is set per message.
     #[prost(oneof="stream_worksheet_formula_response::Event", tags="1, 2, 3")]
@@ -980,7 +987,7 @@ pub struct StreamWorksheetFormulaResponse {
 /// Nested message and enum types in `StreamWorksheetFormulaResponse`.
 pub mod stream_worksheet_formula_response {
     /// Exactly one event kind is set per message.
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Event {
         /// Stream header. Always the first event, sent exactly once.
         #[prost(message, tag="1")]

@@ -245,6 +245,13 @@ message RangeStarted {
   // precedes its start. Nothing forbids that ordering in a `ref`, and the
   // arithmetic on it would otherwise underflow.
   uint64 total_cells = 3;
+
+  // The sheet's merged cell areas, in absolute coordinates, as the workbook
+  // declares them (`merge_cells_by_sheet_name`). The value of a merged area
+  // sits at its top-left cell; the other cells of the area stream as empty.
+  // XLS and XLSX declare merges; XLSB and ODS reads report none, and a
+  // formula stream never carries them.
+  repeated Dimensions merged_regions = 4;
 }
 
 // WorksheetRow is one streamed row of cell values.

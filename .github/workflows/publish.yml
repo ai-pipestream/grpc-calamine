@@ -1,8 +1,9 @@
 name: Publish Images
 
 # Builds the service and viewer images and pushes them to
-# docker.io/pipestreamai. Every push to main or development republishes
-# :latest; a manual dispatch with a version input also tags that version.
+# docker.io/pipestreamai. Every push to main republishes :latest (development
+# does not publish; merge development into main to ship). A manual dispatch
+# with a version input also tags that version.
 # Docker Hub credentials come from the DOCKER_USER / DOCKER_TOKEN org
 # secrets.
 #
@@ -12,7 +13,7 @@ name: Publish Images
 # platforms too; the Rust build runs under QEMU for the arm64 leg.
 on:
   push:
-    branches: [main, development]
+    branches: [main]
   workflow_dispatch:
     inputs:
       version:

@@ -14,7 +14,7 @@ publish = false # Server binary plus demos; not a library for crates.io.
 exclude = ["bench", "demos"]
 
 [dependencies]
-calamine = { version = "0.36.0", features = ["picture"] }
+calamine = { version = "0.37.0", features = ["picture"] }
 prost = "0.14.4"
 # Already in the tree through calamine; used by src/archive.rs to read the
 # `<sst>` count and the drawing anchors in the pre-open scan.
@@ -34,11 +34,11 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
 
 # Three defects found by this server are fixed upstream in tafia/calamine#695,
-# #696 and #697 but not yet released, and a fourth is fixed only in the fork
-# so far. The pinned commit is the fork's 23ae1f1 (ai-pipestream/calamine#2):
-# `pipestream-main` at 4fddaec, which is calamine 0.36.1 plus upstream master
-# as of that merge (which brings #699, #701 and #707) plus those three fixes,
-# plus the fork's own commit:
+# #696 and #697 but not in a release (0.37.0 does not carry them), and a
+# fourth is fixed only in the fork so far. The pinned commit is the fork's
+# `pipestream-main` at 3aa4bf5: upstream calamine 0.37.0 merged over 23ae1f1
+# (ai-pipestream/calamine#2), so it carries those three fixes plus the fork's
+# own commit:
 #
 #   #695  a reversed `<dimension ref>` underflowed the extent arithmetic, so
 #         `Dimensions::len()` reported 18_446_744_056_529_682_435 cells
@@ -55,7 +55,7 @@ tokio-stream = { version = "0.1.19", features = ["net"] }
 # fork commit is taken on purpose, by changing the rev here and in bench/.
 # Drop this section once all four land in a release.
 [patch.crates-io]
-calamine = { git = "https://github.com/ai-pipestream/calamine.git", rev = "23ae1f1dc54b16152aa260fe2d6bcf62ae5077c3" }
+calamine = { git = "https://github.com/ai-pipestream/calamine.git", rev = "3aa4bf559265191016a94fb637425ed9cba3a04d" }
 
 [lints.rust]
 missing_docs = "warn"

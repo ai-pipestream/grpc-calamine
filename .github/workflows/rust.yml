@@ -4,16 +4,30 @@ on: [ push, pull_request ]
 
 jobs:
   rust:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
+    # Docker Hardened Images Rust toolchain, the family the Dockerfile builds
+    # from. dhi.io signs in with the Docker Hub org credentials.
+    container:
+      image: dhi.io/rust:1-dev
+      credentials:
+        username: ${{ secrets.DOCKER_USER }}
+        password: ${{ secrets.DOCKER_TOKEN }}
     strategy:
       matrix:
         toolchain:
-          - "1.88"  # MSRV, matches calamine.
-          - stable
-          - beta
+          - "1.88"  # MSRV, matches calamine. Installed with rustup.
+          - stable  # The hardened image's own toolchain, rustfmt and clippy.
+          - beta    # Installed with rustup.
     steps:
+    # The hardened image ships the Rust toolchain and a C linker only. The
+    # actions need git and node, and rustup-managed toolchains need curl.
+    - name: Install job tooling
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends ca-certificates curl git nodejs
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
     - name: Install Rust toolchain
+      if: ${{ matrix.toolchain != 'stable' }}
       uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
       with:
           toolchain: ${{ matrix.toolchain }}
@@ -27,12 +41,6 @@ jobs:
     - name: Run tests
       run: |
         cargo test
-    - name: Install rustfmt, clippy
-      uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
-      if: ${{ matrix.toolchain == 'stable' }}
-      with:
-          toolchain: ${{ matrix.toolchain }}
-          components: rustfmt, clippy
     - name: Format checks
       if: ${{ matrix.toolchain == 'stable' }}
       run: |
@@ -43,14 +51,35 @@ jobs:
         cargo clippy --all-targets --all-features -- -Dwarnings
 
   proto:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
+    # Docker Hardened Images Rust toolchain, the family the Dockerfile builds
+    # from. dhi.io signs in with the Docker Hub org credentials.
+    container:
+      image: dhi.io/rust:1-dev
+      credentials:
+        username: ${{ secrets.DOCKER_USER }}
+        password: ${{ secrets.DOCKER_TOKEN }}
     steps:
+    # The hardened image ships the Rust toolchain and a C linker only. The
+    # actions need git and node, and rustup-managed toolchains need curl.
+    - name: Install job tooling
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends ca-certificates curl git nodejs
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-    - uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1
-      with:
-        setup_only: true
-        # Pinned so the descriptor comparison below is against one encoder.
-        version: 1.71.0
+    # Pinned so the descriptor comparison below is against one encoder. A
+    # checksummed release download behaves the same on GitHub and Forgejo.
+    - name: Install buf
+      env:
+        BUF_VERSION: 1.71.0
+      run: |
+        base="https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}"
+        bin="buf-Linux-$(uname -m)"
+        cd "$RUNNER_TEMP"
+        curl -sSfLO "$base/$bin"
+        curl -sSfL "$base/sha256.txt" | grep " $bin\$" | sha256sum -c -
+        install -m 0755 "$bin" /usr/local/bin/buf
+        buf --version
     - name: Lint the protobuf contract
       run: |
         buf lint
@@ -58,7 +87,9 @@ jobs:
     # src/gen is checked in, so nothing else notices when it falls behind the
     # contract: reflection once served comments the protos no longer had.
     - name: Install the codegen plugins
-      run: cargo install --locked protoc-gen-prost@0.5.0 protoc-gen-tonic@0.5.0
+      run: |
+        cargo install --locked protoc-gen-prost@0.5.0 protoc-gen-tonic@0.5.0
+        echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
     - name: Generated code and descriptor match the contract
       run: |
         buf generate

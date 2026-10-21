@@ -15,7 +15,7 @@ jobs:
     strategy:
       matrix:
         toolchain:
-          - "1.88"  # MSRV, matches calamine. Installed with rustup.
+          - "1.89"  # MSRV, set by uuid 1.28 (calamine needs 1.88). Installed with rustup.
           - stable  # The hardened image's own toolchain, rustfmt and clippy.
           - beta    # Installed with rustup.
     steps:

@@ -7,7 +7,7 @@ readme = "README.md"
 keywords = ["excel", "ods", "grpc", "streaming", "calamine"]
 categories = ["parsing", "network-programming"]
 edition = "2024"
-rust-version = "1.88" # Matches calamine's MSRV.
+rust-version = "1.89" # uuid 1.28 needs 1.89; calamine needs 1.88.
 publish = false # Server binary plus demos; not a library for crates.io.
 # `bench/` is its own crate with a path dependency back on this one, so it is
 # built and run explicitly and never lands in this package or in CI.

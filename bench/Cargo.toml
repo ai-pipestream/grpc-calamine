@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Honest cost comparison between in-process calamine and grpc-calamine over the wire"
 license = "Apache-2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 publish = false
 # `cargo run` means the harness; the experiment binaries are run by name.
 default-run = "grpc-calamine-bench"

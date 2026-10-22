@@ -23,6 +23,9 @@ on:
 
 jobs:
   publish:
+    # Images publish from GitHub, the fleet's publishing forge; the Forgejo
+    # mirror of this workflow does not push a second copy.
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

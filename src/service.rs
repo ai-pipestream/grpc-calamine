@@ -1335,6 +1335,24 @@ fn emit_incremental<E: Display>(
         if matches!(value, pb::cell_data::Value::Empty(())) {
             continue;
         }
+        // A column outside Excel's grid. Rows are anchored at column 0, so a
+        // cell at column C grows its row to C+1 cells; an unbounded C is an
+        // unbounded, infallible row allocation from a few bytes of input.
+        // calamine's xlsx reader rejects such a column, but its xlsb reader
+        // reads the column as a raw u32 with no check, so the bound is
+        // enforced here for every incremental format. The limit is Excel's own
+        // 16,384 columns (0-based 0..MAX_DECLARED_COLUMNS).
+        if col as usize >= MAX_DECLARED_COLUMNS {
+            return abort_with(
+                tx,
+                kind,
+                format!(
+                    "sheet {sheet_name:?}: a cell is at column {col}, past the \
+                     {MAX_DECLARED_COLUMNS}-column grid; refusing it rather than growing \
+                     a row to hold a column this workbook cannot legally contain"
+                ),
+            );
+        }
         let idx = col as usize;
 
         // A row index that moves backwards. ECMA-376 does not require `<row>`

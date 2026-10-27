@@ -2830,3 +2830,130 @@ async fn range_header_carries_merged_regions() {
     let (header, _) = stream_range(&client, &opened.workbook_id, 0).await;
     assert!(header.merged_regions.is_empty());
 }
+
+// A hostile xlsb cell whose column lies far outside Excel's 16,384-column grid.
+// calamine's xlsb cell reader stores a cell's column as a raw u32 with no grid
+// check (its xlsx reader rejects such columns), and the incremental value
+// stream grows one row to hold the widest column it sees. A cell at column
+// 5,000,000 therefore grows a single row to five million cells from a few
+// hundred patched bytes; an attacker scales the column toward u32::MAX and the
+// one row becomes a multi-gigabyte infallible allocation inside the stream.
+// ---------------------------------------------------------------------------
+
+/// Rewrite the column of the first cell record in an xlsb worksheet stream to
+/// `col`, so a legal tiny workbook gains one cell outside the column grid.
+///
+/// Records are `[type: 1-2 bytes, 7 bits each][len: 1-4 bytes, 7 bits each]
+/// [payload]`, and a cell record carries its column in the first four payload
+/// bytes (MS-XLSB 2.5.9 Cell), matching what calamine reads back.
+fn patch_first_xlsb_cell_column(sheet: &[u8], col: u32) -> Vec<u8> {
+    const CELL_RECORDS: [u16; 8] = [0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x09, 0x0A];
+    let mut out = sheet.to_vec();
+    let mut pos = 0usize;
+    while pos < out.len() {
+        let b0 = out[pos];
+        pos += 1;
+        let mut typ = u16::from(b0 & 0x7F);
+        if b0 & 0x80 != 0 {
+            typ |= u16::from(out[pos] & 0x7F) << 7;
+            pos += 1;
+        }
+        let mut len = 0u32;
+        let mut shift = 0;
+        loop {
+            let b = out[pos];
+            pos += 1;
+            len |= u32::from(b & 0x7F) << shift;
+            shift += 7;
+            if b & 0x80 == 0 || shift >= 28 {
+                break;
+            }
+        }
+        if CELL_RECORDS.contains(&typ) {
+            out[pos..pos + 4].copy_from_slice(&col.to_le_bytes());
+            return out;
+        }
+        pos += len as usize;
+    }
+    panic!("no cell record found in the xlsb worksheet stream");
+}
+
+/// Rebuild an xlsb package, replacing the bytes of one entry.
+fn rebuild_xlsb_with_sheet(original: &[u8], entry_name: &str, new_sheet: Vec<u8>) -> Vec<u8> {
+    use std::io::{Cursor, Read, Write};
+    let mut zin = zip::ZipArchive::new(Cursor::new(original.to_vec())).expect("open xlsb");
+    let mut zout = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let deflated = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let mut replaced = false;
+    for i in 0..zin.len() {
+        let mut entry = zin.by_index(i).expect("entry");
+        let name = entry.name().to_string();
+        let mut body = Vec::new();
+        entry.read_to_end(&mut body).expect("read entry");
+        let body = if name == entry_name {
+            replaced = true;
+            new_sheet.clone()
+        } else {
+            body
+        };
+        zout.start_file(&name, deflated).expect("start part");
+        zout.write_all(&body).expect("write part");
+    }
+    assert!(replaced, "entry {entry_name:?} not found in the package");
+    zout.finish().expect("finish package").into_inner()
+}
+
+/// A cell whose column lies outside the grid is refused before it can grow a
+/// row to hold it, so the stream ends with a terminal error and no such row is
+/// ever materialised. Without the bound the one row grows to five million
+/// cells here, and to gigabytes once the column is pushed toward u32::MAX.
+#[tokio::test]
+async fn an_xlsb_cell_past_the_column_grid_is_refused() {
+    use std::io::{Cursor, Read};
+    let original = std::fs::read(fixtures().join("date.xlsb")).expect("read fixture");
+    let sheet = {
+        let mut zip = zip::ZipArchive::new(Cursor::new(original.clone())).expect("open xlsb");
+        let mut entry = zip
+            .by_name("xl/worksheets/sheet1.bin")
+            .expect("sheet1.bin present");
+        let mut body = Vec::new();
+        entry.read_to_end(&mut body).expect("read sheet1.bin");
+        body
+    };
+    let patched = patch_first_xlsb_cell_column(&sheet, 5_000_000);
+    let bomb = rebuild_xlsb_with_sheet(&original, "xl/worksheets/sheet1.bin", patched);
+    assert!(
+        bomb.len() < 64 * 1024,
+        "the hostile upload is tiny: {} bytes",
+        bomb.len()
+    );
+
+    let client = start_server().await;
+    let opened = try_upload_bytes(
+        &client,
+        bomb,
+        pb::WorkbookOptions {
+            format_hint: pb::WorkbookFormat::Xlsb as i32,
+            header_row: None,
+        },
+    )
+    .await
+    .expect("the workbook itself opens");
+
+    let (_, rows, error) = stream_range_outcome(&client, &opened.workbook_id, 0).await;
+    assert!(
+        rows.is_empty(),
+        "no row for a cell outside the grid may be built, got {} row(s)",
+        rows.len()
+    );
+    let error = error.expect("a terminal in-band error, not a five-million-cell row");
+    assert!(error.terminal, "the stream must end on it");
+    let detail = error.error.expect("error detail");
+    assert_eq!(detail.kind, pb::CalamineErrorKind::Xlsb as i32);
+    assert!(
+        detail.message.contains("column"),
+        "the error names the offending column: {}",
+        detail.message
+    );
+}

@@ -100,6 +100,11 @@ message ExcelDateTime {
 // Exactly one variant is always set. An empty cell is represented explicitly
 // by the `empty` variant, never by an unset oneof.
 message CellData {
+  // Expanded XLSX formula when requested, alongside its cached value.
+  optional string formula = 12;
+  // Index into the stream header number formats, when supplied by the reader.
+  optional uint32 style_id = 13;
+
   // The cell value. The variants correspond one-to-one to the variants of
   // `calamine::Data` / `calamine::DataRef`.
   oneof value {
@@ -300,6 +305,9 @@ message DefinedName {
 // Workbook-level metadata available immediately after opening a workbook,
 // before any worksheet is read.
 message Metadata {
+  // Document properties for XLSX/XLSB; absent for unsupported formats.
+  WorkbookProperties properties = 3;
+
   // Metadata of every sheet, in workbook order. Matches
   // `Reader::sheets_metadata`; sheet names alone (as returned by
   // `Reader::sheet_names`) are `sheets[i].name` in order.
@@ -456,4 +464,80 @@ message CalamineError {
   // Human-readable detail, i.e. the `Display` rendering of the underlying
   // calamine error.
   string message = 2;
+}
+
+// Document properties as stored by the workbook, without date normalization.
+message WorkbookProperties {
+  // Optional workbook creator.
+  optional string creator = 1;
+  // Optional workbook last modified by.
+  optional string last_modified_by = 2;
+  // Optional workbook created.
+  optional string created = 3;
+  // Optional workbook modified.
+  optional string modified = 4;
+  // Optional workbook title.
+  optional string title = 5;
+  // Optional workbook subject.
+  optional string subject = 6;
+  // Optional workbook description.
+  optional string description = 7;
+  // Optional workbook keywords.
+  optional string keywords = 8;
+  // Optional workbook category.
+  optional string category = 9;
+  // Optional workbook content status.
+  optional string content_status = 10;
+  // Optional workbook revision.
+  optional string revision = 11;
+  // Optional workbook version.
+  optional string version = 12;
+  // Optional workbook application.
+  optional string application = 13;
+  // Optional workbook app version.
+  optional string app_version = 14;
+  // Optional workbook company.
+  optional string company = 15;
+  // Optional workbook template.
+  optional string template = 16;
+  // Optional workbook manager.
+  optional string manager = 17;
+}
+
+// A table explicitly declared by an XLSX workbook, including headers and totals.
+message DeclaredTable {
+  // Workbook-unique display name.
+  string name = 1;
+  // Full inclusive source rectangle.
+  Dimensions range = 2;
+  // Number of header rows within the rectangle.
+  uint32 header_row_count = 3;
+  // Column names in source order.
+  repeated string columns = 4;
+  // Number of totals rows within the rectangle.
+  uint32 totals_row_count = 5;
+}
+
+// Date/duration classification used by the reader to decode values.
+enum NumberFormatKind {
+  // Unspecified classification.
+  NUMBER_FORMAT_KIND_UNSPECIFIED = 0;
+  // General numeric or text formatting.
+  NUMBER_FORMAT_KIND_OTHER = 1;
+  // Date or clock time formatting.
+  NUMBER_FORMAT_KIND_DATE_TIME = 2;
+  // Elapsed duration formatting.
+  NUMBER_FORMAT_KIND_TIME_DELTA = 3;
+}
+
+// A workbook cell style's number-format definition.
+message NumberFormat {
+  // Index referenced by CellData.style_id.
+  uint32 style_id = 1;
+  // Original custom or standard code; absent for reserved/localized built-ins.
+  optional string code = 2;
+  // Date/duration classification used for value decoding.
+  NumberFormatKind kind = 3;
+  // Source built-in or custom format identifier, retained even without a code.
+  uint32 format_id = 4;
 }

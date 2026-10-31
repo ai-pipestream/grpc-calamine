@@ -53,9 +53,11 @@ tokio-stream = { version = "0.1.19", features = ["net"] }
 #
 # Pinned by `rev`, not by branch, so `cargo update` cannot move it: a newer
 # fork commit is taken on purpose, by changing the rev here and in bench/.
-# Drop this section once all four land in a release.
+# This topic additionally exposes metadata-only declared tables, style IDs,
+# and complete source number-format identifiers/codes to avoid data loss.
+# Drop this section once the required APIs and all four fixes are released.
 [patch.crates-io]
-calamine = { git = "https://github.com/ai-pipestream/calamine.git", rev = "3aa4bf559265191016a94fb637425ed9cba3a04d" }
+calamine = { git = "https://github.com/ai-pipestream/calamine.git", rev = "d4bac6b9e458b4d915e7dc929c6591c12b71c20d" }
 
 [lints.rust]
 missing_docs = "warn"

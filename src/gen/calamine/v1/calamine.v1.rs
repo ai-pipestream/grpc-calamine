@@ -33,6 +33,12 @@ pub struct ExcelDateTime {
 /// by the `empty` variant, never by an unset oneof.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CellData {
+    /// Expanded XLSX formula when requested, alongside its cached value.
+    #[prost(string, optional, tag="12")]
+    pub formula: ::core::option::Option<::prost::alloc::string::String>,
+    /// Index into the stream header number formats, when supplied by the reader.
+    #[prost(uint32, optional, tag="13")]
+    pub style_id: ::core::option::Option<u32>,
     /// The cell value. The variants correspond one-to-one to the variants of
     /// `calamine::Data` / `calamine::DataRef`.
     #[prost(oneof="cell_data::Value", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
@@ -205,6 +211,9 @@ pub struct DefinedName {
 /// before any worksheet is read.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Metadata {
+    /// Document properties for XLSX/XLSB; absent for unsupported formats.
+    #[prost(message, optional, tag="3")]
+    pub properties: ::core::option::Option<WorkbookProperties>,
     /// Metadata of every sheet, in workbook order. Matches
     /// `Reader::sheets_metadata`; sheet names alone (as returned by
     /// `Reader::sheet_names`) are `sheets\[i\].name` in order.
@@ -318,6 +327,96 @@ pub struct CalamineError {
     /// calamine error.
     #[prost(string, tag="2")]
     pub message: ::prost::alloc::string::String,
+}
+/// Document properties as stored by the workbook, without date normalization.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WorkbookProperties {
+    /// Optional workbook creator.
+    #[prost(string, optional, tag="1")]
+    pub creator: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional workbook last modified by.
+    #[prost(string, optional, tag="2")]
+    pub last_modified_by: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional workbook created.
+    #[prost(string, optional, tag="3")]
+    pub created: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional workbook modified.
+    #[prost(string, optional, tag="4")]
+    pub modified: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional workbook title.
+    #[prost(string, optional, tag="5")]
+    pub title: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional workbook subject.
+    #[prost(string, optional, tag="6")]
+    pub subject: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional workbook description.
+    #[prost(string, optional, tag="7")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional workbook keywords.
+    #[prost(string, optional, tag="8")]
+    pub keywords: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional workbook category.
+    #[prost(string, optional, tag="9")]
+    pub category: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional workbook content status.
+    #[prost(string, optional, tag="10")]
+    pub content_status: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional workbook revision.
+    #[prost(string, optional, tag="11")]
+    pub revision: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional workbook version.
+    #[prost(string, optional, tag="12")]
+    pub version: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional workbook application.
+    #[prost(string, optional, tag="13")]
+    pub application: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional workbook app version.
+    #[prost(string, optional, tag="14")]
+    pub app_version: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional workbook company.
+    #[prost(string, optional, tag="15")]
+    pub company: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional workbook template.
+    #[prost(string, optional, tag="16")]
+    pub template: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional workbook manager.
+    #[prost(string, optional, tag="17")]
+    pub manager: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// A table explicitly declared by an XLSX workbook, including headers and totals.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeclaredTable {
+    /// Workbook-unique display name.
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    /// Full inclusive source rectangle.
+    #[prost(message, optional, tag="2")]
+    pub range: ::core::option::Option<Dimensions>,
+    /// Number of header rows within the rectangle.
+    #[prost(uint32, tag="3")]
+    pub header_row_count: u32,
+    /// Column names in source order.
+    #[prost(string, repeated, tag="4")]
+    pub columns: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Number of totals rows within the rectangle.
+    #[prost(uint32, tag="5")]
+    pub totals_row_count: u32,
+}
+/// A workbook cell style's number-format definition.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NumberFormat {
+    /// Index referenced by CellData.style_id.
+    #[prost(uint32, tag="1")]
+    pub style_id: u32,
+    /// Original custom or standard code; absent for reserved/localized built-ins.
+    #[prost(string, optional, tag="2")]
+    pub code: ::core::option::Option<::prost::alloc::string::String>,
+    /// Date/duration classification used for value decoding.
+    #[prost(enumeration="NumberFormatKind", tag="3")]
+    pub kind: i32,
+    /// Source built-in or custom format identifier, retained even without a code.
+    #[prost(uint32, tag="4")]
+    pub format_id: u32,
 }
 /// CellErrorType mirrors `calamine::CellErrorType`.
 ///
@@ -614,6 +713,43 @@ impl CalamineErrorKind {
         }
     }
 }
+/// Date/duration classification used by the reader to decode values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum NumberFormatKind {
+    /// Unspecified classification.
+    Unspecified = 0,
+    /// General numeric or text formatting.
+    Other = 1,
+    /// Date or clock time formatting.
+    DateTime = 2,
+    /// Elapsed duration formatting.
+    TimeDelta = 3,
+}
+impl NumberFormatKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "NUMBER_FORMAT_KIND_UNSPECIFIED",
+            Self::Other => "NUMBER_FORMAT_KIND_OTHER",
+            Self::DateTime => "NUMBER_FORMAT_KIND_DATE_TIME",
+            Self::TimeDelta => "NUMBER_FORMAT_KIND_TIME_DELTA",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "NUMBER_FORMAT_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "NUMBER_FORMAT_KIND_OTHER" => Some(Self::Other),
+            "NUMBER_FORMAT_KIND_DATE_TIME" => Some(Self::DateTime),
+            "NUMBER_FORMAT_KIND_TIME_DELTA" => Some(Self::TimeDelta),
+            _ => None,
+        }
+    }
+}
 /// WorkbookOptions carries the open-time settings for `OpenWorkbook`.
 /// It must be the payload of the first `OpenWorkbookRequest` message.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -743,6 +879,10 @@ pub mod sheet_selector {
 /// StreamWorksheetRangeRequest selects the workbook and worksheet to stream.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StreamWorksheetRangeRequest {
+    /// Include expanded formulas alongside cached values in one XLSX pass.
+    /// Accepted without effect for other formats.
+    #[prost(bool, tag="5")]
+    pub include_formulas: bool,
     /// Handle returned by `OpenWorkbook`.
     #[prost(string, tag="1")]
     pub workbook_id: ::prost::alloc::string::String,
@@ -782,6 +922,12 @@ pub struct StreamWorksheetRangeRequest {
 /// lets the caller allocate/validate before any row arrives.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RangeStarted {
+    /// Tables explicitly declared over this sheet; XLSX only.
+    #[prost(message, repeated, tag="5")]
+    pub tables: ::prost::alloc::vec::Vec<DeclaredTable>,
+    /// Workbook style definitions referenced by streamed cells; XLSX/XLSB only.
+    #[prost(message, repeated, tag="6")]
+    pub number_formats: ::prost::alloc::vec::Vec<NumberFormat>,
     /// Resolved name of the worksheet being streamed.
     #[prost(string, tag="1")]
     pub sheet_name: ::prost::alloc::string::String,

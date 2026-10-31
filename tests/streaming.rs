@@ -145,6 +145,7 @@ async fn stream_range_batched(
             }),
             max_rows_per_message,
             use_string_table: false,
+            include_formulas: false,
         })
         .await
         .expect("stream worksheet range")
@@ -221,6 +222,23 @@ fn expected_rows(file: &str, sheet_index: usize) -> (String, Vec<pb::WorksheetRo
     let name = workbook.sheet_names()[sheet_index].clone();
     let range = workbook.worksheet_range(&name).expect("worksheet range");
     let start = range.start().expect("non-empty range");
+    let mut styles = std::collections::HashMap::new();
+    match &mut workbook {
+        Sheets::Xlsx(xlsx) => {
+            let mut reader = xlsx.worksheet_cells_reader(&name).unwrap();
+            while let Some(cell) = reader.next_cell().unwrap() {
+                styles.insert(cell.get_position(), reader.style_id());
+            }
+        }
+        Sheets::Xlsb(xlsb) => {
+            let mut reader = xlsb.worksheet_cells_reader(&name).unwrap();
+            while let Some(cell) = reader.next_cell().unwrap() {
+                styles.insert(cell.get_position(), reader.style_id());
+            }
+        }
+        _ => {}
+    }
+
     // Streamed rows are anchored at column 0, so a range starting right of
     // column A carries explicit leading empties.
     let pad = start.1 as usize;
@@ -229,10 +247,16 @@ fn expected_rows(file: &str, sheet_index: usize) -> (String, Vec<pb::WorksheetRo
         .enumerate()
         .map(|(offset, row)| {
             let mut values = vec![convert::empty_cell_data(); pad];
-            values.extend(
-                row.iter()
-                    .map(|d| convert::cell_data(convert::data_value(d, is_1904))),
-            );
+            values.extend(row.iter().enumerate().map(|(col, d)| {
+                let mut cell = convert::cell_data(convert::data_value(d, is_1904));
+                if !matches!(d, Data::Empty) {
+                    cell.style_id = styles
+                        .get(&(start.0 + offset as u32, start.1 + col as u32))
+                        .copied()
+                        .flatten();
+                }
+                cell
+            }));
             pb::WorksheetRow {
                 row_index: start.0 + offset as u32,
                 values,
@@ -312,6 +336,7 @@ async fn single_row_mode_uses_the_row_carrier() {
             }),
             max_rows_per_message: 1,
             use_string_table: false,
+            include_formulas: false,
         })
         .await
         .expect("stream worksheet range")
@@ -439,6 +464,7 @@ async fn unknown_workbook_id_is_not_found() {
             }),
             max_rows_per_message: 0,
             use_string_table: false,
+            include_formulas: false,
         })
         .await
         .expect_err("must fail");
@@ -459,6 +485,7 @@ async fn unknown_sheet_fails_in_band() {
             }),
             max_rows_per_message: 0,
             use_string_table: false,
+            include_formulas: false,
         })
         .await
         .expect("rpc itself succeeds")
@@ -729,6 +756,7 @@ async fn stream_range_outcome(
             }),
             max_rows_per_message: 0,
             use_string_table: false,
+            include_formulas: false,
         })
         .await
         .expect("stream worksheet range")
@@ -1024,6 +1052,7 @@ async fn a_reversed_declared_dimension_does_not_break_the_stream() {
             }),
             max_rows_per_message: 0,
             use_string_table: false,
+            include_formulas: false,
         })
         .await
         .expect("rpc itself succeeds")
@@ -1209,6 +1238,7 @@ async fn stream_range_events(
             }),
             max_rows_per_message: 0,
             use_string_table: false,
+            include_formulas: false,
         })
         .await
         .expect("stream worksheet range")
@@ -1523,6 +1553,7 @@ async fn stream_range_resolved(
             }),
             max_rows_per_message,
             use_string_table: true,
+            include_formulas: false,
         })
         .await
         .expect("stream worksheet range")
@@ -2284,6 +2315,7 @@ async fn range_stream_status(
             }),
             max_rows_per_message: 0,
             use_string_table: false,
+            include_formulas: false,
         })
         .await
         .expect("stream worksheet range")
@@ -2829,4 +2861,342 @@ async fn range_header_carries_merged_regions() {
     let opened = upload(&client, "date.xlsx").await;
     let (header, _) = stream_range(&client, &opened.workbook_id, 0).await;
     assert!(header.merged_regions.is_empty());
+}
+
+/// Preserve original document-property strings and optional presence on both APIs.
+#[tokio::test]
+async fn workbook_properties_survive_open_and_metadata() {
+    let mut client = start_server().await;
+    let core = br#"<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/">
+<dc:creator>Alice &amp; Bob</dc:creator><cp:lastModifiedBy>Editor</cp:lastModifiedBy><dcterms:created>2026-10-31T01:02:03+02:00</dcterms:created><dcterms:modified>2026-10-31T02:02:03Z</dcterms:modified><dc:title>Accounts</dc:title><dc:subject>Subject</dc:subject><dc:description>Comments</dc:description><cp:keywords>tax;cash</cp:keywords><cp:category>Finance</cp:category><cp:contentStatus>Draft</cp:contentStatus><cp:revision>7</cp:revision><cp:version>v3</cp:version></cp:coreProperties>"#;
+    let app = br#"<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Spreadsheet</Application><AppVersion>26.8</AppVersion><Company>Company</Company><Template>Book.xltx</Template><Manager>Manager</Manager></Properties>"#;
+    let bytes = xlsx_with_parts(&[
+        ("docProps/core.xml", core.to_vec()),
+        ("docProps/app.xml", app.to_vec()),
+    ]);
+    let opened = try_upload_bytes(&client, bytes, default_options())
+        .await
+        .unwrap();
+    let props = opened
+        .metadata
+        .as_ref()
+        .unwrap()
+        .properties
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        props,
+        &pb::WorkbookProperties {
+            creator: Some("Alice & Bob".into()),
+            last_modified_by: Some("Editor".into()),
+            created: Some("2026-10-31T01:02:03+02:00".into()),
+            modified: Some("2026-10-31T02:02:03Z".into()),
+            title: Some("Accounts".into()),
+            subject: Some("Subject".into()),
+            description: Some("Comments".into()),
+            keywords: Some("tax;cash".into()),
+            category: Some("Finance".into()),
+            content_status: Some("Draft".into()),
+            revision: Some("7".into()),
+            version: Some("v3".into()),
+            application: Some("Spreadsheet".into()),
+            app_version: Some("26.8".into()),
+            company: Some("Company".into()),
+            template: Some("Book.xltx".into()),
+            manager: Some("Manager".into()),
+        }
+    );
+    let snapshot = client
+        .get_metadata(pb::GetMetadataRequest {
+            workbook_id: opened.workbook_id,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(opened.metadata, snapshot.metadata);
+    for file in ["date.xlsx", "date.xlsb", "date.xls", "date.ods"] {
+        let opened = upload(&client, file).await;
+        assert_eq!(
+            opened.metadata.unwrap().properties.is_some(),
+            file.ends_with("xlsx") || file.ends_with("xlsb")
+        );
+    }
+    let minimal = try_upload_bytes(&client, xlsx_with_parts(&[]), default_options())
+        .await
+        .unwrap();
+    assert_eq!(
+        minimal.metadata.unwrap().properties,
+        Some(pb::WorkbookProperties::default())
+    );
+}
+
+/// Collect sparse cells without expanding row gaps, including opposite-corner workbooks.
+async fn sparse_cells(
+    client: &CalamineServiceClient<tonic::transport::Channel>,
+    id: &str,
+    formulas: bool,
+) -> (
+    pb::RangeStarted,
+    std::collections::BTreeMap<(u32, u32), pb::CellData>,
+) {
+    let mut client = client.clone();
+    let mut stream = client
+        .stream_worksheet_range(pb::StreamWorksheetRangeRequest {
+            workbook_id: id.into(),
+            sheet: Some(pb::SheetSelector {
+                selector: Some(pb::sheet_selector::Selector::SheetIndex(0)),
+            }),
+            include_formulas: formulas,
+            max_rows_per_message: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut header = None;
+    let mut cells = std::collections::BTreeMap::new();
+    while let Some(event) = stream.message().await.unwrap() {
+        let rows = match event.event.unwrap() {
+            pb::stream_worksheet_range_response::Event::Started(h) => {
+                header = Some(h);
+                continue;
+            }
+            pb::stream_worksheet_range_response::Event::Row(r) => vec![r],
+            pb::stream_worksheet_range_response::Event::Rows(b) => b.rows,
+            pb::stream_worksheet_range_response::Event::RowGap(_) => continue,
+            other => panic!("unexpected event: {other:?}"),
+        };
+        for row in rows {
+            for (col, value) in row.values.into_iter().enumerate() {
+                if value.formula.is_some()
+                    || !matches!(value.value, Some(pb::cell_data::Value::Empty(())))
+                {
+                    cells.insert((row.row_index, col as u32), value);
+                }
+            }
+        }
+    }
+    (header.unwrap(), cells)
+}
+
+#[tokio::test]
+async fn one_pass_formulas_keep_cached_values_and_expand_shared_cells() {
+    for file in ["formula.issue.xlsx", "corners_formula.xlsx"] {
+        let client = start_server().await;
+        let opened = upload(&client, file).await;
+        let (_, plain) = sparse_cells(&client, &opened.workbook_id, false).await;
+        let (_, rich) = sparse_cells(&client, &opened.workbook_id, true).await;
+        for (pos, cell) in &plain {
+            assert_eq!(
+                cell.value, rich[pos].value,
+                "cached value changed at {file}/{pos:?}"
+            );
+        }
+        let mut workbook: Sheets<_> = open_workbook_auto(fixtures().join(file)).unwrap();
+        let name = workbook.sheet_names()[0].clone();
+        let mut expected = std::collections::BTreeMap::new();
+        if let Sheets::Xlsx(xlsx) = &mut workbook {
+            let mut reader = xlsx.worksheet_cells_reader(&name).unwrap();
+            while let Some(cell) = reader.next_formula().unwrap() {
+                if !cell.get_value().is_empty() {
+                    expected.insert(cell.get_position(), cell.get_value().clone());
+                }
+            }
+        }
+        let got: std::collections::BTreeMap<_, _> = rich
+            .into_iter()
+            .filter_map(|(p, c)| c.formula.filter(|f| !f.is_empty()).map(|f| (p, f)))
+            .collect();
+        assert_eq!(got, expected, "{file}");
+    }
+    let client = start_server().await;
+    let bytes = xlsx_with_sheet_data(
+        r#"<row r="1"><c r="A1"><f t="shared" ref="A1:A3" si="0">B1+1</f><v>2</v></c></row><row r="2"><c r="A2"><f t="shared" si="0"/><v>3</v></c></row><row r="3"><c r="A3"><f t="shared" si="0"/><v>4</v></c></row>"#,
+    );
+    let opened = try_upload_bytes(&client, bytes, default_options())
+        .await
+        .unwrap();
+    let (_, cells) = sparse_cells(&client, &opened.workbook_id, true).await;
+    for row in 0..3 {
+        assert_eq!(cells[&(row, 0)].formula, Some(format!("B{}+1", row + 1)));
+        assert!(cells[&(row, 0)].value.is_some());
+    }
+    for file in ["date.xlsb", "date.xls", "date.ods"] {
+        let opened = upload(&client, file).await;
+        let (_, plain) = sparse_cells(&client, &opened.workbook_id, false).await;
+        let (_, flagged) = sparse_cells(&client, &opened.workbook_id, true).await;
+        assert_eq!(plain, flagged, "flag is a no-op on {file}");
+    }
+}
+
+#[tokio::test]
+async fn declared_tables_keep_full_ranges_headers_totals_and_column_names() {
+    let client = start_server().await;
+    let rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="t1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/><Relationship Id="t2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table2.xml"/></Relationships>"#;
+    let one = br#"<table displayName="Sales" ref="B2:C5" headerRowCount="1" totalsRowCount="1"><tableColumns><tableColumn name="Product &amp; SKU"/><tableColumn name="Price"/></tableColumns></table>"#;
+    let two = br#"<table displayName="Raw" ref="E3:F7" headerRowCount="0" totalsRowCount="0"><tableColumns><tableColumn name="Code"/><tableColumn name="Value"/></tableColumns></table>"#;
+    let bytes = xlsx_with_parts(&[
+        ("xl/worksheets/_rels/sheet1.xml.rels", rels.to_vec()),
+        ("xl/tables/table1.xml", one.to_vec()),
+        ("xl/tables/table2.xml", two.to_vec()),
+    ]);
+    let opened = try_upload_bytes(&client, bytes, default_options())
+        .await
+        .unwrap();
+    let (header, _) = sparse_cells(&client, &opened.workbook_id, false).await;
+    assert_eq!(header.tables.len(), 2);
+    let sales = &header.tables[0];
+    assert_eq!(sales.name, "Sales");
+    assert_eq!(sales.header_row_count, 1);
+    assert_eq!(sales.totals_row_count, 1);
+    assert_eq!(sales.columns, ["Product & SKU", "Price"]);
+    assert_eq!(
+        sales.range,
+        Some(pb::Dimensions {
+            start: Some(pb::CellPosition { row: 1, col: 1 }),
+            end: Some(pb::CellPosition { row: 4, col: 2 })
+        })
+    );
+    assert_eq!(header.tables[1].header_row_count, 0);
+    assert_eq!(header.tables[1].name, "Raw");
+    for file in ["date.xlsx", "date.xlsb", "date.xls", "date.ods"] {
+        let opened = upload(&client, file).await;
+        let (h, _) = sparse_cells(&client, &opened.workbook_id, false).await;
+        assert!(h.tables.is_empty(), "{file}");
+    }
+}
+
+#[tokio::test]
+async fn number_formats_preserve_codes_and_each_cells_style_reference() {
+    let client = start_server().await;
+    let styles=br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="&quot;$&quot;#,##0.00"/></numFmts><cellXfs count="5"><xf numFmtId="0"/><xf numFmtId="10"/><xf numFmtId="3"/><xf numFmtId="2"/><xf numFmtId="164"/></cellXfs></styleSheet>"#;
+    let sheet=br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" s="1"><v>0.125</v></c><c r="B1" s="2"><v>1234</v></c><c r="C1" s="3"><v>12.34</v></c><c r="D1" s="4"><f>A1*2</f><v>0.25</v></c></row></sheetData></worksheet>"#;
+    let mut bytes = xlsx_with_parts(&[("xl/styles.xml", styles.to_vec())]);
+    bytes = replace_zip_parts(&bytes, &[("xl/worksheets/sheet1.xml", sheet.to_vec())]);
+    let opened = try_upload_bytes(&client, bytes, default_options())
+        .await
+        .unwrap();
+    for formulas in [false, true] {
+        let (header, cells) = sparse_cells(&client, &opened.workbook_id, formulas).await;
+        assert_eq!(header.number_formats.len(), 5);
+        for (col, code) in ["0.00%", "#,##0", "0.00", "\"$\"#,##0.00"]
+            .iter()
+            .enumerate()
+        {
+            let style = cells[&(0, col as u32)].style_id.unwrap();
+            assert_eq!(style, col as u32 + 1);
+            assert_eq!(
+                header.number_formats[style as usize].code.as_deref(),
+                Some(*code)
+            );
+        }
+        assert_eq!(cells[&(0, 3)].formula.is_some(), formulas);
+    }
+    let opened = upload(&client, "date.xlsb").await;
+    let (header, cells) = sparse_cells(&client, &opened.workbook_id, false).await;
+    assert!(!header.number_formats.is_empty());
+    for cell in cells.values() {
+        let style = cell.style_id.unwrap();
+        assert!(header.number_formats.iter().any(|f| f.style_id == style));
+    }
+}
+
+/// Replace archive parts without retaining a second entry with the same name.
+fn replace_zip_parts(bytes: &[u8], parts: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    use std::io::{Read, Write};
+    let mut input = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut output = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for index in 0..input.len() {
+        let mut file = input.by_index(index).unwrap();
+        let mut body = Vec::new();
+        file.read_to_end(&mut body).unwrap();
+        let name = file.name().to_owned();
+        if let Some((_, replacement)) = parts.iter().find(|(n, _)| *n == name) {
+            body.clone_from(replacement);
+        }
+        output
+            .start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        output.write_all(&body).unwrap();
+    }
+    output.finish().unwrap().into_inner()
+}
+
+/// BIFF12 encodes record types and lengths as seven-bit continuation integers.
+fn biff_record(output: &mut Vec<u8>, kind: u16, body: &[u8]) {
+    fn variable(output: &mut Vec<u8>, mut value: usize) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            output.push(byte | if value == 0 { 0 } else { 0x80 });
+            if value == 0 {
+                break;
+            }
+        }
+    }
+    variable(output, usize::from(kind));
+    variable(output, body.len());
+    output.extend_from_slice(body);
+}
+
+#[tokio::test]
+async fn xlsb_preserves_percent_thousands_decimal_and_currency_styles() {
+    let client = start_server().await;
+    let mut styles = Vec::new();
+    biff_record(&mut styles, 0x267, &1u32.to_le_bytes());
+    let mut fmt = 164u16.to_le_bytes().to_vec();
+    let code = "\"$\"#,##0.00";
+    fmt.extend_from_slice(&(code.encode_utf16().count() as u32).to_le_bytes());
+    for ch in code.encode_utf16() {
+        fmt.extend_from_slice(&ch.to_le_bytes());
+    }
+    biff_record(&mut styles, 0x2c, &fmt);
+    biff_record(&mut styles, 0x268, &[]);
+    biff_record(&mut styles, 0x269, &5u32.to_le_bytes());
+    for id in [0u16, 10, 3, 2, 164] {
+        let mut xf = vec![0, 0];
+        xf.extend_from_slice(&id.to_le_bytes());
+        biff_record(&mut styles, 0x2f, &xf);
+    }
+    let mut sheet = Vec::new();
+    biff_record(&mut sheet, 0x81, &[]);
+    let mut dimensions = Vec::new();
+    for value in [0u32, 0, 0, 3] {
+        dimensions.extend_from_slice(&value.to_le_bytes());
+    }
+    biff_record(&mut sheet, 0x94, &dimensions);
+    biff_record(&mut sheet, 0x91, &[]);
+    biff_record(&mut sheet, 0, &0u32.to_le_bytes());
+    for (col, value) in [0.125f64, 1234.0, 12.34, 0.25].into_iter().enumerate() {
+        let mut cell = (col as u32).to_le_bytes().to_vec();
+        cell.extend_from_slice(&((col + 1) as u32).to_le_bytes());
+        cell.extend_from_slice(&value.to_le_bytes());
+        biff_record(&mut sheet, 5, &cell);
+    }
+    biff_record(&mut sheet, 0x92, &[]);
+    let original = std::fs::read(fixtures().join("date.xlsb")).unwrap();
+    let bytes = replace_zip_parts(
+        &original,
+        &[
+            ("xl/styles.bin", styles),
+            ("xl/worksheets/sheet1.bin", sheet),
+        ],
+    );
+    let opened = try_upload_bytes(&client, bytes, default_options())
+        .await
+        .unwrap();
+    let (header, cells) = sparse_cells(&client, &opened.workbook_id, false).await;
+    assert_eq!(header.number_formats.len(), 5);
+    assert_eq!(cells.len(), 4);
+    for (col, code) in ["0.00%", "#,##0", "0.00", "\"$\"#,##0.00"]
+        .iter()
+        .enumerate()
+    {
+        let style = cells[&(0, col as u32)].style_id.unwrap();
+        assert_eq!(style, col as u32 + 1);
+        assert_eq!(
+            header.number_formats[style as usize].code.as_deref(),
+            Some(*code)
+        );
+    }
 }

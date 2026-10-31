@@ -161,6 +161,8 @@ fn approx_row_bytes(values: &[pb::CellData]) -> usize {
         .iter()
         .map(|cell| {
             PER_CELL
+                + cell.formula.as_ref().map_or(0, |s| s.len() + 6)
+                + if cell.style_id.is_some() { 6 } else { 0 }
                 + match &cell.value {
                     Some(
                         pb::cell_data::Value::StringValue(s)
@@ -759,6 +761,7 @@ fn range_header<T: CellType>(
                 }),
                 total_cells: (height * width) as u64,
                 merged_regions,
+                ..Default::default()
             }
         }
         _ => pb::RangeStarted {
@@ -766,6 +769,7 @@ fn range_header<T: CellType>(
             dimensions: None,
             total_cells: 0,
             merged_regions,
+            ..Default::default()
         },
     }
 }
@@ -782,6 +786,7 @@ fn declared_header(
         dimensions: Some(convert::dimensions(dims)),
         total_cells: declared_total_cells(dims),
         merged_regions,
+        ..Default::default()
     }
 }
 
@@ -937,9 +942,17 @@ struct RowBatcher {
     /// with the cell conversion that interns into it; the batcher's job is
     /// to put pending entries on the wire before the rows that need them.
     strings: Option<Rc<RefCell<StringTable>>>,
+    tables: Vec<pb::DeclaredTable>,
+    number_formats: Vec<pb::NumberFormat>,
 }
 
 impl RowBatcher {
+    fn header(&self, mut header: pb::RangeStarted) -> pb::RangeStarted {
+        header.tables.clone_from(&self.tables);
+        header.number_formats.clone_from(&self.number_formats);
+        header
+    }
+
     fn new(max_rows_per_message: u32, strings: Option<Rc<RefCell<StringTable>>>) -> Self {
         let requested = match max_rows_per_message {
             0 => DEFAULT_MAX_ROWS_PER_MESSAGE,
@@ -962,6 +975,8 @@ impl RowBatcher {
             next_expected: None,
             highest_sent: None,
             strings,
+            tables: Vec::new(),
+            number_formats: Vec::new(),
         }
     }
 
@@ -1144,7 +1159,9 @@ fn merge_row_values(into: &mut Vec<pb::CellData>, from: Vec<pb::CellData>) {
         into.resize(from.len(), convert::empty_cell_data());
     }
     for (slot, value) in into.iter_mut().zip(from) {
-        if !matches!(value.value, Some(pb::cell_data::Value::Empty(())) | None) {
+        if value.formula.is_some()
+            || !matches!(value.value, Some(pb::cell_data::Value::Empty(())) | None)
+        {
             *slot = value;
         }
     }
@@ -1192,7 +1209,7 @@ fn emit_range(
     }
     if !send_event(
         tx,
-        range_started(range_header(sheet_name, range, merged_regions)),
+        range_started(batcher.header(range_header(sheet_name, range, merged_regions))),
     ) {
         return;
     }
@@ -1254,14 +1271,14 @@ fn emit_incremental<E: Display>(
     header: pb::RangeStarted,
     dims: calamine::Dimensions,
     header_row: Option<u32>,
-    mut next_cell: impl FnMut() -> Result<Option<(u32, u32, pb::cell_data::Value)>, E>,
+    mut next_cell: impl FnMut() -> Result<Option<(u32, u32, pb::CellData)>, E>,
     kind: pb::CalamineErrorKind,
     batcher: &mut RowBatcher,
     tx: &mpsc::Sender<Result<pb::StreamWorksheetRangeResponse, Status>>,
 ) {
     let sheet_name = header.sheet_name.clone();
     let sheet_name = sheet_name.as_str();
-    if !send_event(tx, range_started(header)) {
+    if !send_event(tx, range_started(batcher.header(header))) {
         return;
     }
 
@@ -1332,7 +1349,7 @@ fn emit_incremental<E: Display>(
         // row nor advances the walk. Dropping them here is what makes leading
         // and trailing styled-blank rows disappear with no special casing, and
         // stops one blank cell far to the right from inflating every row.
-        if matches!(value, pb::cell_data::Value::Empty(())) {
+        if matches!(value.value, Some(pb::cell_data::Value::Empty(()))) && value.formula.is_none() {
             continue;
         }
         let idx = col as usize;
@@ -1358,7 +1375,7 @@ fn emit_incremental<E: Display>(
             // As long as its own last value, like any other row, so a repaired
             // sheet streams the same shape a sorted one would.
             let mut late = vec![convert::empty_cell_data(); idx + 1];
-            late[idx] = convert::cell_data(value);
+            late[idx] = value;
             if !batcher.push(tx, row, late) {
                 return;
             }
@@ -1392,7 +1409,7 @@ fn emit_incremental<E: Display>(
         if idx >= values.len() {
             values.resize(idx + 1, convert::empty_cell_data());
         }
-        values[idx] = convert::cell_data(value);
+        values[idx] = value;
     }
 
     // Complete the final row. Rows after it hold nothing: that is trailing
@@ -1416,7 +1433,7 @@ fn cell_tuple(
     cell: calamine::Cell<calamine::DataRef<'_>>,
     is_1904: bool,
     table: Option<&Rc<RefCell<StringTable>>>,
-) -> (u32, u32, pb::cell_data::Value) {
+) -> (u32, u32, pb::CellData) {
     let (row, col) = cell.get_position();
     let value = match (cell.get_value(), table) {
         (calamine::DataRef::SharedString(s), Some(table)) => {
@@ -1424,7 +1441,7 @@ fn cell_tuple(
         }
         (value, _) => convert::data_ref_value(value, is_1904),
     };
-    (row, col, value)
+    (row, col, convert::cell_data(value))
 }
 
 /// The merged cell areas a sheet declares, for its `RangeStarted` header.
@@ -1458,6 +1475,7 @@ fn run_stream_worksheet_range(
     selector: Option<&pb::SheetSelector>,
     max_rows_per_message: u32,
     use_string_table: bool,
+    include_formulas: bool,
     max_dense_cells: u64,
     tx: &mpsc::Sender<Result<pb::StreamWorksheetRangeResponse, Status>>,
 ) {
@@ -1472,6 +1490,8 @@ fn run_stream_worksheet_range(
             return;
         }
     };
+    batcher.tables = entry.tables.get(&sheet_name).cloned().unwrap_or_default();
+    batcher.number_formats.clone_from(&entry.number_formats);
     let kind = convert::error_kind_for_format(entry.format);
     // Fresh independent reader: no locks, fully parallel with other reads.
     let Some(mut workbook) = checkout(entry, kind, tx) else {
@@ -1505,9 +1525,36 @@ fn run_stream_worksheet_range(
                         dims,
                         header_row,
                         || {
-                            reader.next_cell().map(|opt| {
-                                opt.map(|cell| cell_tuple(cell, is_1904, table.as_ref()))
-                            })
+                            if include_formulas {
+                                reader.next_cell_with_formula().map(|opt| {
+                                    opt.map(|cell| {
+                                        let mut value = convert::cell_data(
+                                            match (&cell.value, table.as_ref()) {
+                                                (
+                                                    calamine::DataRef::SharedString(s),
+                                                    Some(table),
+                                                ) => pb::cell_data::Value::SharedStringId(
+                                                    table.borrow_mut().intern(s),
+                                                ),
+                                                (value, _) => {
+                                                    convert::data_ref_value(value, is_1904)
+                                                }
+                                            },
+                                        );
+                                        value.formula = cell.formula;
+                                        value.style_id = reader.style_id();
+                                        (cell.pos.0, cell.pos.1, value)
+                                    })
+                                })
+                            } else {
+                                reader.next_cell().map(|opt| {
+                                    opt.map(|cell| {
+                                        let mut tuple = cell_tuple(cell, is_1904, table.as_ref());
+                                        tuple.2.style_id = reader.style_id();
+                                        tuple
+                                    })
+                                })
+                            }
                         },
                         kind,
                         &mut batcher,
@@ -1543,7 +1590,11 @@ fn run_stream_worksheet_range(
                         header_row,
                         || {
                             reader.next_cell().map(|opt| {
-                                opt.map(|cell| cell_tuple(cell, is_1904, table.as_ref()))
+                                opt.map(|cell| {
+                                    let mut tuple = cell_tuple(cell, is_1904, table.as_ref());
+                                    tuple.2.style_id = reader.style_id();
+                                    tuple
+                                })
                             })
                         },
                         kind,
@@ -1722,6 +1773,7 @@ fn emit_sparse_formulas(
                 dimensions: None,
                 total_cells: 0,
                 merged_regions: Vec::new(),
+                ..Default::default()
             }),
         );
         return;
@@ -1743,6 +1795,7 @@ fn emit_sparse_formulas(
         }),
         total_cells: rows * (u64::from(last_col - first_col) + 1),
         merged_regions: Vec::new(),
+        ..Default::default()
     };
     if !send_event(tx, formula_started(header)) {
         return;
@@ -2077,6 +2130,7 @@ impl CalamineService for CalamineGrpc {
                 req.sheet.as_ref(),
                 req.max_rows_per_message,
                 req.use_string_table,
+                req.include_formulas,
                 max_dense_cells,
                 &tx,
             );

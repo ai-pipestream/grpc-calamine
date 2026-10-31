@@ -422,6 +422,10 @@ pub struct WorkbookEntry {
     /// Workbook-level 1904 date-system flag, read once at open time via
     /// `has_1904_epoch` and stamped onto every streamed datetime cell.
     pub is_1904: bool,
+    /// Declared tables grouped by sheet, captured without decoding cells.
+    pub tables: std::collections::HashMap<String, Vec<pb::DeclaredTable>>,
+    /// Source number formats indexed by cell style references.
+    pub number_formats: Vec<pb::NumberFormat>,
     /// Readers parked for reuse. Never held across a parse.
     pool: Arc<ReaderPool>,
     /// What this workbook counts against [`StoreLimits::max_store_bytes`].
@@ -866,7 +870,7 @@ impl WorkbookStore {
         let bytes: WorkbookBytes = bytes.into();
 
         // One probing reader to detect the format and snapshot metadata.
-        let probe =
+        let mut probe =
             if format_hint == pb::WorkbookFormat::Unspecified && self.formats != FormatSet::ALL {
                 self.detect_accepted(&bytes)?
             } else {
@@ -878,7 +882,17 @@ impl WorkbookStore {
             Sheets::Xlsb(_) => pb::WorkbookFormat::Xlsb,
             Sheets::Ods(_) => pb::WorkbookFormat::Ods,
         };
+        let properties = if matches!(&probe, Sheets::Xlsx(_) | Sheets::Xlsb(_)) {
+            Some(convert::workbook_properties(
+                probe.workbook_properties().map_err(|e| OpenError {
+                    error: convert::calamine_error(convert::error_kind(&e), &e),
+                })?,
+            ))
+        } else {
+            None
+        };
         let metadata = pb::Metadata {
+            properties,
             sheets: probe.sheets_metadata().iter().map(convert::sheet).collect(),
             defined_names: probe
                 .defined_names()
@@ -890,6 +904,40 @@ impl WorkbookStore {
                 .collect(),
         };
         let is_1904 = convert::has_1904_epoch(&probe);
+        let mut tables = std::collections::HashMap::<String, Vec<pb::DeclaredTable>>::new();
+        let mut number_formats: Vec<pb::NumberFormat> = match &mut probe {
+            Sheets::Xlsx(xlsx) => {
+                for table in xlsx.declared_tables().map_err(|e| OpenError {
+                    error: convert::calamine_error(pb::CalamineErrorKind::Xlsx, &e),
+                })? {
+                    tables
+                        .entry(table.sheet_name.clone())
+                        .or_default()
+                        .push(convert::declared_table(table));
+                }
+                xlsx.number_formats()
+                    .iter()
+                    .map(convert::number_format)
+                    .collect()
+            }
+            Sheets::Xlsb(xlsb) => xlsb
+                .number_formats()
+                .iter()
+                .map(convert::number_format)
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        if number_formats.is_empty()
+            && matches!(format, pb::WorkbookFormat::Xlsx | pb::WorkbookFormat::Xlsb)
+        {
+            number_formats.push(pb::NumberFormat {
+                style_id: 0,
+                format_id: 0,
+                code: Some("General".into()),
+                kind: pb::NumberFormatKind::Other as i32,
+            });
+        }
 
         // The probe is a fully parsed reader. Park it instead of dropping it,
         // so the first read of this workbook does not repeat the open.
@@ -902,6 +950,8 @@ impl WorkbookStore {
             header_row,
             metadata,
             is_1904,
+            tables,
+            number_formats,
             pool,
             held_bytes,
             reader_bytes,

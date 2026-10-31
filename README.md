@@ -414,3 +414,26 @@ program that uploads a workbook and prints its rows. See
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+Workbook document properties are returned in `Metadata.properties` by both
+`OpenWorkbook` and `GetMetadata` for XLSX and XLSB. Each optional field preserves
+its original string, including dates and the distinction between an absent
+property and an empty one. XLS and ODS omit this message.
+
+`StreamWorksheetRange.include_formulas` adds expanded formula text to each
+XLSX `CellData` alongside its cached value, in the same incremental pass.
+Shared formulas expand at each derived cell after their anchor has appeared.
+A formula with no cached value still appears as a cell with an empty value.
+The flag is accepted without effect for XLS, XLSB and ODS; their separate
+`StreamWorksheetFormula` RPC remains available. Formula strings remain plain
+text even when shared-string dictionary encoding is enabled.
+
+Value-stream headers carry explicit XLSX table declarations in
+`RangeStarted.tables`, with their complete source rectangles, header and totals
+row counts, and ordered column names. Reading this metadata does not decode
+worksheet cells. `RangeStarted.number_formats` carries XLSX/XLSB style
+references, source format identifiers, classification and optional format codes;
+`CellData.style_id` selects a definition. Custom codes are preserved literally.
+Reserved or locale-dependent built-in identifiers retain their numeric ID
+without inventing a format string. The service provides format metadata rather
+than rendering numbers into display text.

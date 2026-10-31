@@ -183,6 +183,10 @@ message SheetSelector {
 
 // StreamWorksheetRangeRequest selects the workbook and worksheet to stream.
 message StreamWorksheetRangeRequest {
+  // Include expanded formulas alongside cached values in one XLSX pass.
+  // Accepted without effect for other formats.
+  bool include_formulas = 5;
+
   // Handle returned by `OpenWorkbook`.
   string workbook_id = 1;
 
@@ -221,6 +225,11 @@ message StreamWorksheetRangeRequest {
 // first event of `StreamWorksheetRange` and `StreamWorksheetFormula` and
 // lets the caller allocate/validate before any row arrives.
 message RangeStarted {
+  // Tables explicitly declared over this sheet; XLSX only.
+  repeated DeclaredTable tables = 5;
+  // Workbook style definitions referenced by streamed cells; XLSX/XLSB only.
+  repeated NumberFormat number_formats = 6;
+
   // Resolved name of the worksheet being streamed.
   string sheet_name = 1;
 

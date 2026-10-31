@@ -104,7 +104,11 @@ pub fn has_1904_epoch<RS: std::io::Read + std::io::Seek>(workbook: &calamine::Sh
 /// Wrap a oneof value into a `CellData` message.
 #[must_use]
 pub fn cell_data(value: pb::cell_data::Value) -> pb::CellData {
-    pb::CellData { value: Some(value) }
+    pb::CellData {
+        value: Some(value),
+        formula: None,
+        style_id: None,
+    }
 }
 
 /// Build an empty `CellData` (`Data::Empty`).
@@ -201,5 +205,56 @@ pub fn error_kind_for_format(format: pb::WorkbookFormat) -> pb::CalamineErrorKin
         pb::WorkbookFormat::Xlsb => pb::CalamineErrorKind::Xlsb,
         pb::WorkbookFormat::Ods => pb::CalamineErrorKind::Ods,
         pb::WorkbookFormat::Unspecified => pb::CalamineErrorKind::Unspecified,
+    }
+}
+
+/// Preserve document properties, including absent versus empty values.
+#[must_use]
+pub fn workbook_properties(p: calamine::WorkbookProperties) -> pb::WorkbookProperties {
+    pb::WorkbookProperties {
+        creator: p.creator,
+        last_modified_by: p.last_modified_by,
+        created: p.created,
+        modified: p.modified,
+        title: p.title,
+        subject: p.subject,
+        description: p.description,
+        keywords: p.keywords,
+        category: p.category,
+        content_status: p.content_status,
+        revision: p.revision,
+        version: p.version,
+        application: p.application,
+        app_version: p.app_version,
+        company: p.company,
+        template: p.template,
+        manager: p.manager,
+    }
+}
+
+/// Preserve the complete source table rectangle and declared row roles.
+#[must_use]
+pub fn declared_table(t: &calamine::DeclaredTableMetadata) -> pb::DeclaredTable {
+    pb::DeclaredTable {
+        name: t.name.clone(),
+        range: Some(dimensions(t.dimensions)),
+        header_row_count: t.header_row_count,
+        totals_row_count: t.totals_row_count,
+        columns: t.columns.clone(),
+    }
+}
+
+/// Preserve the number-format source and the parser's classification.
+#[must_use]
+pub fn number_format(f: &calamine::NumberFormat) -> pb::NumberFormat {
+    pb::NumberFormat {
+        style_id: f.style_id,
+        format_id: f.format_id,
+        code: f.code.clone(),
+        kind: match f.kind {
+            calamine::NumberFormatKind::Other => pb::NumberFormatKind::Other,
+            calamine::NumberFormatKind::DateTime => pb::NumberFormatKind::DateTime,
+            calamine::NumberFormatKind::TimeDelta => pb::NumberFormatKind::TimeDelta,
+        } as i32,
     }
 }

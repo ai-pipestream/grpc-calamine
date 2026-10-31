@@ -557,6 +557,7 @@ async fn arm_grpc(
             }),
             max_rows_per_message: batch,
             use_string_table: dict,
+            include_formulas: false,
         })
         .await
         .expect("stream request")

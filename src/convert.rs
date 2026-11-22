@@ -246,7 +246,7 @@ pub fn declared_table(t: &calamine::DeclaredTableMetadata) -> pb::DeclaredTable 
 
 /// Preserve the number-format source and the parser's classification.
 #[must_use]
-pub fn number_format(f: &calamine::NumberFormat) -> pb::NumberFormat {
+pub fn number_format(f: &calamine::StyleNumberFormat) -> pb::NumberFormat {
     pb::NumberFormat {
         style_id: f.style_id,
         format_id: f.format_id,

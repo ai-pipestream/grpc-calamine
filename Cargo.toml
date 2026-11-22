@@ -14,7 +14,7 @@ publish = false # Server binary plus demos; not a library for crates.io.
 exclude = ["bench", "demos"]
 
 [dependencies]
-calamine = { version = "0.37.0", features = ["picture"] }
+calamine = { version = "0.38.0", features = ["picture"] }
 prost = "0.14.4"
 # Already in the tree through calamine; used by src/archive.rs to read the
 # `<sst>` count and the drawing anchors in the pre-open scan.
@@ -33,31 +33,28 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 [dev-dependencies]
 tokio-stream = { version = "0.1.19", features = ["net"] }
 
-# Three defects found by this server are fixed upstream in tafia/calamine#695,
-# #696 and #697 but not in a release (0.37.0 does not carry them), and a
-# fourth is fixed only in the fork so far. The pinned commit is the fork's
-# `pipestream-main` at 3aa4bf5: upstream calamine 0.37.0 merged over 23ae1f1
-# (ai-pipestream/calamine#2), so it carries those three fixes plus the fork's
-# own commit:
+# The fork carries fixes and APIs this server needs that are not in a calamine
+# release yet. The pinned commit is the fork's `pipestream-main-0.38` branch:
+# upstream master after 0.38.0 (which already has tafia/calamine#695, reversed
+# `<dimension ref>` normalisation) plus, in order:
 #
-#   #695  a reversed `<dimension ref>` underflowed the extent arithmetic, so
-#         `Dimensions::len()` reported 18_446_744_056_529_682_435 cells
-#   #696  cell reference parsing overflowed u32 unchecked, so a crafted `r=`
-#         yielded a cell position that appears nowhere in the file
-#   #697  `Range::from_sparse` densified without bound, so a 2 KB worksheet
-#         aborted the process through `handle_alloc_error` (uncatchable)
-#   23ae1f1  every anchor of an xlsx picture got its own copy of the image at
-#         open time, so one image anchored 20,000 times was 20,000 copies; and
-#         a shared formula's `si` sized a Vec, so si="1000000000000" aborted.
-#         Adds `Reader::pictures_iter`, which the server uses.
+#   #696  a cell reference beyond the grid (e.g. XFE1, A1048577) is an error,
+#         checked while the reference is parsed
+#   #697  `Range::from_sparse` returns an error past a fixed cell limit instead
+#         of densifying without bound and aborting the process
+#   ecbd87d  every anchor of an xlsx picture shares one copy of the image, and
+#         a shared formula's `si` no longer sizes a Vec. Adds
+#         `Reader::pictures_iter`, which the server uses.
+#   f5ae782, 42fae6f  metadata-only declared tables, cell style ids, and full
+#         source number-format identifiers and codes (`StyleNumberFormat`,
+#         renamed from `NumberFormat`, which upstream now uses for styles).
 #
+# #696 and #697 are open upstream; the other three are fork-only so far.
 # Pinned by `rev`, not by branch, so `cargo update` cannot move it: a newer
 # fork commit is taken on purpose, by changing the rev here and in bench/.
-# This topic additionally exposes metadata-only declared tables, style IDs,
-# and complete source number-format identifiers/codes to avoid data loss.
-# Drop this section once the required APIs and all four fixes are released.
+# Drop this section once the required APIs and fixes are released.
 [patch.crates-io]
-calamine = { git = "https://github.com/ai-pipestream/calamine.git", rev = "d4bac6b9e458b4d915e7dc929c6591c12b71c20d" }
+calamine = { git = "https://github.com/ai-pipestream/calamine.git", rev = "42fae6f5669cb728944a51406c43c5a49224390d" }
 
 [lints.rust]
 missing_docs = "warn"

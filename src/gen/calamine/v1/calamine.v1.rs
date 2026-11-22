@@ -1237,5 +1237,220 @@ pub mod get_pictures_response {
         Error(super::StreamError),
     }
 }
+/// ParseWorkbookRequest is one frame of the `ParseWorkbook` request stream.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ParseWorkbookRequest {
+    /// Exactly one per message, in the order the RPC documents.
+    #[prost(oneof="parse_workbook_request::Frame", tags="1, 2, 3")]
+    pub frame: ::core::option::Option<parse_workbook_request::Frame>,
+}
+/// Nested message and enum types in `ParseWorkbookRequest`.
+pub mod parse_workbook_request {
+    /// Exactly one per message, in the order the RPC documents.
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Frame {
+        /// What to emit. First frame only; sending it twice is an error.
+        #[prost(message, tag="1")]
+        Open(super::ParseWorkbookOpen),
+        /// A chunk of the workbook file bytes, in order.
+        #[prost(message, tag="2")]
+        Chunk(super::WorkbookChunk),
+        /// Stop the parse. Allowed at any point after `open`.
+        #[prost(message, tag="3")]
+        Cancel(super::ParseWorkbookCancel),
+    }
+}
+/// ParseWorkbookOpen carries the open-time settings and the selection of parts
+/// for `ParseWorkbook`. Workbook metadata is always emitted; every other part
+/// is emitted only when its flag is set.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ParseWorkbookOpen {
+    /// Format hint and header row selection, exactly as for `OpenWorkbook`.
+    #[prost(message, optional, tag="1")]
+    pub options: ::core::option::Option<WorkbookOptions>,
+    /// Emit every selected sheet's cell data as `range` events.
+    #[prost(bool, tag="2")]
+    pub emit_ranges: bool,
+    /// Emit every selected sheet's formulas as `formula` events.
+    #[prost(bool, tag="3")]
+    pub emit_formulas: bool,
+    /// Emit the workbook's defined names as one `defined_names` event.
+    #[prost(bool, tag="4")]
+    pub emit_defined_names: bool,
+    /// Emit every embedded picture as `picture` events.
+    #[prost(bool, tag="5")]
+    pub emit_pictures: bool,
+    /// Emit the VBA project as `vba` events.
+    #[prost(bool, tag="6")]
+    pub emit_vba: bool,
+    /// The sheets whose ranges and formulas are emitted, in emission order.
+    /// Empty selects every sheet in workbook order. A selector that names no
+    /// sheet of the workbook fails the stream with NOT_FOUND before any part.
+    #[prost(message, repeated, tag="7")]
+    pub sheets: ::prost::alloc::vec::Vec<SheetSelector>,
+    /// Range stream settings, with the meaning they have on
+    /// `StreamWorksheetRangeRequest`.
+    #[prost(message, optional, tag="8")]
+    pub range_options: ::core::option::Option<ParseWorkbookRangeOptions>,
+    /// Caller-side limits. Each can only tighten the server's own.
+    #[prost(message, optional, tag="9")]
+    pub limits: ::core::option::Option<ParseWorkbookLimits>,
+}
+/// ParseWorkbookRangeOptions carries the `StreamWorksheetRangeRequest`
+/// settings that apply to every `range` part of a `ParseWorkbook` stream.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ParseWorkbookRangeOptions {
+    /// See `StreamWorksheetRangeRequest.max_rows_per_message`.
+    #[prost(uint32, tag="1")]
+    pub max_rows_per_message: u32,
+    /// See `StreamWorksheetRangeRequest.use_string_table`. The table belongs to
+    /// one sheet's range part, never to the whole stream.
+    #[prost(bool, tag="2")]
+    pub use_string_table: bool,
+    /// See `StreamWorksheetRangeRequest.include_formulas`.
+    #[prost(bool, tag="3")]
+    pub include_formulas: bool,
+}
+/// ParseWorkbookLimits lets a caller tighten the server's limits for one
+/// `ParseWorkbook` stream. Zero means the server's own limit; a value above
+/// it is clamped to it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ParseWorkbookLimits {
+    /// Largest upload accepted, in bytes.
+    #[prost(uint64, tag="1")]
+    pub max_workbook_bytes: u64,
+    /// Most cells one range or formula part may densify, counted from column A.
+    #[prost(uint64, tag="2")]
+    pub max_dense_cells: u64,
+    /// Most formula bytes one xlsx or xlsb formula part may collect.
+    #[prost(uint64, tag="3")]
+    pub max_formula_bytes: u64,
+}
+/// WorkbookChunk is one piece of the uploaded workbook file.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WorkbookChunk {
+    /// File bytes. Chunks are concatenated in stream order. Empty only on the
+    /// chunk marked `last`, which may carry nothing but the marker.
+    #[prost(bytes="vec", tag="1")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+    /// True on the final chunk. The upload also ends when the client
+    /// half-closes, so a client that half-closes need never set it.
+    #[prost(bool, tag="2")]
+    pub last: bool,
+}
+/// ParseWorkbookCancel asks the server to stop a `ParseWorkbook` stream.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ParseWorkbookCancel {
+    /// Free-form reason, for the server's own diagnostics only.
+    #[prost(string, tag="1")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// ParseWorkbookResponse is one event of the `ParseWorkbook` stream.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ParseWorkbookResponse {
+    /// Exactly one per message.
+    ///
+    /// Unknown variants must be ignored rather than treated as failures: this
+    /// oneof is the extension point, and a later server may add events an older
+    /// client has no name for.
+    #[prost(oneof="parse_workbook_response::Event", tags="1, 2, 3, 4, 5, 6, 7")]
+    pub event: ::core::option::Option<parse_workbook_response::Event>,
+}
+/// Nested message and enum types in `ParseWorkbookResponse`.
+pub mod parse_workbook_response {
+    /// Exactly one per message.
+    ///
+    /// Unknown variants must be ignored rather than treated as failures: this
+    /// oneof is the extension point, and a later server may add events an older
+    /// client has no name for.
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Event {
+        /// Always the first event, sent exactly once.
+        #[prost(message, tag="1")]
+        Metadata(super::WorkbookMetadata),
+        /// All defined names, sent once when asked for.
+        #[prost(message, tag="2")]
+        DefinedNames(super::WorkbookDefinedNames),
+        /// One event of a sheet's range part.
+        #[prost(message, tag="3")]
+        Range(super::SheetRangeEvent),
+        /// One event of a sheet's formula part.
+        #[prost(message, tag="4")]
+        Formula(super::SheetFormulaEvent),
+        /// One event of the pictures part.
+        #[prost(message, tag="5")]
+        Picture(super::GetPicturesResponse),
+        /// One event of the VBA part.
+        #[prost(message, tag="6")]
+        Vba(super::StreamVbaProjectResponse),
+        /// Always the last event of a stream that did not fail.
+        #[prost(message, tag="7")]
+        Done(super::ParseWorkbookDone),
+    }
+}
+/// WorkbookMetadata is the first event of a `ParseWorkbook` stream.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkbookMetadata {
+    /// The format the workbook was opened as. Never
+    /// `WORKBOOK_FORMAT_UNSPECIFIED`.
+    #[prost(enumeration="WorkbookFormat", tag="1")]
+    pub detected_format: i32,
+    /// Workbook metadata: sheets (in workbook order) and defined names.
+    #[prost(message, optional, tag="2")]
+    pub metadata: ::core::option::Option<Metadata>,
+}
+/// WorkbookDefinedNames carries every defined name of the workbook.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkbookDefinedNames {
+    /// All defined names, mirroring `Reader::defined_names`.
+    #[prost(message, repeated, tag="1")]
+    pub defined_names: ::prost::alloc::vec::Vec<DefinedName>,
+}
+/// SheetRangeEvent is one event of one sheet's range part.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SheetRangeEvent {
+    /// Zero-based position of the sheet in workbook order.
+    #[prost(uint32, tag="1")]
+    pub sheet_index: u32,
+    /// The event, exactly as `StreamWorksheetRange` would send it. A part
+    /// starts with its `started` event.
+    #[prost(message, optional, tag="2")]
+    pub event: ::core::option::Option<StreamWorksheetRangeResponse>,
+}
+/// SheetFormulaEvent is one event of one sheet's formula part.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SheetFormulaEvent {
+    /// Zero-based position of the sheet in workbook order.
+    #[prost(uint32, tag="1")]
+    pub sheet_index: u32,
+    /// The event, exactly as `StreamWorksheetFormula` would send it. A part
+    /// starts with its `started` event.
+    #[prost(message, optional, tag="2")]
+    pub event: ::core::option::Option<StreamWorksheetFormulaResponse>,
+}
+/// ParseWorkbookDone is the last event of a `ParseWorkbook` stream that did
+/// not fail.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ParseWorkbookDone {
+    /// True when the client cancelled; the counts then cover what was sent
+    /// before the cancel took effect.
+    #[prost(bool, tag="1")]
+    pub cancelled: bool,
+    /// Sheets whose range part ended without a terminal in-band error.
+    #[prost(uint32, tag="2")]
+    pub range_sheets: u32,
+    /// Sheets whose formula part ended without a terminal in-band error.
+    #[prost(uint32, tag="3")]
+    pub formula_sheets: u32,
+    /// Pictures sent.
+    #[prost(uint32, tag="4")]
+    pub pictures: u32,
+    /// VBA modules sent.
+    #[prost(uint32, tag="5")]
+    pub vba_modules: u32,
+    /// In-band `StreamError` events sent across every part.
+    #[prost(uint32, tag="6")]
+    pub part_errors: u32,
+}
 include!("calamine.v1.tonic.rs");
 // @@protoc_insertion_point(module)

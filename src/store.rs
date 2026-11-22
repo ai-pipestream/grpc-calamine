@@ -851,6 +851,45 @@ impl WorkbookStore {
         format_hint: pb::WorkbookFormat,
         header_row: Option<HeaderRow>,
     ) -> Result<(String, Arc<WorkbookEntry>), StoreError> {
+        let (reservation, entry) = self.parse(bytes, format_hint, header_row)?;
+        let id = reservation.register(Arc::clone(&entry));
+        Ok((id, entry))
+    }
+
+    /// Parse `bytes` as a workbook and run `read` on it without registering
+    /// it, so no id ever exists and nothing outlives the call.
+    ///
+    /// The workbook is charged against the store's limits exactly as an open
+    /// one is, a slot under the workbook cap included, for as long as `read`
+    /// runs, and released when it returns or unwinds. This is blocking CPU
+    /// work; callers must run it inside `tokio::task::spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// As [`WorkbookStore::open`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store lock was poisoned by a panic on another thread.
+    pub fn with_transient<R>(
+        &self,
+        bytes: Vec<u8>,
+        format_hint: pb::WorkbookFormat,
+        header_row: Option<HeaderRow>,
+        read: impl FnOnce(&WorkbookEntry) -> R,
+    ) -> Result<R, StoreError> {
+        let (_reservation, entry) = self.parse(bytes, format_hint, header_row)?;
+        Ok(read(&entry))
+    }
+
+    /// Parse `bytes` as a workbook under a reservation the caller either
+    /// registers or drops.
+    fn parse(
+        &self,
+        bytes: Vec<u8>,
+        format_hint: pb::WorkbookFormat,
+        header_row: Option<HeaderRow>,
+    ) -> Result<(Reservation<'_>, Arc<WorkbookEntry>), StoreError> {
         // A refused format is refused before anything is parsed: what calamine
         // builds while opening some formats is the reason to refuse them.
         if format_hint != pb::WorkbookFormat::Unspecified && !self.formats.accepts(format_hint) {
@@ -959,8 +998,7 @@ impl WorkbookStore {
             last_used: Mutex::new(Instant::now()),
         });
 
-        let id = reservation.register(Arc::clone(&entry));
-        Ok((id, entry))
+        Ok((reservation, entry))
     }
 
     /// Open `bytes` as the first format this store accepts that they open
@@ -1242,6 +1280,26 @@ mod tests {
             .err()
             .expect("garbage does not parse");
         assert!(matches!(refused, StoreError::Unreadable(_)));
+        assert_eq!(store.held_bytes(), 0);
+        open(&store, "date.xlsx").expect("the only slot is free again");
+    }
+
+    /// A transient workbook is charged while it is read, never gets an id,
+    /// and gives everything back when the read returns.
+    #[test]
+    fn a_transient_workbook_holds_room_only_while_read() {
+        let store = WorkbookStore::with_limits(limits(1, u64::MAX, TTL));
+        let bytes = fixture("date.xlsx");
+        let sheets = store
+            .with_transient(bytes, pb::WorkbookFormat::Unspecified, None, |entry| {
+                assert!(store.held_bytes() > 0, "charged while read");
+                assert!(store.is_empty(), "never registered");
+                let refused = open(&store, "date.xlsx").err().expect("the slot is taken");
+                assert!(matches!(refused, StoreError::Limit(_)));
+                entry.metadata.sheets.len()
+            })
+            .expect("opens");
+        assert!(sheets > 0);
         assert_eq!(store.held_bytes(), 0);
         open(&store, "date.xlsx").expect("the only slot is free again");
     }

@@ -302,6 +302,32 @@ pub mod calamine_service_client {
                 .insert(GrpcMethod::new("calamine.v1.CalamineService", "GetPictures"));
             self.inner.server_streaming(req, path, codec).await
         }
+        pub async fn parse_workbook(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<
+                Message = super::ParseWorkbookRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::ParseWorkbookResponse>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/calamine.v1.CalamineService/ParseWorkbook",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("calamine.v1.CalamineService", "ParseWorkbook"));
+            self.inner.streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -404,6 +430,19 @@ pub mod calamine_service_server {
             request: tonic::Request<super::GetPicturesRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::GetPicturesStream>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the ParseWorkbook method.
+        type ParseWorkbookStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::ParseWorkbookResponse, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn parse_workbook(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::ParseWorkbookRequest>>,
+        ) -> std::result::Result<
+            tonic::Response<Self::ParseWorkbookStream>,
             tonic::Status,
         >;
     }
@@ -859,6 +898,55 @@ pub mod calamine_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/calamine.v1.CalamineService/ParseWorkbook" => {
+                    #[allow(non_camel_case_types)]
+                    struct ParseWorkbookSvc<T: CalamineService>(pub Arc<T>);
+                    impl<
+                        T: CalamineService,
+                    > tonic::server::StreamingService<super::ParseWorkbookRequest>
+                    for ParseWorkbookSvc<T> {
+                        type Response = super::ParseWorkbookResponse;
+                        type ResponseStream = T::ParseWorkbookStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::ParseWorkbookRequest>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as CalamineService>::parse_workbook(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ParseWorkbookSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

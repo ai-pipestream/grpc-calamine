@@ -9,6 +9,11 @@
 // client-streaming), receives a `workbook_id`, and then issues any number of
 // read RPCs against that handle. Handles are independent, so many clients
 // (or one client with many workbooks) can stream concurrently.
+//
+// `ParseWorkbook` is the handle-free alternative: one bidirectional stream
+// carries the upload in and every requested part of the workbook out, and
+// the workbook lives exactly as long as that stream. Nothing is left on the
+// server for a client that goes away.
 
 syntax = "proto3";
 
@@ -77,6 +82,45 @@ service CalamineService {
   // compile-time requirement rather than a runtime one, so this RPC has no
   // "unsupported" outcome.
   rpc GetPictures(GetPicturesRequest) returns (stream GetPicturesResponse);
+
+  // Uploads a workbook and streams the parts the caller asked for, chunks in
+  // and events out, with no handle and no server-side state past the stream.
+  //
+  // The first request message must carry `open`; every subsequent message
+  // carries a `chunk` of the file bytes, in order. The upload ends with the
+  // first chunk marked `last`, or when the client half-closes. A client that
+  // marks `last` may keep its side open and send `cancel` at any point; one
+  // that half-closes can still cancel the call itself.
+  //
+  // A successful stream is exactly: one `metadata`; then one `defined_names`
+  // if asked for; then, for every selected sheet in selection order, its
+  // `range` events if asked for, followed by its `formula` events if asked
+  // for; then the `picture` events if asked for; then the `vba` events if
+  // asked for; then one `done`. Each part's events are exactly what the
+  // per-part RPC (`StreamWorksheetRange`, `StreamWorksheetFormula`,
+  // `GetPictures`, `StreamVbaProject`) would send for the same workbook, so
+  // an in-band `StreamError` marked `terminal` ends that one part and the
+  // stream moves on to the next.
+  //
+  // A cancelled stream stops at the next event boundary and ends with a
+  // `done` whose `cancelled` is set. A failed stream ends with a gRPC status
+  // and no `done`:
+  //
+  //   INVALID_ARGUMENT    the frames break the order above, or the bytes are
+  //                       not a workbook
+  //   NOT_FOUND           a sheet selector names no sheet of the workbook
+  //   RESOURCE_EXHAUSTED  the upload, the server's store budget, or a part's
+  //                       dense-cell or formula-byte budget was exceeded, or
+  //                       the upload or stream caps are full
+  //   FAILED_PRECONDITION the server does not accept the workbook's format
+  //   DEADLINE_EXCEEDED   the client sent nothing for the stall limit during
+  //                       the upload, the upload took longer than its
+  //                       deadline, or the client read nothing for the stall
+  //                       limit
+  //   INTERNAL            a bug here; the parser panicked
+  //
+  // Events already delivered before a failure remain valid.
+  rpc ParseWorkbook(stream ParseWorkbookRequest) returns (stream ParseWorkbookResponse);
 }
 
 // WorkbookOptions carries the open-time settings for `OpenWorkbook`.
@@ -493,4 +537,189 @@ message GetPicturesResponse {
     // An in-band error.
     StreamError error = 2;
   }
+}
+
+// ParseWorkbookRequest is one frame of the `ParseWorkbook` request stream.
+message ParseWorkbookRequest {
+  // Exactly one per message, in the order the RPC documents.
+  oneof frame {
+    // What to emit. First frame only; sending it twice is an error.
+    ParseWorkbookOpen open = 1;
+
+    // A chunk of the workbook file bytes, in order.
+    WorkbookChunk chunk = 2;
+
+    // Stop the parse. Allowed at any point after `open`.
+    ParseWorkbookCancel cancel = 3;
+  }
+}
+
+// ParseWorkbookOpen carries the open-time settings and the selection of parts
+// for `ParseWorkbook`. Workbook metadata is always emitted; every other part
+// is emitted only when its flag is set.
+message ParseWorkbookOpen {
+  // Format hint and header row selection, exactly as for `OpenWorkbook`.
+  WorkbookOptions options = 1;
+
+  // Emit every selected sheet's cell data as `range` events.
+  bool emit_ranges = 2;
+
+  // Emit every selected sheet's formulas as `formula` events.
+  bool emit_formulas = 3;
+
+  // Emit the workbook's defined names as one `defined_names` event.
+  bool emit_defined_names = 4;
+
+  // Emit every embedded picture as `picture` events.
+  bool emit_pictures = 5;
+
+  // Emit the VBA project as `vba` events.
+  bool emit_vba = 6;
+
+  // The sheets whose ranges and formulas are emitted, in emission order.
+  // Empty selects every sheet in workbook order. A selector that names no
+  // sheet of the workbook fails the stream with NOT_FOUND before any part.
+  repeated SheetSelector sheets = 7;
+
+  // Range stream settings, with the meaning they have on
+  // `StreamWorksheetRangeRequest`.
+  ParseWorkbookRangeOptions range_options = 8;
+
+  // Caller-side limits. Each can only tighten the server's own.
+  ParseWorkbookLimits limits = 9;
+}
+
+// ParseWorkbookRangeOptions carries the `StreamWorksheetRangeRequest`
+// settings that apply to every `range` part of a `ParseWorkbook` stream.
+message ParseWorkbookRangeOptions {
+  // See `StreamWorksheetRangeRequest.max_rows_per_message`.
+  uint32 max_rows_per_message = 1;
+
+  // See `StreamWorksheetRangeRequest.use_string_table`. The table belongs to
+  // one sheet's range part, never to the whole stream.
+  bool use_string_table = 2;
+
+  // See `StreamWorksheetRangeRequest.include_formulas`.
+  bool include_formulas = 3;
+}
+
+// ParseWorkbookLimits lets a caller tighten the server's limits for one
+// `ParseWorkbook` stream. Zero means the server's own limit; a value above
+// it is clamped to it.
+message ParseWorkbookLimits {
+  // Largest upload accepted, in bytes.
+  uint64 max_workbook_bytes = 1;
+
+  // Most cells one range or formula part may densify, counted from column A.
+  uint64 max_dense_cells = 2;
+
+  // Most formula bytes one xlsx or xlsb formula part may collect.
+  uint64 max_formula_bytes = 3;
+}
+
+// WorkbookChunk is one piece of the uploaded workbook file.
+message WorkbookChunk {
+  // File bytes. Chunks are concatenated in stream order. Empty only on the
+  // chunk marked `last`, which may carry nothing but the marker.
+  bytes data = 1;
+
+  // True on the final chunk. The upload also ends when the client
+  // half-closes, so a client that half-closes need never set it.
+  bool last = 2;
+}
+
+// ParseWorkbookCancel asks the server to stop a `ParseWorkbook` stream.
+message ParseWorkbookCancel {
+  // Free-form reason, for the server's own diagnostics only.
+  string reason = 1;
+}
+
+// ParseWorkbookResponse is one event of the `ParseWorkbook` stream.
+message ParseWorkbookResponse {
+  // Exactly one per message.
+  //
+  // Unknown variants must be ignored rather than treated as failures: this
+  // oneof is the extension point, and a later server may add events an older
+  // client has no name for.
+  oneof event {
+    // Always the first event, sent exactly once.
+    WorkbookMetadata metadata = 1;
+
+    // All defined names, sent once when asked for.
+    WorkbookDefinedNames defined_names = 2;
+
+    // One event of a sheet's range part.
+    SheetRangeEvent range = 3;
+
+    // One event of a sheet's formula part.
+    SheetFormulaEvent formula = 4;
+
+    // One event of the pictures part.
+    GetPicturesResponse picture = 5;
+
+    // One event of the VBA part.
+    StreamVbaProjectResponse vba = 6;
+
+    // Always the last event of a stream that did not fail.
+    ParseWorkbookDone done = 7;
+  }
+}
+
+// WorkbookMetadata is the first event of a `ParseWorkbook` stream.
+message WorkbookMetadata {
+  // The format the workbook was opened as. Never
+  // `WORKBOOK_FORMAT_UNSPECIFIED`.
+  WorkbookFormat detected_format = 1;
+
+  // Workbook metadata: sheets (in workbook order) and defined names.
+  Metadata metadata = 2;
+}
+
+// WorkbookDefinedNames carries every defined name of the workbook.
+message WorkbookDefinedNames {
+  // All defined names, mirroring `Reader::defined_names`.
+  repeated DefinedName defined_names = 1;
+}
+
+// SheetRangeEvent is one event of one sheet's range part.
+message SheetRangeEvent {
+  // Zero-based position of the sheet in workbook order.
+  uint32 sheet_index = 1;
+
+  // The event, exactly as `StreamWorksheetRange` would send it. A part
+  // starts with its `started` event.
+  StreamWorksheetRangeResponse event = 2;
+}
+
+// SheetFormulaEvent is one event of one sheet's formula part.
+message SheetFormulaEvent {
+  // Zero-based position of the sheet in workbook order.
+  uint32 sheet_index = 1;
+
+  // The event, exactly as `StreamWorksheetFormula` would send it. A part
+  // starts with its `started` event.
+  StreamWorksheetFormulaResponse event = 2;
+}
+
+// ParseWorkbookDone is the last event of a `ParseWorkbook` stream that did
+// not fail.
+message ParseWorkbookDone {
+  // True when the client cancelled; the counts then cover what was sent
+  // before the cancel took effect.
+  bool cancelled = 1;
+
+  // Sheets whose range part ended without a terminal in-band error.
+  uint32 range_sheets = 2;
+
+  // Sheets whose formula part ended without a terminal in-band error.
+  uint32 formula_sheets = 3;
+
+  // Pictures sent.
+  uint32 pictures = 4;
+
+  // VBA modules sent.
+  uint32 vba_modules = 5;
+
+  // In-band `StreamError` events sent across every part.
+  uint32 part_errors = 6;
 }

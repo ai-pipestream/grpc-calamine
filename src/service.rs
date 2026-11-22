@@ -19,6 +19,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+mod parse_workbook;
+
 use crate::convert;
 use crate::proto::v1 as pb;
 use crate::proto::v1::calamine_service_server::{CalamineService, CalamineServiceServer};
@@ -353,12 +355,7 @@ impl CalamineGrpc {
                 "first upload frame must carry `options`",
             ));
         };
-        let format_hint = pb::WorkbookFormat::try_from(options.format_hint)
-            .map_err(|_| Status::invalid_argument("unknown format_hint value"))?;
-        let header_row = options.header_row.map(|hr| match hr.selection {
-            Some(pb::header_row::Selection::RowIndex(i)) => HeaderRow::Row(i),
-            _ => HeaderRow::FirstNonEmptyRow,
-        });
+        let (format_hint, header_row) = open_options(&options)?;
 
         // Remaining frames are file bytes; held in memory only.
         let mut bytes = Vec::new();
@@ -372,19 +369,7 @@ impl CalamineGrpc {
                     ));
                 }
                 Some(pb::open_workbook_request::Payload::Chunk(chunk)) => {
-                    let len = bytes.len() + chunk.len();
-                    if len > self.max_workbook_bytes {
-                        return Err(Status::resource_exhausted(format!(
-                            "workbook exceeds the {} byte limit",
-                            self.max_workbook_bytes
-                        )));
-                    }
-                    // Refused as soon as it cannot fit, not after it has been
-                    // buffered whole only to be turned away.
-                    self.store
-                        .admits(len as u64)
-                        .map_err(|limit| Status::resource_exhausted(limit.to_string()))?;
-                    bytes.extend_from_slice(&chunk);
+                    accept_chunk(&self.store, self.max_workbook_bytes, &mut bytes, &chunk)?;
                 }
                 _ => {
                     return Err(Status::invalid_argument(
@@ -506,12 +491,65 @@ fn resolve_sheet_name(
     }
 }
 
+/// The format hint and header row selection of an upload's options.
+fn open_options(
+    options: &pb::WorkbookOptions,
+) -> Result<(pb::WorkbookFormat, Option<HeaderRow>), Status> {
+    let format_hint = pb::WorkbookFormat::try_from(options.format_hint)
+        .map_err(|_| Status::invalid_argument("unknown format_hint value"))?;
+    let header_row = options.header_row.map(|hr| match hr.selection {
+        Some(pb::header_row::Selection::RowIndex(i)) => HeaderRow::Row(i),
+        _ => HeaderRow::FirstNonEmptyRow,
+    });
+    Ok((format_hint, header_row))
+}
+
+/// Append one upload chunk to `bytes`, or refuse the upload once it passes
+/// `max` or no longer fits in the store.
+fn accept_chunk(
+    store: &WorkbookStore,
+    max: usize,
+    bytes: &mut Vec<u8>,
+    chunk: &[u8],
+) -> Result<(), Status> {
+    let len = bytes.len() + chunk.len();
+    if len > max {
+        return Err(Status::resource_exhausted(format!(
+            "workbook exceeds the {max} byte limit"
+        )));
+    }
+    // Refused as soon as it cannot fit, not after it has been buffered whole
+    // only to be turned away.
+    store
+        .admits(len as u64)
+        .map_err(|limit| Status::resource_exhausted(limit.to_string()))?;
+    bytes.extend_from_slice(chunk);
+    Ok(())
+}
+
+/// The status a workbook that does not open is refused with.
+fn store_error_status(e: StoreError) -> Status {
+    match e {
+        StoreError::Limit(limit) => Status::resource_exhausted(limit.to_string()),
+        StoreError::Unreadable(e) => Status::invalid_argument(format!("cannot open workbook: {e}")),
+        StoreError::Malformed { part, detail } => {
+            Status::invalid_argument(format!("cannot open workbook: {part}: {detail}"))
+        }
+        refused @ StoreError::FormatRefused { .. } => {
+            Status::failed_precondition(format!("cannot open workbook: {refused}"))
+        }
+        unknown @ StoreError::NoAcceptedFormat { .. } => {
+            Status::invalid_argument(format!("cannot open workbook: {unknown}"))
+        }
+    }
+}
+
 /// The next upload frame, or `DEADLINE_EXCEEDED` once the client has sent
 /// nothing for `stall`.
-async fn next_frame(
-    stream: &mut Streaming<pb::OpenWorkbookRequest>,
+async fn next_frame<T>(
+    stream: &mut Streaming<T>,
     stall: std::time::Duration,
-) -> Result<Option<pb::OpenWorkbookRequest>, Status> {
+) -> Result<Option<T>, Status> {
     match tokio::time::timeout(stall, stream.message()).await {
         Ok(frame) => frame,
         Err(_) => Err(Status::deadline_exceeded(format!(
@@ -564,6 +602,22 @@ where
     F: FnOnce(mpsc::Sender<Result<T, Status>>) + Send + 'static,
 {
     let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
+    let _supervisor = spawn_blocking_onto(permit, tx, body);
+    Response::new(ReceiverStream::new(rx))
+}
+
+/// [`spawn_blocking_stream`] onto a channel the caller already holds. The
+/// returned task ends once the body has finished and any terminal status has
+/// been delivered.
+fn spawn_blocking_onto<T, F>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    tx: mpsc::Sender<Result<T, Status>>,
+    body: F,
+) -> tokio::task::JoinHandle<()>
+where
+    T: Send + 'static,
+    F: FnOnce(mpsc::Sender<Result<T, Status>>) + Send + 'static,
+{
     let supervisor = tx.clone();
     let handle = tokio::task::spawn_blocking(move || {
         // Pool threads are reused, so never trust what the last body left.
@@ -582,8 +636,7 @@ where
             let _ = supervisor.send(Err(status)).await;
         }
         drop(permit);
-    });
-    Response::new(ReceiverStream::new(rx))
+    })
 }
 
 /// Render a `JoinError` into a message worth putting on the wire.
@@ -2068,21 +2121,7 @@ impl CalamineService for CalamineGrpc {
         })
         .await
         .map_err(|e| Status::internal(format!("parser task failed: {e}")))?
-        .map_err(|e| match e {
-            StoreError::Limit(limit) => Status::resource_exhausted(limit.to_string()),
-            StoreError::Unreadable(e) => {
-                Status::invalid_argument(format!("cannot open workbook: {e}"))
-            }
-            StoreError::Malformed { part, detail } => {
-                Status::invalid_argument(format!("cannot open workbook: {part}: {detail}"))
-            }
-            refused @ StoreError::FormatRefused { .. } => {
-                Status::failed_precondition(format!("cannot open workbook: {refused}"))
-            }
-            unknown @ StoreError::NoAcceptedFormat { .. } => {
-                Status::invalid_argument(format!("cannot open workbook: {unknown}"))
-            }
-        })?;
+        .map_err(store_error_status)?;
 
         Ok(Response::new(pb::OpenWorkbookResponse {
             workbook_id: id,
@@ -2204,6 +2243,30 @@ impl CalamineService for CalamineGrpc {
         Ok(spawn_blocking_stream(permit, move |tx| {
             run_get_pictures(&entry, &tx);
         }))
+    }
+
+    type ParseWorkbookStream = ReceiverStream<Result<pb::ParseWorkbookResponse, Status>>;
+
+    async fn parse_workbook(
+        &self,
+        request: Request<Streaming<pb::ParseWorkbookRequest>>,
+    ) -> Result<Response<Self::ParseWorkbookStream>, Status> {
+        // Both slots are taken before a single frame is read, so a refused
+        // call has buffered nothing: the upload slot until the workbook is
+        // parsed, as for `OpenWorkbook`, and a stream slot for the parts.
+        let upload_permit = self.admit_upload()?;
+        let stream_permit = self.admit()?;
+        let job = parse_workbook::ParseJob {
+            store: Arc::clone(&self.store),
+            upload_stall: self.upload_stall,
+            upload_deadline: self.upload_deadline,
+            max_workbook_bytes: self.max_workbook_bytes,
+            max_dense_cells: self.max_dense_cells,
+            max_formula_bytes: self.max_formula_bytes,
+        };
+        let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
+        tokio::spawn(job.run(request.into_inner(), upload_permit, stream_permit, tx));
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 

@@ -830,7 +830,7 @@ fn abort_with<T: StreamResponse>(
 fn range_header<T: CellType>(
     sheet_name: &str,
     range: &Range<T>,
-    merged_regions: Vec<pb::Dimensions>,
+    merges: Merges,
 ) -> pb::RangeStarted {
     match (range.start(), range.end()) {
         (Some(start), Some(end)) => {
@@ -842,7 +842,8 @@ fn range_header<T: CellType>(
                     end: Some(convert::cell_position(end)),
                 }),
                 total_cells: (height * width) as u64,
-                merged_regions,
+                merged_regions: merges.regions,
+                merged_regions_unavailable: merges.unavailable,
                 ..Default::default()
             }
         }
@@ -850,7 +851,8 @@ fn range_header<T: CellType>(
             sheet_name: sheet_name.to_string(),
             dimensions: None,
             total_cells: 0,
-            merged_regions,
+            merged_regions: merges.regions,
+            merged_regions_unavailable: merges.unavailable,
             ..Default::default()
         },
     }
@@ -861,13 +863,14 @@ fn range_header<T: CellType>(
 fn declared_header(
     sheet_name: &str,
     dims: calamine::Dimensions,
-    merged_regions: Vec<pb::Dimensions>,
+    merges: Merges,
 ) -> pb::RangeStarted {
     pb::RangeStarted {
         sheet_name: sheet_name.to_string(),
         dimensions: Some(convert::dimensions(dims)),
         total_cells: declared_total_cells(dims),
-        merged_regions,
+        merged_regions: merges.regions,
+        merged_regions_unavailable: merges.unavailable,
         ..Default::default()
     }
 }
@@ -1279,7 +1282,7 @@ fn formula_row(row_index: u32, formulas: Vec<String>) -> pb::StreamWorksheetForm
 fn emit_range(
     sheet_name: &str,
     range: &Range<Data>,
-    merged_regions: Vec<pb::Dimensions>,
+    merges: Merges,
     is_1904: bool,
     max_dense_cells: u64,
     batcher: &mut RowBatcher,
@@ -1291,7 +1294,7 @@ fn emit_range(
     }
     if !send_event(
         tx,
-        range_started(batcher.header(range_header(sheet_name, range, merged_regions))),
+        range_started(batcher.header(range_header(sheet_name, range, merges))),
     ) {
         return;
     }
@@ -1562,25 +1565,41 @@ fn cell_tuple(
     (row, col, convert::cell_data(value))
 }
 
+/// A sheet's merged areas for its `RangeStarted` header, or the fact that
+/// they could not be read.
+#[derive(Clone, Default)]
+struct Merges {
+    /// The areas the sheet declares. Empty when it declares none, and when
+    /// `unavailable` is set.
+    regions: Vec<pb::Dimensions>,
+    /// The merge list failed to read, so `regions` is unknown, not empty.
+    unavailable: bool,
+}
+
 /// The merged cell areas a sheet declares, for its `RangeStarted` header.
-/// XLS and XLSX declare them; XLSB and ODS reads have none to report. A
-/// sheet whose merge list cannot be read streams without merges: the cells
-/// are the contract, and a merge read that fails will fail the cell read of
-/// the same part as well.
-fn merged_regions(
-    workbook: &mut crate::store::WorkbookReader,
-    sheet_name: &str,
-) -> Vec<pb::Dimensions> {
+/// XLS and XLSX declare them; XLSB and ODS reads have none to report.
+///
+/// A sheet whose merge list cannot be read still streams: the cells are the
+/// contract. But the failure is carried to the header, because it does not
+/// always fail the cell read too. In XLSX the `mergeCells` block sits after
+/// `sheetData`, so a sheet damaged only there streams every cell, and an
+/// empty list would tell a table rebuild that no cell spans another.
+fn merged_regions(workbook: &mut crate::store::WorkbookReader, sheet_name: &str) -> Merges {
     let areas = match workbook {
-        Sheets::Xlsx(xlsx) => xlsx
-            .merge_cells_by_sheet_name(sheet_name)
-            .unwrap_or_default(),
-        Sheets::Xls(xls) => xls
-            .merge_cells_by_sheet_name(sheet_name)
-            .unwrap_or_default(),
-        _ => Vec::new(),
+        Sheets::Xlsx(xlsx) => xlsx.merge_cells_by_sheet_name(sheet_name).map_err(|_| ()),
+        Sheets::Xls(xls) => xls.merge_cells_by_sheet_name(sheet_name).map_err(|_| ()),
+        _ => Ok(Vec::new()),
     };
-    areas.into_iter().map(convert::dimensions).collect()
+    match areas {
+        Ok(areas) => Merges {
+            regions: areas.into_iter().map(convert::dimensions).collect(),
+            unavailable: false,
+        },
+        Err(()) => Merges {
+            regions: Vec::new(),
+            unavailable: true,
+        },
+    }
 }
 
 /// The blocking body of `StreamWorksheetRange`.
@@ -1987,7 +2006,7 @@ fn run_stream_worksheet_formula(
     }
     if !send_event(
         tx,
-        formula_started(range_header(&sheet_name, &range, Vec::new())),
+        formula_started(range_header(&sheet_name, &range, Merges::default())),
     ) {
         return;
     }

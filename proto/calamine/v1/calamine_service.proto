@@ -305,6 +305,12 @@ message RangeStarted {
   // XLS and XLSX declare merges; XLSB and ODS reads report none, and a
   // formula stream never carries them.
   repeated Dimensions merged_regions = 4;
+
+  // True when the sheet's merge list could not be read, so `merged_regions`
+  // is empty because it is unknown and not because the sheet has no merges.
+  // The cells still stream. A consumer that rebuilds tables should treat the
+  // spans of such a sheet as unknown.
+  bool merged_regions_unavailable = 7;
 }
 
 // WorksheetRow is one streamed row of cell values.

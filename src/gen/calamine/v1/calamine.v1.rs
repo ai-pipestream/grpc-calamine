@@ -960,6 +960,12 @@ pub struct RangeStarted {
     /// formula stream never carries them.
     #[prost(message, repeated, tag="4")]
     pub merged_regions: ::prost::alloc::vec::Vec<Dimensions>,
+    /// True when the sheet's merge list could not be read, so `merged_regions`
+    /// is empty because it is unknown and not because the sheet has no merges.
+    /// The cells still stream. A consumer that rebuilds tables should treat the
+    /// spans of such a sheet as unknown.
+    #[prost(bool, tag="7")]
+    pub merged_regions_unavailable: bool,
 }
 /// WorksheetRow is one streamed row of cell values.
 ///

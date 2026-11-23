@@ -275,7 +275,9 @@ events define each distinct string once, cells carry `shared_string_id`,
 and every id is defined before the first row that references it. The
 dictionary is XLSX/XLSB only; other formats accept the flag unchanged.
 The header also lists the sheet's merged cell areas (`merged_regions`) for
-XLS and XLSX; a merged area's value sits at its top-left cell.
+XLS, XLSX and XLSB; a merged area's value sits at its top-left cell.
+calamine does not read ODS spans, so an ODS header sets
+`merged_regions_unavailable` instead of claiming the sheet has none.
 
 Close handles when you are done with them. One left open is closed for you
 once it has been idle for the TTL (five minutes by default), but until then

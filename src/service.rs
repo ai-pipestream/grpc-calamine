@@ -1577,7 +1577,9 @@ struct Merges {
 }
 
 /// The merged cell areas a sheet declares, for its `RangeStarted` header.
-/// XLS and XLSX declare them; XLSB and ODS reads have none to report.
+/// XLS, XLSX and XLSB declare them. calamine does not read ODS spans
+/// (`table:number-columns-spanned`), so an ODS sheet's merges are unknown
+/// and reported as unavailable, never as an empty list.
 ///
 /// A sheet whose merge list cannot be read still streams: the cells are the
 /// contract. But the failure is carried to the header, because it does not
@@ -1588,7 +1590,8 @@ fn merged_regions(workbook: &mut crate::store::WorkbookReader, sheet_name: &str)
     let areas = match workbook {
         Sheets::Xlsx(xlsx) => xlsx.merge_cells_by_sheet_name(sheet_name).map_err(|_| ()),
         Sheets::Xls(xls) => xls.merge_cells_by_sheet_name(sheet_name).map_err(|_| ()),
-        _ => Ok(Vec::new()),
+        Sheets::Xlsb(xlsb) => xlsb.merge_cells_by_sheet_name(sheet_name).map_err(|_| ()),
+        Sheets::Ods(_) => Err(()),
     };
     match areas {
         Ok(areas) => Merges {

@@ -2883,15 +2883,23 @@ fn merged_areas(header: &pb::RangeStarted) -> Vec<(u32, u32, u32, u32)> {
 async fn range_header_carries_merged_regions() {
     let client = start_server().await;
     let want = vec![(0, 0, 0, 1), (1, 0, 3, 0), (1, 1, 3, 3)];
-    for file in ["merge_cells.xlsx", "merge_cells.xls"] {
+    for file in ["merge_cells.xlsx", "merge_cells.xls", "merge_cells.xlsb"] {
         let opened = upload(&client, file).await;
         let (header, _) = stream_range(&client, &opened.workbook_id, 0).await;
         assert_eq!(merged_areas(&header), want, "{file}");
+        assert!(!header.merged_regions_unavailable, "{file}");
     }
     // A sheet without merges reports none.
     let opened = upload(&client, "date.xlsx").await;
     let (header, _) = stream_range(&client, &opened.workbook_id, 0).await;
     assert!(header.merged_regions.is_empty());
+    assert!(!header.merged_regions_unavailable);
+    // calamine does not read ODS spans, so an ODS sheet's merges are
+    // unknown, and the header says so rather than claiming there are none.
+    let opened = upload(&client, "date.ods").await;
+    let (header, _) = stream_range(&client, &opened.workbook_id, 0).await;
+    assert!(header.merged_regions.is_empty());
+    assert!(header.merged_regions_unavailable, "ODS spans are not read");
 }
 
 /// Preserve original document-property strings and optional presence on both APIs.

@@ -956,8 +956,9 @@ pub struct RangeStarted {
     /// The sheet's merged cell areas, in absolute coordinates, as the workbook
     /// declares them (`merge_cells_by_sheet_name`). The value of a merged area
     /// sits at its top-left cell; the other cells of the area stream as empty.
-    /// XLS and XLSX declare merges; XLSB and ODS reads report none, and a
-    /// formula stream never carries them.
+    /// XLS, XLSX and XLSB declare merges; a formula stream never carries them.
+    /// ODS spans are not read, so an ODS sheet sets
+    /// `merged_regions_unavailable`.
     #[prost(message, repeated, tag="4")]
     pub merged_regions: ::prost::alloc::vec::Vec<Dimensions>,
     /// True when the sheet's merge list could not be read, so `merged_regions`

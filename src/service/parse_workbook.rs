@@ -20,9 +20,9 @@ use tokio::sync::mpsc;
 use tonic::{Status, Streaming};
 
 use super::{
-    CONSUMER_STALL, STALL_REASON, STREAM_CHANNEL_CAPACITY, accept_chunk, next_frame, open_options,
-    run_get_pictures, run_stream_vba_project, run_stream_worksheet_formula,
-    run_stream_worksheet_range, send_event, store_error_status,
+    CONSUMER_STALL, STALL_REASON, STREAM_CHANNEL_CAPACITY, TERMINAL_FAILURE, accept_chunk,
+    next_frame, open_options, run_get_pictures, run_stream_vba_project,
+    run_stream_worksheet_formula, run_stream_worksheet_range, send_event, store_error_status,
 };
 use crate::proto::v1 as pb;
 use crate::store::{WorkbookEntry, WorkbookStore};
@@ -395,6 +395,10 @@ fn forward_part<T: PartEvent>(
     });
     body(&inner_tx);
     drop(inner_tx);
+    // A part that failed for good has said so in band, and the tally counts
+    // it. In this RPC that ends the part, not the stream, so the status a
+    // per-part RPC would end with is dropped here rather than delivered.
+    TERMINAL_FAILURE.with(|failure| *failure.borrow_mut() = None);
     let (part, outcome) = runtime
         .block_on(forwarder)
         .unwrap_or_else(|_| (Tally::default(), Err(Halt::Ended)));

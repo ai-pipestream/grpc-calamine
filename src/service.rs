@@ -622,8 +622,13 @@ where
     let handle = tokio::task::spawn_blocking(move || {
         // Pool threads are reused, so never trust what the last body left.
         STALL_REASON.with(|reason| *reason.borrow_mut() = None);
+        TERMINAL_FAILURE.with(|failure| *failure.borrow_mut() = None);
         body(tx);
-        STALL_REASON.with(|reason| reason.borrow_mut().take())
+        // A consumer that stopped reading outranks a parse failure: it is the
+        // reason the stream is ending, and the client never saw the other.
+        let stalled = STALL_REASON.with(|reason| reason.borrow_mut().take());
+        let failed = TERMINAL_FAILURE.with(|failure| failure.borrow_mut().take());
+        stalled.or(failed)
     });
     tokio::spawn(async move {
         let status = match handle.await {
@@ -663,6 +668,16 @@ thread_local! {
     /// an abandoned stream ends with a status instead of looking like a sheet
     /// that simply stopped.
     static STALL_REASON: RefCell<Option<Status>> = const { RefCell::new(None) };
+
+    /// The status a stream must end with because its parse failed for good.
+    ///
+    /// [`abort_with`] sends the typed error in band and records the status
+    /// here; the supervisor of a per-part RPC delivers it once the body has
+    /// returned, so the call ends non-OK as the contract promises. It is a
+    /// slot rather than a direct send because the same bodies run inside
+    /// `ParseWorkbook`, where a part's failure ends that part and not the
+    /// stream: there the forwarder clears the slot instead of delivering it.
+    pub(crate) static TERMINAL_FAILURE: RefCell<Option<Status>> = const { RefCell::new(None) };
 }
 
 /// Send one event; returns false when the stream should stop.
@@ -787,13 +802,27 @@ fn checkout<T: StreamResponse>(
     }
 }
 
-/// Convert a calamine parse failure into an in-band terminal stream error.
+/// End the stream on a calamine parse failure it cannot continue past.
+///
+/// The failure goes out twice, in this order: the typed `StreamError` with
+/// `terminal` set, so the client learns the `CalamineErrorKind`, and then the
+/// gRPC status the supervisor sends once the body returns. A stream that
+/// ended OK after the in-band event would read as a complete sheet to any
+/// client that checks the status, which is what the contract tells it to do.
 fn abort_with<T: StreamResponse>(
     tx: &mpsc::Sender<Result<T, Status>>,
     kind: pb::CalamineErrorKind,
     err: impl Display,
 ) {
-    let _ = send_stream_error(tx, convert::calamine_error(kind, err), true);
+    let error = convert::calamine_error(kind, err);
+    let status = Status::invalid_argument(error.message.clone());
+    // If the event cannot be sent the client has left or stalled, and the
+    // stream is already ending for that reason.
+    if send_stream_error(tx, error, true) {
+        TERMINAL_FAILURE.with(|failure| {
+            failure.borrow_mut().get_or_insert(status);
+        });
+    }
 }
 
 /// Build the `RangeStarted` header for a parsed range. An empty range gets
@@ -1388,7 +1417,22 @@ fn emit_incremental<E: Display>(
         let cell = match next_cell() {
             Ok(Some(cell)) => cell,
             Ok(None) => break,
-            Err(e) => return abort_with(tx, kind, e),
+            Err(e) => {
+                // Every cell read before the failure is sound and is owed to
+                // the client: the row under construction goes out with the
+                // rows still queued, and the terminal error that follows says
+                // the sheet stops there.
+                if open
+                    && batcher.accepts(current_row)
+                    && !batcher.push(tx, current_row, std::mem::take(&mut values))
+                {
+                    return;
+                }
+                if !batcher.flush(tx) {
+                    return;
+                }
+                return abort_with(tx, kind, e);
+            }
         };
         let (row, col, value) = cell;
         // Everything above the selected header row is not part of the sheet,
@@ -1413,6 +1457,9 @@ fn emit_incremental<E: Display>(
         // enforced here for every incremental format. The limit is Excel's own
         // 16,384 columns (0-based 0..MAX_DECLARED_COLUMNS).
         if col as usize >= MAX_DECLARED_COLUMNS {
+            if !batcher.flush(tx) {
+                return;
+            }
             return abort_with(
                 tx,
                 kind,

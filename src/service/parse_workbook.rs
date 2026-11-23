@@ -21,7 +21,7 @@ use tonic::{Status, Streaming};
 
 use super::{
     CONSUMER_STALL, STALL_REASON, STREAM_CHANNEL_CAPACITY, accept_chunk, next_frame, open_options,
-    run_get_pictures, run_stream_vba_project, run_stream_worksheet_formula,
+    panic_detail, run_get_pictures, run_stream_vba_project, run_stream_worksheet_formula,
     run_stream_worksheet_range, send_event, store_error_status,
 };
 use crate::proto::v1 as pb;
@@ -344,6 +344,9 @@ enum Halt {
     /// reports it; [`forward_part`] turns it into [`Halt::Ended`] once the
     /// reason is recorded for the supervisor.
     Stalled,
+    /// The forwarder task itself died. Only the forwarder's join reports it;
+    /// [`forward_part`] sends the status and turns it into [`Halt::Ended`].
+    Failed(Status),
 }
 
 /// Run one part's body into a channel of its own response type, forwarding
@@ -356,6 +359,11 @@ fn forward_part<T: PartEvent>(
     body: impl FnOnce(&mpsc::Sender<Result<T, Status>>),
 ) -> Result<(), Halt> {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        // Not reachable from `spawn_blocking`, and not a quiet ending if it
+        // ever is: the client is owed a status, not a stream that just stops.
+        let _ = tx.blocking_send(Err(Status::internal(
+            "no async runtime to forward this part on",
+        )));
         return Err(Halt::Ended);
     };
     let (inner_tx, mut inner_rx) = mpsc::channel::<Result<T, Status>>(STREAM_CHANNEL_CAPACITY);
@@ -395,9 +403,15 @@ fn forward_part<T: PartEvent>(
     });
     body(&inner_tx);
     drop(inner_tx);
-    let (part, outcome) = runtime
-        .block_on(forwarder)
-        .unwrap_or_else(|_| (Tally::default(), Err(Halt::Ended)));
+    // A forwarder that panicked has sent neither `done` nor a status. Mapping
+    // that to "the client left" would end the call OK with parts missing.
+    let (part, outcome) = runtime.block_on(forwarder).unwrap_or_else(|join| {
+        let status = Status::internal(format!(
+            "the task forwarding this part failed: {}",
+            panic_detail(join)
+        ));
+        (Tally::default(), Err(Halt::Failed(status)))
+    });
     tally.errors += part.errors;
     tally.terminal = part.terminal;
     tally.items += part.items;
@@ -417,6 +431,10 @@ fn forward_part<T: PartEvent>(
     }
     // The body gives up on a stalled consumer itself too, and records why.
     if STALL_REASON.with(|reason| reason.borrow().is_some()) {
+        return Err(Halt::Ended);
+    }
+    if let Err(Halt::Failed(status)) = outcome {
+        let _ = tx.blocking_send(Err(status));
         return Err(Halt::Ended);
     }
     outcome
@@ -607,4 +625,44 @@ fn emit_workbook(
         return;
     }
     let _ = send_event(tx, done_event(done));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Arc, OnceLock, StopSignal, Tally, forward_part, mpsc, pb};
+    use tonic::Code;
+
+    /// A forwarder task that dies ends the stream with INTERNAL. It used to
+    /// be read as "the client left", which ended the call with gRPC OK, no
+    /// `done` and parts missing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forwarder_that_panics_ends_the_stream_with_internal() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let stop: StopSignal = Arc::new(OnceLock::new());
+        let halted = tokio::task::spawn_blocking(move || {
+            let mut tally = Tally::default();
+            forward_part::<pb::GetPicturesResponse>(
+                &tx,
+                &stop,
+                &mut tally,
+                |_| panic!("the wrap closure runs on the forwarder task"),
+                |inner| {
+                    let _ = inner.blocking_send(Ok(pb::GetPicturesResponse::default()));
+                },
+            )
+            .is_err()
+        })
+        .await
+        .expect("the part body itself does not panic");
+        assert!(halted, "the part does not report success");
+
+        let status = rx
+            .recv()
+            .await
+            .expect("a status reaches the client, not silence")
+            .expect_err("and it is a failure");
+        assert_eq!(status.code(), Code::Internal, "{status:?}");
+        assert!(status.message().contains("forwarding"), "{status:?}");
+        assert!(rx.recv().await.is_none(), "nothing follows it");
+    }
 }

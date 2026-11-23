@@ -659,6 +659,10 @@ pub enum StoreError {
     NoAcceptedFormat {
         /// The formats this server accepts.
         accepted: FormatSet,
+        /// What each accepted format made of the bytes, in the order they
+        /// were tried. A damaged or encrypted workbook of an accepted format
+        /// is told apart from a format this server refuses by these alone.
+        attempts: Vec<(pb::WorkbookFormat, pb::CalamineError)>,
     },
 }
 
@@ -674,11 +678,17 @@ impl std::fmt::Display for StoreError {
                  (GRPC_CALAMINE_FORMATS)",
                 FormatSet::name(*format)
             ),
-            Self::NoAcceptedFormat { accepted } => write!(
-                f,
-                "the upload does not open as any format this server accepts \
-                 ({accepted}; GRPC_CALAMINE_FORMATS)"
-            ),
+            Self::NoAcceptedFormat { accepted, attempts } => {
+                write!(
+                    f,
+                    "the upload does not open as any format this server accepts \
+                     ({accepted}; GRPC_CALAMINE_FORMATS)"
+                )?;
+                for (format, error) in attempts {
+                    write!(f, "; {}: {}", FormatSet::name(*format), error.message)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -1005,13 +1015,22 @@ impl WorkbookStore {
     /// as, trying them in calamine's own auto-detection order and never
     /// trying a refused one.
     fn detect_accepted(&self, bytes: &WorkbookBytes) -> Result<WorkbookReader, StoreError> {
-        FormatSet::DETECTION_ORDER
-            .into_iter()
-            .filter(|format| self.formats.accepts(*format))
-            .find_map(|format| open_as(Cursor::new(Arc::clone(bytes)), format).ok())
-            .ok_or(StoreError::NoAcceptedFormat {
-                accepted: self.formats,
-            })
+        let mut attempts = Vec::new();
+        for format in FormatSet::DETECTION_ORDER {
+            if !self.formats.accepts(format) {
+                continue;
+            }
+            match open_as(Cursor::new(Arc::clone(bytes)), format) {
+                Ok(reader) => return Ok(reader),
+                // Kept, not dropped: when nothing opens, these are the only
+                // account of why.
+                Err(refused) => attempts.push((format, refused.error)),
+            }
+        }
+        Err(StoreError::NoAcceptedFormat {
+            accepted: self.formats,
+            attempts,
+        })
     }
 
     /// Look up an open workbook by id, recording the use.
@@ -1317,6 +1336,40 @@ mod tests {
         assert_eq!("xlsx,xlsb,xls,ods".parse::<FormatSet>(), Ok(FormatSet::ALL));
         assert!("xlsx,csv".parse::<FormatSet>().is_err());
         assert!(" , ".parse::<FormatSet>().is_err());
+    }
+
+    /// A damaged workbook that auto-detection gives up on still says what each
+    /// accepted format made of it, so "not accepted" is not the whole answer.
+    #[test]
+    fn a_failed_detection_keeps_the_error_of_every_format_it_tried() {
+        let store = WorkbookStore::with_limits(limits(8, u64::MAX, TTL))
+            .with_formats("xlsx,xlsb".parse().expect("two formats"));
+        // A real xlsx cut in half: a zip with no central directory.
+        let mut damaged = fixture("date.xlsx");
+        damaged.truncate(damaged.len() / 2);
+        let err = store
+            .open(damaged, pb::WorkbookFormat::Unspecified, None)
+            .err()
+            .expect("half a workbook does not open");
+        let StoreError::NoAcceptedFormat { attempts, .. } = &err else {
+            panic!("expected NoAcceptedFormat, got {err}");
+        };
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|(format, _)| *format)
+                .collect::<Vec<_>>(),
+            vec![pb::WorkbookFormat::Xlsx, pb::WorkbookFormat::Xlsb],
+            "one entry per accepted format, in detection order"
+        );
+        assert_eq!(attempts[0].1.kind, pb::CalamineErrorKind::Xlsx as i32);
+        assert!(!attempts[0].1.message.is_empty());
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("xlsx: {}", attempts[0].1.message)),
+            "the status text carries the cause: {text}"
+        );
+        assert_eq!(store.held_bytes(), 0);
     }
 
     /// A refused format is refused before anything is parsed or reserved.

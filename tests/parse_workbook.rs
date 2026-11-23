@@ -892,3 +892,80 @@ async fn a_stalled_upload_is_abandoned() {
     assert_eq!(err.code(), Code::DeadlineExceeded, "{err:?}");
     drop(tx);
 }
+
+/// One sheet named `Sheet` whose worksheet part is `sheet`, verbatim.
+fn one_sheet_workbook(sheet: &str) -> Vec<u8> {
+    zip_parts(vec![
+        ("[Content_Types].xml", CONTENT_TYPES.to_vec()),
+        ("_rels/.rels", rels("officeDocument", "xl/workbook.xml")),
+        (
+            "xl/workbook.xml",
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Sheet" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#
+                .to_vec(),
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels("worksheet", "worksheets/sheet1.xml"),
+        ),
+        ("xl/worksheets/sheet1.xml", sheet.as_bytes().to_vec()),
+    ])
+}
+
+/// The `RangeStarted` header of the only sheet, from `ParseWorkbook`.
+fn range_header(events: &[Event]) -> pb::RangeStarted {
+    events
+        .iter()
+        .find_map(|event| match event {
+            Event::Range(pb::SheetRangeEvent {
+                event:
+                    Some(pb::StreamWorksheetRangeResponse {
+                        event: Some(pb::stream_worksheet_range_response::Event::Started(header)),
+                    }),
+                ..
+            }) => Some(header.clone()),
+            _ => None,
+        })
+        .expect("a range header")
+}
+
+/// A merge list that cannot be read is not the same as a sheet without
+/// merges, and the header says which one it is.
+///
+/// The cells of this sheet are sound and all stream. Only the `mergeCells`
+/// block after them is damaged, and the header used to report it as an empty
+/// `merged_regions`, which a table rebuild reads as "no spanned cells".
+#[tokio::test]
+async fn an_unreadable_merge_list_is_reported_not_passed_off_as_no_merges() {
+    let client = start_server().await;
+    let cells =
+        r#"<sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row></sheetData>"#;
+    let head = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">"#;
+
+    let damaged = format!(
+        r#"{head}{cells}<mergeCells count="1"><mergeCell ref="A1:B"/></mergeCells></worksheet>"#
+    );
+    let events = parse(&client, every_part(), &one_sheet_workbook(&damaged)).await;
+    let header = range_header(&events);
+    assert!(header.merged_regions.is_empty());
+    assert!(
+        header.merged_regions_unavailable,
+        "the merge list failed to read, and the header must say so"
+    );
+    assert_eq!(done(&events).range_sheets, 1, "the cells still stream");
+
+    // A sound merge list, and a sheet with none, leave the flag clear.
+    let sound = format!(
+        r#"{head}{cells}<mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells></worksheet>"#
+    );
+    let header = range_header(&parse(&client, every_part(), &one_sheet_workbook(&sound)).await);
+    assert_eq!(header.merged_regions.len(), 1);
+    assert!(!header.merged_regions_unavailable);
+    let none = format!("{head}{cells}</worksheet>");
+    let header = range_header(&parse(&client, every_part(), &one_sheet_workbook(&none)).await);
+    assert!(header.merged_regions.is_empty());
+    assert!(!header.merged_regions_unavailable);
+}

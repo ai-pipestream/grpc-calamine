@@ -505,6 +505,12 @@ async fn unknown_sheet_fails_in_band() {
         }
         other => panic!("expected in-band error, got {other:?}"),
     }
+    // The typed error is not the end of it: the call itself fails too.
+    let status = stream
+        .message()
+        .await
+        .expect_err("a terminal failure ends the stream with a status, not OK");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
 }
 
 #[tokio::test]
@@ -764,8 +770,33 @@ async fn stream_range_outcome(
 
     let mut header = None;
     let mut rows = Vec::new();
-    let mut error = None;
-    while let Some(event) = stream.message().await.expect("stream event") {
+    let mut error: Option<pb::StreamError> = None;
+    loop {
+        let event = match stream.message().await {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                // A stream that ends OK is complete: a terminal failure never
+                // ends one that way.
+                assert!(
+                    !error.as_ref().is_some_and(|e| e.terminal),
+                    "the stream ended with gRPC OK after a terminal in-band error"
+                );
+                break;
+            }
+            Err(status) => {
+                // The typed error goes first and the status that ends the
+                // stream says the same thing.
+                let terminal = error.as_ref().filter(|e| e.terminal).unwrap_or_else(|| {
+                    panic!("a status with no terminal error before it: {status:?}")
+                });
+                assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+                assert_eq!(
+                    status.message(),
+                    terminal.error.as_ref().expect("error detail").message
+                );
+                break;
+            }
+        };
         match event.event.expect("event kind") {
             pb::stream_worksheet_range_response::Event::Started(started) => header = Some(started),
             pb::stream_worksheet_range_response::Event::Row(row) => rows.push(row),

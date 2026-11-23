@@ -358,6 +358,146 @@ fn tall_workbook(rows: u32) -> Vec<u8> {
     ])
 }
 
+/// One sheet whose XML is sound for `rows` rows and then breaks: the next row
+/// opens a cell with an attribute that is never closed, and the part ends.
+fn workbook_broken_after(rows: u32) -> Vec<u8> {
+    let mut sheet = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>"#,
+    );
+    for r in 1..=rows {
+        sheet.push_str(&format!(r#"<row r="{r}"><c r="A{r}"><v>{r}</v></c></row>"#));
+    }
+    sheet.push_str(r#"<row r="x"><c r="A"#);
+    // The same package as `tall_workbook`, around the broken sheet.
+    zip_parts(vec![
+        ("[Content_Types].xml", CONTENT_TYPES.to_vec()),
+        ("_rels/.rels", rels("officeDocument", "xl/workbook.xml")),
+        (
+            "xl/workbook.xml",
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Broken" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#
+                .to_vec(),
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels("worksheet", "worksheets/sheet1.xml"),
+        ),
+        ("xl/worksheets/sheet1.xml", sheet.into_bytes()),
+    ])
+}
+
+/// A per-part stream that hits a terminal parse failure ends with a gRPC
+/// status, as the contract says, and not with OK after an in-band event.
+///
+/// A client written to the proto checks the status and treats in-band errors
+/// as survivable; ending OK let it record a truncated sheet as a complete
+/// one. The typed error still arrives in band first, and so does every row
+/// read before the break.
+#[tokio::test]
+async fn a_terminal_parse_failure_ends_the_range_stream_with_a_status() {
+    const ROWS: u32 = 300;
+    let mut client = start_server().await;
+    let bytes = workbook_broken_after(ROWS);
+    let mut frames = vec![pb::OpenWorkbookRequest {
+        payload: Some(pb::open_workbook_request::Payload::Options(
+            pb::WorkbookOptions::default(),
+        )),
+    }];
+    frames.extend(bytes.chunks(64 * 1024).map(|c| pb::OpenWorkbookRequest {
+        payload: Some(pb::open_workbook_request::Payload::Chunk(c.to_vec())),
+    }));
+    let opened = client
+        .open_workbook(tokio_stream::iter(frames))
+        .await
+        .expect("the workbook part is sound, so the open succeeds")
+        .into_inner();
+
+    let mut stream = client
+        .stream_worksheet_range(pb::StreamWorksheetRangeRequest {
+            workbook_id: opened.workbook_id.clone(),
+            sheet: Some(pb::SheetSelector {
+                selector: Some(pb::sheet_selector::Selector::SheetIndex(0)),
+            }),
+            // The default batching, so rows are queued when the break hits.
+            max_rows_per_message: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("the stream opens")
+        .into_inner();
+
+    let mut rows = 0_u32;
+    let mut in_band = None;
+    let status = loop {
+        match stream.message().await {
+            Ok(Some(message)) => match message.event.expect("event kind") {
+                pb::stream_worksheet_range_response::Event::Row(_) => rows += 1,
+                pb::stream_worksheet_range_response::Event::Rows(batch) => {
+                    rows += batch.rows.len() as u32;
+                }
+                pb::stream_worksheet_range_response::Event::Error(error) => {
+                    assert!(in_band.is_none(), "one terminal error, not several");
+                    in_band = Some(error);
+                }
+                _ => {}
+            },
+            Ok(None) => panic!(
+                "the stream ended with gRPC OK after {rows} rows and in-band error \
+                 {in_band:?}; a terminal failure must end it with a status"
+            ),
+            Err(status) => break status,
+        }
+    };
+
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    let in_band = in_band.expect("the typed error still arrives in band, before the status");
+    assert!(in_band.terminal);
+    let detail = in_band.error.expect("error detail");
+    assert_eq!(detail.kind, pb::CalamineErrorKind::Xlsx as i32);
+    assert_eq!(
+        status.message(),
+        detail.message,
+        "the status says what the typed error says"
+    );
+    assert_eq!(
+        rows, ROWS,
+        "every row read before the break is delivered, not left in the batcher"
+    );
+}
+
+/// Inside `ParseWorkbook` a part's terminal failure ends that part only: the
+/// error is forwarded in band, counted, and the stream runs on to `done`.
+#[tokio::test]
+async fn a_failed_part_does_not_end_the_combined_stream() {
+    let client = start_server().await;
+    let events = parse(&client, every_part(), &workbook_broken_after(40)).await;
+    let done = done(&events);
+    assert!(done.part_errors >= 1, "{done:?}");
+    assert_eq!(
+        done.range_sheets, 0,
+        "the broken sheet is not counted as sent"
+    );
+    assert!(!done.cancelled);
+    let terminal = events.iter().any(|event| {
+        matches!(
+            event,
+            Event::Range(range) if matches!(
+                &range.event,
+                Some(pb::StreamWorksheetRangeResponse {
+                    event: Some(pb::stream_worksheet_range_response::Event::Error(error)),
+                }) if error.terminal
+            )
+        )
+    });
+    assert!(
+        terminal,
+        "the range part's terminal error is forwarded in band"
+    );
+}
+
 /// Every part of every workbook matches the per-part RPCs event for event,
 /// for every format, and `done` counts what was sent.
 #[tokio::test]

@@ -295,7 +295,11 @@ service's web UI from the contract alone.
 Terminal failures use gRPC status codes (`NOT_FOUND`, `INVALID_ARGUMENT`,
 `RESOURCE_EXHAUSTED`). Recoverable per-item failures arrive as in-band
 `StreamError` events with a typed `CalamineError`, so one bad sheet doesn't
-kill the stream.
+kill the stream. A calamine parse failure that a per-part stream cannot
+continue past is sent both ways: the typed `StreamError` with `terminal` set,
+after every row read before it, and then `INVALID_ARGUMENT` as the status. A
+stream that ends `OK` is complete. In `ParseWorkbook` such a failure ends its
+part only and is counted in `done.part_errors`.
 
 ### One stream, no handle
 

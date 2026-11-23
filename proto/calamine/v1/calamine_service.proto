@@ -391,8 +391,16 @@ message StringTableChunk {
 // StreamError is an in-band error event on a streaming RPC.
 //
 // Non-terminal errors (e.g. one sheet of a multi-item read failed) are
-// delivered this way so the stream can continue. Terminal failures still use
-// the gRPC status and end the stream.
+// delivered this way so the stream can continue.
+//
+// A terminal failure always ends a per-part stream with a non-OK gRPC
+// status. When the failure is a calamine parse error it is also sent here
+// first, with `terminal` set, so the client gets the typed kind: the event,
+// then the status. A stream that ends OK is complete.
+//
+// Inside `ParseWorkbook` a part's terminal error ends that part only. It is
+// forwarded in band and counted in `ParseWorkbookDone.part_errors`, and the
+// stream runs on to its other parts and to `done`.
 message StreamError {
   // The structured calamine error.
   CalamineError error = 1;
